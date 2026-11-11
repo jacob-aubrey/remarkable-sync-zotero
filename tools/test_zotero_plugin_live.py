@@ -894,13 +894,48 @@ async function startup({rootURI}) {
           else if (command.action === 'reader_tags') {
             const item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, command.context.key);
             const reader = await Zotero.Reader.open(item.id, {pageIndex: command.context.page});
-            const until = Date.now() + 30000;
-            while ((!reader._internalReader?._state?.primaryViewStats?.pagesCount
-                || !reader._iframeWindow.document.querySelector('.notable-page-tag')) && Date.now() < until) await Zotero.Promise.delay(100);
-            const button = reader._iframeWindow.document.querySelector('.notable-page-tag');
-            if (!button) throw new Error('Reader tag control missing');
-            const original = ui.rpc; response.requests = [];
-            ui.rpc = async function(method, params) {
+            const buttons = () => [...(reader._iframeWindow?.document.querySelectorAll('.notable-page-tag') || [])];
+            const waitFor = async (condition, message) => {
+              const until = Date.now() + 30000;
+              while (!condition() && Date.now() < until) await Zotero.Promise.delay(100);
+              if (!condition()) throw Error(message);
+            };
+            await waitFor(() => reader._internalReader?._state?.primaryViewStats?.pagesCount && buttons().length,
+              'Reader tag control missing');
+            const {AddonManager} = ChromeUtils.importESModule('resource://gre/modules/AddonManager.sys.mjs');
+            const addon = await AddonManager.getAddonByID(ui.id);
+            await addon.disable();
+            await waitFor(() => !Zotero.Notable && !buttons().length, 'Plugin shutdown did not remove the tag control');
+            await addon.enable();
+            await waitFor(() => Zotero.Notable && buttons().length, 'Existing reader lost its tag control after plugin reload');
+            if (buttons().length !== 1) throw Error('Plugin reload added duplicate controls');
+            const [button] = buttons();
+            const doc = button.ownerDocument;
+            const style = node => reader._iframeWindow.getComputedStyle(node);
+            if (style(button).getPropertyValue('-moz-window-dragging') !== 'no-drag'
+                || button.textContent.trim() || !button.querySelector('svg') || button.tabIndex !== -1
+                || button.getAttribute('aria-label') !== 'Tag this page' || button.title !== 'Tag this page') {
+              throw Error('Reader tag control is missing native toolbar styling, icon, or accessible name');
+            }
+            const themeRoot = doc.documentElement;
+            const initialScheme = themeRoot.getAttribute('data-color-scheme');
+            try {
+              const colors = ['light', 'dark'].map(scheme => {
+                themeRoot.setAttribute('data-color-scheme', scheme);
+                const color = style(button).color;
+                if (color !== style(doc.getElementById('appearance')).color) {
+                  throw Error(`Reader tag control did not match the ${scheme} toolbar color`);
+                }
+                return color;
+              });
+              if (colors[0] === colors[1]) throw Error('Reader toolbar theme did not change');
+            } finally {
+              if (initialScheme === null) themeRoot.removeAttribute('data-color-scheme');
+              else themeRoot.setAttribute('data-color-scheme', initialScheme);
+            }
+            const activeUI = Zotero.Notable;
+            const original = activeUI.rpc; response.requests = [];
+            activeUI.rpc = async function(method, params) {
               if (method === 'tag_context') { response.requests.push({method, params}); return command.context; }
               if (method === 'set_page_tags') {
                 response.requests.push({method, params});
@@ -910,17 +945,18 @@ async function startup({rootURI}) {
             };
             try {
               button.click();
-              while (!ui.tagEditor && Date.now() < until) await Zotero.Promise.delay(100);
-              if (!ui.tagEditor) throw new Error('Reader page editor did not open');
-              response.heading = ui.view.document.querySelector('main h2')?.textContent;
-              const inputs = [...ui.view.document.querySelectorAll('main input')];
+              const saveButton = () => [...(activeUI.view?.document.querySelectorAll('button') || [])]
+                .find(b => b.textContent === 'Save tags');
+              await waitFor(saveButton, 'Reader page editor did not open');
+              response.heading = activeUI.view.document.querySelector('main h2')?.textContent;
+              const inputs = [...activeUI.view.document.querySelectorAll('main input')];
               inputs[0].value = 'Native paper tag'; inputs[1].value = 'Native page tag';
-              [...ui.view.document.querySelectorAll('button')].find(b => b.textContent === 'Save tags').click();
-              while (!response.requests.some(r => r.method === 'set_page_tags') && Date.now() < until) await Zotero.Promise.delay(100);
-              while (ui.busy && Date.now() < until) await Zotero.Promise.delay(100);
+              saveButton().click();
+              await waitFor(() => response.requests.some(r => r.method === 'set_page_tags') && !activeUI.busy,
+                'Reader tags did not save');
               response.readerPage = reader._internalReader._state.primaryViewStats.pageIndex;
-              response.readerButton = button.textContent;
-            } finally { ui.rpc = original; }
+              response.readerButton = button.title;
+            } finally { activeUI.rpc = original; }
           }
           else if (command.action === 'snapshot') {
             const win = command.mainWindow ? Zotero.getMainWindow() : ui.view, canvas = win.document.createElementNS('http://www.w3.org/1999/xhtml', 'canvas');

@@ -11,26 +11,7 @@ var NotableUI = {
     this.rootURI = rootURI;
     this.scheduleInbox();
     Zotero.Notable = this;
-    this.readerToolbar = ({reader, doc, append}) => {
-      if (reader.type !== 'pdf') return;
-      const button = doc.createElement('button');
-      button.textContent = 'Tag this page'; button.className = 'notable-page-tag';
-      button.style.cssText = 'display: inline-flex; align-items: center; gap: 6px; margin-inline: 8px; padding: 4px 8px;';
-      const icon = doc.createElement('span');
-      icon.setAttribute('aria-hidden', 'true');
-      icon.style.cssText = 'display: inline-block; width: 16px; height: 16px; flex: 0 0 16px; background: currentColor; mask: url("chrome://notable/content/icons/tag.svg") center / contain no-repeat;';
-      button.prepend(icon);
-      button.title = 'Open paper and page tags for this PDF. Changes apply only when you save them.';
-      button.setAttribute('aria-description', button.title);
-      button.addEventListener('click', async () => {
-        button.disabled = true;
-        try { await this.openPageTags(reader); }
-        catch (error) { reader._iframeWindow.alert(error.message); }
-        finally { button.disabled = false; }
-      });
-      append(button);
-    };
-    Zotero.Reader.registerEventListener('renderToolbar', this.readerToolbar, this.id);
+    await this.registerReaderTagButton(rootURI);
     this.collectionObserver = Zotero.Notifier.registerObserver({notify: (event, type) => {
       if (type === 'collection') this.refreshCollectionNames();
       this.observeReviewChange(event, type);
@@ -81,6 +62,45 @@ var NotableUI = {
         this.schedule(5000);
       }
     });
+  },
+  async registerReaderTagButton(rootURI) {
+    const icon = await (await fetch(rootURI + 'icons/tag.svg')).text();
+    if (this.stopped) return;
+    this.readerToolbar = ({reader, doc, append}) => {
+      if (reader.type !== 'pdf' || doc.querySelector('.notable-page-tag')) return;
+      const button = doc.createElement('button');
+      button.type = 'button';
+      button.className = 'toolbar-button notable-page-tag';
+      button.tabIndex = -1;
+      button.title = 'Tag this page';
+      button.setAttribute('aria-label', button.title);
+      // Use the bundled SVG inline so its stroke takes the reader's toolbar color.
+      button.innerHTML = icon;
+      const svg = button.firstElementChild;
+      svg.setAttribute('width', '16');
+      svg.setAttribute('height', '16');
+      svg.setAttribute('aria-hidden', 'true');
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try { await this.openPageTags(reader); }
+        catch (error) { Zotero.alert(reader._iframeWindow, button.title, error.message); }
+        finally { button.disabled = false; }
+      });
+      append(button);
+    };
+    Zotero.Reader.registerEventListener('renderToolbar', this.readerToolbar, this.id);
+    // A hot update leaves existing readers mounted, so they may not emit renderToolbar again.
+    for (const reader of Zotero.Reader._readers) {
+      const doc = reader._iframeWindow?.document;
+      const sections = doc?.querySelector('.toolbar .end > .custom-sections');
+      if (!sections) continue;
+      this.readerToolbar({reader, doc, append: button => {
+        const section = doc.createElement('div');
+        section.className = 'section';
+        section.append(button);
+        sections.append(section);
+      }});
+    }
   },
   recordTransport(event, details = {}) {
     try {
@@ -138,7 +158,9 @@ var NotableUI = {
     Zotero.Reader.unregisterEventListener('renderToolbar', this.readerToolbar);
     if (this.collectionObserver) Zotero.Notifier.unregisterObserver(this.collectionObserver);
     this.collectionObserver = null;
-    for (const reader of Zotero.Reader._readers) reader._iframeWindow?.document.querySelectorAll('.notable-page-tag').forEach(node => node.remove());
+    for (const reader of Zotero.Reader._readers) {
+      reader._iframeWindow?.document.querySelector('.notable-page-tag')?.parentElement.remove();
+    }
     clearTimeout(this.timer);
     clearInterval(this.activityTimer);
     clearTimeout(this.inboxTimer);
@@ -681,10 +703,15 @@ var NotableUI = {
     if (!Number.isInteger(page)) throw new Error('Wait for this PDF page to finish loading.');
     const item = await Zotero.Items.getAsync(reader.itemID);
     if (!item?.isPDFAttachment()) throw new Error('Choose a PDF first.');
-    this.requestedTab = 'tags'; this.open();
     const context = await this.rpc('tag_context', {key: item.key, page});
-    this.tagEditor = context; this.requestedTab = 'tags';
-    if (this.view?.document.getElementById('app')?.querySelector('h1')) { this.tab = 'tags'; this.render(); }
+    this.tagEditor = context;
+    if (this.view && !this.view.closed && this.view.document.getElementById('app')?.querySelector('h1')) {
+      this.tab = 'tags';
+      this.render();
+    } else {
+      this.requestedTab = 'tags';
+    }
+    this.open();
   },
   async action(method, params = {}, render = true) {
     if (this.paperTagChecking) { try { await this.paperTagRequest; } catch (_) {} }
