@@ -1,0 +1,3 @@
+# Test fixtures reuse Notable's synthetic cloud/service helpers.
+-r requirements-zotero-plugin.txt
+watchdog==6.0.0

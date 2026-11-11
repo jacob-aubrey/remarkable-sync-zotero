@@ -1,0 +1,14 @@
+.readable-field { min-width: 0; }
+.readable-field > label { display: block; min-width: 0; }
+.readable-field > label > span { display: block; font-weight: 600; margin-bottom: 8px; }
+.notable-wrapped-field { box-sizing: border-box; width: 100%; min-width: 0; min-height: calc(2.9em + 18px); padding: 8px; font: inherit; line-height: 1.45; color: FieldText; background: Field; border: 1px solid GrayText; border-radius: 4px; overflow: hidden; resize: none; white-space: pre-wrap; overflow-wrap: anywhere; }
+.notable-wrapped-field:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
+.readable-field-full { min-width: 0; margin: 8px 0 0; }
+.readable-field-full[hidden] { display: none; }
+.readable-field-full > summary { font-size: .9em; font-weight: 500; color: LinkText; }
+.readable-field-value { box-sizing: border-box; max-width: 100%; margin: 10px 0; padding: 10px 12px; border: 1px solid color-mix(in srgb, GrayText 45%, transparent); border-radius: 4px; background: color-mix(in srgb, Field 75%, Canvas); font: inherit; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.readable-field-full > button { padding: 5px 10px; }
+.readable-field-copy-status { display: inline-block; margin-inline-start: 10px; font-size: .9em; }
+
+.message, .hint, summary, h4, h5, li, td, th { overflow-wrap: anywhere; }
+.readable-field-full .actions { margin: 10px 0 0; }

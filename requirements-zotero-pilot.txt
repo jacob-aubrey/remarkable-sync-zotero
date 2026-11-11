@@ -1,0 +1,5 @@
+# Optional companion only; no Tk/webview/Office/AI dependencies.
+PyMuPDF==1.28.2
+Pillow==13.0.0
+rmscene==0.8.0
+pyzotero==1.16.0

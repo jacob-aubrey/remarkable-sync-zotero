@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.test-tmp/
+build/
+dist/
+*.sqlite*
+*.log
+.env
+.env.*

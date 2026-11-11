@@ -1,0 +1,7 @@
+# Keep document bytes intact and avoid treating PDF syntax as source text.
+*.pdf binary
+# Preserve the exact upstream vendored runtime bytes on every checkout.
+note_organizer/assets/pdfjs/** -text
+
+# Preserve the exact hash-verified processing snapshot on every platform.
+_vendor/** -text

@@ -1,0 +1,4 @@
+# Optional CPU handwriting pilot; separate environment, explicit local models.
+-r requirements-zotero-pilot.txt
+rapidocr==3.10.0
+onnxruntime==1.31.0

@@ -1,0 +1,42 @@
+.folder-chooser { min-width: 0; margin: 20px 0; }
+.folder-chooser-label { display: block; margin-bottom: 10px; font-weight: 600; }
+.folder-chooser-compact { display: flex; align-items: flex-start; gap: 16px; min-width: 0; }
+.folder-chooser-compact > button { flex: 0 0 auto; }
+.folder-chooser-summary { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.folder-chooser-selected { display: block; padding: 8px 0; overflow-wrap: anywhere; }
+.folder-chooser-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding-inline-start: 9px; border: 1px solid GrayText; border-radius: 6px; overflow-wrap: anywhere; }
+.folder-chooser-chip > button { padding: 4px 8px; border: 0; }
+.folder-chooser-dialog { box-sizing: border-box; width: min(700px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); padding: 22px; border: 1px solid GrayText; border-radius: 9px; background: Canvas; color: CanvasText; box-shadow: 0 10px 50px #0006; }
+.folder-chooser-dialog::backdrop { background: #0007; }
+.folder-chooser-dialog { overflow: auto; }
+.folder-chooser-dialog h2 { margin: 0 0 18px; }
+.folder-chooser-toolbar { display: flex; align-items: center; gap: 16px; }
+.folder-chooser-toolbar > input { flex: 1; min-width: 0; width: auto; margin: 0; }
+.folder-chooser-toolbar > button { flex: 0 0 auto; }
+.folder-chooser-toolbar > input, .folder-chooser-toolbar > button { min-height: 40px; }
+.folder-chooser-tree { overflow: auto; max-height: min(48vh, 420px); min-height: 120px; border: 1px solid GrayText; border-radius: 5px; margin-block: 10px; }
+.folder-chooser-option { display: flex; align-items: center; gap: 6px; padding: 8px; cursor: pointer; min-width: 0; border-bottom: 1px solid color-mix(in srgb, GrayText 18%, transparent); }
+.folder-chooser-option:hover, .folder-chooser-option:focus { background: color-mix(in srgb, Highlight 13%, Canvas); }
+.folder-chooser-option[aria-selected="true"] { background: color-mix(in srgb, Highlight 18%, Canvas); }
+.folder-chooser-option:focus-visible { outline: 2px solid Highlight; outline-offset: -2px; }
+.folder-chooser-option-text { display: flex; flex-direction: column; min-width: 0; gap: 3px; overflow-wrap: anywhere; }
+.folder-chooser-expand { width: 26px; height: 28px; padding: 0; flex: 0 0 26px; border: 0; }
+.folder-chooser-spacer { width: 26px; flex: 0 0 26px; }
+.folder-chooser-check { flex: 0 0 auto; }
+.folder-chooser-detail, .folder-chooser-hint { display: block; color: light-dark(#526273, #b3becb); font-size: .88em; overflow-wrap: anywhere; }
+.folder-chooser-recents { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; }
+.folder-chooser-recents > strong { font-size: .88em; width: 100%; }
+.folder-chooser-recents:empty { display: none; }
+.folder-chooser-dialog > .folder-chooser-hint { margin: 12px 0 16px; }
+.folder-chooser-recents > button { padding: 5px 9px; max-width: 100%; overflow-wrap: anywhere; }
+.folder-chooser-error { color: light-dark(#9f2929, #ffaaaa); overflow-wrap: anywhere; }
+.folder-chooser-footer { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; margin-top: 20px; }
+.folder-create { box-sizing: border-box; width: min(620px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); overflow: auto; padding: 22px; border: 1px solid GrayText; border-radius: 9px; background: Canvas; color: CanvasText; box-shadow: 0 10px 50px #0006; }
+.folder-create::backdrop { background: #0007; }
+.folder-create h2 { margin-top: 0; }
+.folder-create p, .folder-create label { overflow-wrap: anywhere; }
+.folder-create input, .folder-create select { box-sizing: border-box; width: 100%; min-width: 0; }
+.folder-create .actions, .folder-create .action-row { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; }
+.folder-create > button { margin-inline-end: 8px; margin-block-start: 12px; }
+@media (max-width: 480px) { .folder-chooser-dialog { padding: 14px; } .folder-chooser-compact { flex-wrap: wrap; } .folder-chooser-summary { flex-basis: 100%; } }
+@media (max-height: 540px) { .folder-chooser-dialog, .folder-create { padding: 14px; } .folder-chooser-tree { max-height: 34vh; min-height: 80px; } }

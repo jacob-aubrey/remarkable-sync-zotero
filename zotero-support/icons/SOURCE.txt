@@ -1,0 +1,7 @@
+Lucide Icons
+https://github.com/lucide-icons/lucide
+Revision: f12b0de177fbc2a6795e99be065887e72b237123
+SVG originals and 72px PNG renders; round-cap dots rendered as circles, with a larger Help dot for small-size legibility. See LICENSE.txt.
+minimize.svg is a locally drawn inward-facing companion to the bundled maximize icon, rendered with the same pipeline.
+
+sync-conflict.svg adapts the bundled Lucide refresh-cw arrows with a centered exclamation mark. It retains the same 24px viewBox, stroke width, caps, and joins, and remains under the included ISC notice. Google Material Sync Problem (https://github.com/google/material-design-icons/tree/master/src/notification/sync_problem) was a visual precedent; no Google asset or new icon framework is included. Reusing the already bundled SVG keeps the Windows Zotero/Gecko icon pipeline and existing visual style.
