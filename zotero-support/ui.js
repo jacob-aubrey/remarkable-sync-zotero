@@ -36,9 +36,9 @@ var NotableUI = {
         this.filingQueuePaused = !!saved.jobs.length;
       } catch (_) { this.queueError = 'The saved filing queue could not be read. Your papers remain pending.'; }
     }
-    for (const target of ['main/menubar/tools', 'main/library/item']) {
+    for (const [target, label] of [['main/menubar/tools', this.shortName], ['main/library/item', this.name + '…']]) {
       Zotero.MenuManager.registerMenu({menuID: 'notable-' + target.replaceAll('/', '-'), pluginID: this.id, target,
-        menus: [{menuType: 'menuitem', onShowing: (event, context) => { context.menuElem.setAttribute('label', this.name + '…'); },
+        menus: [{menuType: 'menuitem', onShowing: (event, {menuElem}) => menuElem.setAttribute('label', label),
           onCommand: () => this.open()}]});
     }
     // Startup is awaited while Zotero initializes plugins, before its first
@@ -72,7 +72,7 @@ var NotableUI = {
       button.type = 'button';
       button.className = 'toolbar-button notable-page-tag';
       button.tabIndex = -1;
-      button.title = 'Tag this page';
+      button.title = 'Tag this paper and/or page';
       button.setAttribute('aria-label', button.title);
       // Use the bundled SVG inline so its stroke takes the reader's toolbar color.
       button.innerHTML = icon;

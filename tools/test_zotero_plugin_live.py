@@ -36,7 +36,24 @@ async function startup({rootURI}) {
           const ui = Zotero.Notable;
           if (!ui) throw new Error('Notable UI did not initialize');
           if (command.action === 'open') {
-            ui.open(); const deadline = Date.now() + 120000;
+            const window = Zotero.getMainWindow();
+            const popup = window.document.getElementById('menu_ToolsPopup');
+            popup.dispatchEvent(new window.Event('popupshowing'));
+            const entries = [...popup.children].filter(item => item.getAttribute('label') === 'reMarkable Sync');
+            if (entries.length !== 1 || entries[0].hidden || entries[0].disabled) {
+              throw Error('Tools must contain one usable reMarkable Sync command');
+            }
+            const manager = Zotero.openInViewer('chrome://mozapps/content/extensions/aboutaddons.html');
+            try {
+              const getIcon = () => manager.document.querySelector('browser')?.contentDocument
+                ?.querySelector(`addon-card[addon-id="${ui.id}"] .addon-icon`);
+              for (let i = 0; i < 150 && !getIcon()?.naturalWidth; i++) await Zotero.Promise.delay(100);
+              const icon = getIcon();
+              if (!icon?.naturalWidth || !icon.src.endsWith('/icons/tablet.svg')) {
+                throw Error('The Plugins manager did not load the reMarkable Sync icon');
+              }
+            } finally { manager.close(); }
+            entries[0].doCommand(); const deadline = Date.now() + 120000;
             while ((!ui.process || !Object.keys(ui.latest?.types || {}).length || !ui.view?.document.getElementById('app')?.querySelector('h1')) && Date.now() < deadline) {
               if (ui.view?.document.querySelector('[role="alert"]')) break;
               await Zotero.Promise.delay(100);
@@ -914,7 +931,7 @@ async function startup({rootURI}) {
             const style = node => reader._iframeWindow.getComputedStyle(node);
             if (style(button).getPropertyValue('-moz-window-dragging') !== 'no-drag'
                 || button.textContent.trim() || !button.querySelector('svg') || button.tabIndex !== -1
-                || button.getAttribute('aria-label') !== 'Tag this page' || button.title !== 'Tag this page') {
+                || button.getAttribute('aria-label') !== button.title || button.title !== 'Tag this paper and/or page') {
               throw Error('Reader tag control is missing native toolbar styling, icon, or accessible name');
             }
             const themeRoot = doc.documentElement;
@@ -1399,7 +1416,7 @@ def bulk_checks(client, root, checked, count, resume=False):
     command(root, 'snapshot')
     import shutil
     shutil.copyfile(root / 'workspace.png', root / 'tag-workspace.png')
-    assert ui_tags['readerButton'] == 'Tag this page' and ui_tags['readerPage'] == 0
+    assert ui_tags['readerButton'] == 'Tag this paper and/or page' and ui_tags['readerPage'] == 0
     assert ui_tags['requests'][0]['params'] == {'key': key, 'page': 0}
     edit = next(r for r in ui_tags['requests'] if r['method'] == 'set_page_tags')['params']
     worker.dispatch('set_page_tags', edit)
@@ -1843,7 +1860,7 @@ def main():
             assert client.server_id == json.loads(Path(config['ready']).read_text())['server']
             ui = command(root, 'open')
             assert ui['worker'] and any(name in ui['title'] for name in ['Notable', 'reMarkable Sync']) and 'Connect Zotero' in ui['buttons'], ui
-            checked('Zotero_opens_graphical_setup_and_manages_private_worker')
+            checked('Zotero_Tools_opens_graphical_setup_and_Plugins_loads_the_R_icon')
             if args.preferences_checks:
                 command(root, 'preferences')
                 checked('Zotero_settings_opens_setup_in_new_and_existing_workspaces')

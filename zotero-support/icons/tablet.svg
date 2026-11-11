@@ -9,6 +9,11 @@
   stroke-linecap="round"
   stroke-linejoin="round"
 >
+  <style>
+    @media (prefers-color-scheme: dark) {
+      svg { color: #f0f0f0; }
+    }
+  </style>
   <rect width="16" height="20" x="4" y="2" rx="2" ry="2" />
   <path d="M9 16V8h3a2 2 0 0 1 0 4H9m3 0 3 4" />
 </svg>
