@@ -83,6 +83,7 @@ BRANCH = r"""
             response.parentKey = parent.key;
             response.version = Zotero.version;
             response.originalOCR = savedConfig.ocr ?? true;
+            response.alertFixture = {...discovered, reviews: discovered.reviews.filter(row => row.identity === parent.key)};
           }
           else if (command.action === 'reference_pdf_lifecycle') {
             const ensure = (value, message) => {if (!value) throw Error(message);};
@@ -234,6 +235,31 @@ BRANCH = r"""
             await ui.closeProcess(ui.process);
             await ui.refresh();
           }
+          else if (command.action === 'inbox_alert_layout') {
+            ui.latest = command.snapshot;
+            ui.tab = 'inbox';
+            ui.render();
+            ui.view.resizeTo(command.width, 760);
+            const doc = ui.view.document;
+            doc.documentElement.style.colorScheme = 'dark';
+            await Zotero.Promise.delay(150);
+            const message = doc.getElementById('message');
+            const pdfError = 'No available file found. Open the source link, download the PDF, and use Attach downloaded PDF.';
+            for (const text of [pdfError, pdfError + '\n' + 'VeryLongFilename'.repeat(20) + '.pdf']) {
+              ui.message(text, true);
+              const bounds = message.getBoundingClientRect();
+              const range = doc.createRange();
+              range.selectNodeContents(message);
+              const lines = [...range.getClientRects()];
+              if (!lines.length || message.getAttribute('role') !== 'alert'
+                  || message.scrollHeight > message.clientHeight + 1
+                  || lines.some(line => line.bottom > bounds.bottom + 1 || line.right > bounds.right + 1)) {
+                throw Error('Inbox clipped the alert at width ' + ui.view.innerWidth);
+              }
+            }
+            ui.message(pdfError, true);
+            response.alertWidth = ui.view.innerWidth;
+          }
 """
 
 def checks(client, root, checked):
@@ -261,6 +287,10 @@ def checks(client, root, checked):
         assert '1 to check in Zotero' in layout['queueSummary'], layout
         live.command(root, 'snapshot', filename=f'inbox-merge-{width}.png')
     checked('native_stale_merge_detail_fits_wide_and_narrow_Inbox_layouts')
+    for width in [1040, 640]:
+        live.command(root, 'inbox_alert_layout', snapshot=result['alertFixture'], width=width)
+        live.command(root, 'snapshot', filename=f'inbox-alert-{width}.png')
+    checked('native_Inbox_alerts_wrap_without_clipping_at_wide_and_narrow_widths')
     # The shared packaged search check runs after this fixture. Restore its OCR
     # setting before it asks the private worker to reindex a scanned PDF.
     live.command(root, 'restore_intake_test_ocr', enabled=result['originalOCR'])

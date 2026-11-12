@@ -171,6 +171,13 @@ nav button.sync-conflicts-attention[aria-pressed="true"] .button-icon { color: #
 #notable-sync-details { flex: 1 0 100%; min-width: 0; }
 #notable-sync-step { margin: 4px 0 0; max-block-size: 4.5em; overflow: auto; overflow-wrap: anywhere; }
 .workspace-status #message { flex: 1 1 220px; margin: 0; min-width: 0; block-size: 1.6em; max-width: 100%; }
+.workspace-status #message.error {
+  flex-basis: 100%;
+  block-size: auto;
+  overflow: visible;
+  scrollbar-gutter: auto;
+  white-space: pre-wrap;
+}
 .review-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 16px; margin-bottom: 12px; }
 .review-heading > h2 { margin: 0; }
 .review-heading > .queue-summary { grid-column: 1; margin: 0; }

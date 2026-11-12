@@ -43,6 +43,13 @@ async function startup({rootURI}) {
             if (entries.length !== 1 || entries[0].hidden || entries[0].disabled) {
               throw Error('Tools must contain one usable reMarkable Sync command');
             }
+            const menuIcon = 'chrome://notable/content/icons/tablet.svg';
+            const [entry] = entries;
+            if (!entry.classList.contains('menuitem-iconic')
+                || !window.getComputedStyle(entry).listStyleImage.includes(menuIcon)
+                || !entry.style.getPropertyValue('--custom-menu-icon-dark').includes(menuIcon)) {
+              throw Error('The Tools command is missing its native R icon');
+            }
             const manager = Zotero.openInViewer('chrome://mozapps/content/extensions/aboutaddons.html');
             try {
               const getIcon = () => manager.document.querySelector('browser')?.contentDocument
@@ -1860,7 +1867,7 @@ def main():
             assert client.server_id == json.loads(Path(config['ready']).read_text())['server']
             ui = command(root, 'open')
             assert ui['worker'] and any(name in ui['title'] for name in ['Notable', 'reMarkable Sync']) and 'Connect Zotero' in ui['buttons'], ui
-            checked('Zotero_Tools_opens_graphical_setup_and_Plugins_loads_the_R_icon')
+            checked('Zotero_Tools_and_Plugins_display_the_R_icon_and_Tools_opens_setup')
             if args.preferences_checks:
                 command(root, 'preferences')
                 checked('Zotero_settings_opens_setup_in_new_and_existing_workspaces')

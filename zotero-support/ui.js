@@ -38,7 +38,8 @@ var NotableUI = {
     }
     for (const [target, label] of [['main/menubar/tools', this.shortName], ['main/library/item', this.name + '…']]) {
       Zotero.MenuManager.registerMenu({menuID: 'notable-' + target.replaceAll('/', '-'), pluginID: this.id, target,
-        menus: [{menuType: 'menuitem', onShowing: (event, {menuElem}) => menuElem.setAttribute('label', label),
+        menus: [{menuType: 'menuitem', icon: target === 'main/menubar/tools' ? 'chrome://notable/content/icons/tablet.svg' : undefined,
+          onShowing: (event, {menuElem}) => menuElem.setAttribute('label', label),
           onCommand: () => this.open()}]});
     }
     // Startup is awaited while Zotero initializes plugins, before its first
