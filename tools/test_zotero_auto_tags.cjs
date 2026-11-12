@@ -10,7 +10,7 @@ function node(tag, text = '') {
   return {tag, textContent: text, children: [], listeners: {}, dataset: {}, isConnected: true,
     setAttribute(name, value) {this[name] = value;}, focus() {},
     addEventListener(type, callback) {(this.listeners[type] ||= []).push(callback);},
-    fire(type) {for (const callback of this.listeners[type] || []) callback({});},
+    fire(type, event = {}) {for (const callback of this.listeners[type] || []) callback(event);},
     replaceChildren() {this.children = [];},
     all() {return this.children.flatMap(child => [child, ...child.all()]);}};
 }
@@ -115,6 +115,9 @@ async function main() {
   const metadata = new Map([[match.key, {title: match.title, citation: [match.title, 'Gurevich', '2025'],
     files: [match.findings[0].name], fields: ['Vascular Imaging']}]]);
   ui.paperSearchMetadata = async () => metadata;
+  ui.zoteroPaperMatches = async (query, mode) => new Set(
+    (mode === 'citation' && query === 'gurevich 2025') || (mode === 'all' && query === 'vascular')
+      || (mode === 'citation' && query === 'Comparison') ? [match.key] : []);
   ui.reviewNavigationButton = (label, parent) => ui.button(label, parent, async () => {});
   ui.renderLinkedPaper = (parent, row, title) => ui.el('h3', title || row.name, parent);
   ui.action = async (method, params) => {
@@ -129,22 +132,30 @@ async function main() {
   const control = label => names.all().find(item => item['aria-label'] === label);
   const rerender = () => {names.replaceChildren(); ui.renderLinks(names);};
   const tick = () => new Promise(resolve => setImmediate(resolve));
+  const searchTick = async () => {
+    for (const [id, task] of timers) {
+      if (task.delay === 140) { timers.delete(id); await task.callback(); }
+    }
+  };
   ui.tab = 'links'; ui.view.document = {};
   ui.render = rerender;
   ui.schedule = () => {};
   rerender(); await tick();
   let search = control('Search linked papers');
-  search.value = 'gurevich 2025'; search.fire('input');
+  search.value = 'gurevich 2025'; search.fire('input'); await searchTick();
   assert.ok(find(match.title), 'Terms can match across citation fields');
   let mode = control('Search fields');
   mode.value = 'all'; mode.fire('change');
-  search.value = 'vascular'; search.fire('input');
+  assert.equal(ui.paperSearch.mode, 'all');
+  search.value = 'vascular'; search.fire('input'); await searchTick();
   assert.ok(find(match.title), 'All Fields & Tags searches tags');
-  search.value = 'no-match'; search.fire('input');
-  assert.ok(find('No papers match this search.'));
+  search.value = 'no-match'; search.fire('input'); await searchTick();
+  assert.equal(ui.paperSearch.appliedQuery, 'no-match');
+  assert.ok(find('No papers match this search.'), names.all().map(item => item.textContent).filter(Boolean).join(' / '));
   control('Clear search').fire('click');
   assert.equal(search.value, '');
   assert.ok(find(match.title));
+  mode.value = 'files'; mode.fire('change');
   await find('Review paper names').click();
   await tick();
   assert.ok(find(unlinked.title), 'All Zotero papers includes unlinked records');
@@ -157,11 +168,16 @@ async function main() {
   assert.ok(find('Preview rename'));
   assert.ok(find(rename.files[0].filename));
   assert.deepEqual(callsForNames.map(([method]) => method), ['maintenance', 'preview_filename_cleanup']);
+  mode = control('Search fields');
+  mode.value = 'citation'; mode.fire('change');
+  search.value = 'Comparison'; search.fire('input'); await searchTick();
   await find('Queue for review').click();
   assert.equal(callsForNames[2][1].selected[0].token, match.token);
+  await searchTick();
   await find('Queue rename').click();
   assert.equal(callsForNames[3][1].selected[0].identity, rename.identity);
   assert.equal(callsForNames[3][1].selected[0].token, rename.token);
+  await searchTick();
   assert.ok(find('Rename queued · ' + rename.target + '.pdf'));
   console.log('PASS: automatic quiet tag preparation, explicit-only approval, per-source caching, preserved draft choices, source changes, failures/retry, idle guards, and shutdown');
 }

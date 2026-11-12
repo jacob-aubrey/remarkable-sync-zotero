@@ -104,8 +104,10 @@ async function startup({rootURI}) {
             };
             const enter = value => { search().value = value; search().dispatchEvent(new ui.view.Event('input')); };
             await waitFor(() => contains(command.title), 'Citation metadata did not load');
+            enter('no matching citation');
+            await waitFor(() => contains('No papers match this search.'), 'Unmatched reference was still rendered');
             enter('gurevich 2025');
-            if (!contains(command.title)) throw Error('Creator and year did not match across fields');
+            await waitFor(() => contains(command.title), 'Creator and year did not match across fields');
             const mode = doc.querySelector('[aria-label="Search fields"]');
             const toolbar = mode.closest('.paper-search-toolbar');
             const reference = mode.cloneNode(true);
@@ -126,9 +128,16 @@ async function startup({rootURI}) {
             }
             mode.value = 'all'; mode.dispatchEvent(new ui.view.Event('change'));
             enter('vascular fixture tag');
-            if (!contains(command.title)) throw Error('Reference tags did not match');
-            enter('not in the library');
-            if (contains(command.title)) throw Error('Unmatched reference was still rendered');
+            await waitFor(() => contains(command.title), 'Reference tags did not match');
+            enter('"nonexistent tag"');
+            if (!contains(command.title) || !contains('Press Enter')) throw Error('Quoted query applied before Enter');
+            search().dispatchEvent(new ui.view.KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+            await waitFor(() => contains('No papers match this search.'), 'Quoted query did not apply on Enter');
+            enter('cafe');
+            await waitFor(() => contains(command.title), 'Accented Zotero note text did not match in All Fields & Tags');
+            mode.value = 'everything'; mode.dispatchEvent(new ui.view.Event('change'));
+            enter('fixtureembedding');
+            await waitFor(() => contains(command.title), 'Everything did not match indexed PDF text');
             doc.querySelector('[aria-label="Clear search"]').click();
             if (search().value || !contains(command.title)) throw Error('Clear search did not restore results');
             mode.value = 'files'; mode.dispatchEvent(new ui.view.Event('change'));
@@ -161,16 +170,22 @@ async function startup({rootURI}) {
             const reviewMode = doc.querySelector('[aria-label="Search fields"]');
             reviewMode.value = 'citation'; reviewMode.dispatchEvent(new ui.view.Event('change'));
           }
+          else if (command.action === 'index_search_fixture') {
+            const libraryID = Zotero.Libraries.userLibraryID;
+            const parent = await Zotero.Items.getByLibraryAndKeyAsync(libraryID, command.parent);
+            const attachment = await Zotero.Attachments.importFromFile({file: command.path, parentItemID: parent.id});
+            await Zotero.FullText.indexItems([attachment.id]);
+            response.attachment = attachment.key;
+          }
           else if (command.action === 'tag_search_ui') {
             const doc = ui.view.document;
             const waitFor = async (predicate, message) => {
               for (let i = 0; i < 150 && !predicate(); i++) await Zotero.Promise.delay(50);
               if (!predicate()) throw Error(message);
             };
-            const input = () => doc.querySelector('[aria-label="Filter tag list"]');
+            const input = () => doc.querySelector('[aria-label="Filter tag names"]');
             const choices = () => [...doc.querySelectorAll('.tag-list > button')];
             const choose = tag => choices().find(button => button.textContent === tag);
-            const search = () => [...doc.querySelectorAll('main button')].find(button => button.textContent === 'Search');
             const found = title => [...doc.querySelectorAll('.search-result > h3')].some(node => node.textContent === title);
             const filter = value => { input().value = value; input().dispatchEvent(new ui.view.Event('input')); };
             const changeScope = value => {
@@ -180,20 +195,28 @@ async function startup({rootURI}) {
             await waitFor(() => ui.paperTagBank?.tags.includes('Reading list'), 'The native paper tag bank did not warm before opening Tags');
             const originalRPC = ui.rpc;
             const originalLinks = ui.latest.links;
+            await Zotero.Tags.setColor(Zotero.Libraries.userLibraryID, 'Read', '#0077aa');
             let helperCalls = 0;
             ui.rpc = (...params) => {
               helperCalls++;
               return originalRPC.call(ui, ...params);
             };
             try {
-              ui.latest.links = [{parent: command.parent, view_key: 'fixture-view',
+              ui.latest.links = [{parent: command.parent, view_key: command.attachment,
                 page_map: ['current-page'], page_tags: {'current-page': ['Saved page tag'], orphan: ['Orphan tag']}}];
               ui.busy = true;
               ui.openTab('tags');
               if (!choose('Read') || !choose('Reading list')) throw Error('Opening Tags did not show the warm bank immediately');
+              if (!choose('Read').classList.contains('colored-tag')) throw Error('The plugin did not show the native Zotero tag color');
               if (choose('Trash-only fixture tag') || choose('Note-only fixture tag')) throw Error('The paper bank included a trashed paper or note');
               changeScope('page');
               if (!choose('Saved page tag') || choose('Orphan tag') || choose('Read')) throw Error('Page tags were not read from current saved links');
+              choose('Saved page tag').click();
+              await waitFor(() => found(command.title),
+                'Page tag search did not find the matching linked page during sync');
+              if (![...doc.querySelectorAll('.search-result button')].some(button => button.textContent === 'Open page')) {
+                throw Error('A page result did not offer to open the matching page');
+              }
               changeScope('paper');
               if (helperCalls) throw Error('Browsing the tag bank called the busy helper');
             } finally {
@@ -209,25 +232,24 @@ async function startup({rootURI}) {
             parent.removeTag('New native fixture tag');
             await parent.saveTx();
             await waitFor(() => !choose('New native fixture tag'), 'The removed Zotero tag stayed in the picker');
-            ui.view.dispatchEvent(new ui.view.KeyboardEvent('keydown', {key: 'f', ctrlKey: true}));
-            if (doc.activeElement !== input()) throw Error('Ctrl+F did not focus the tag list filter');
+            ui.view.dispatchEvent(new ui.view.KeyboardEvent('keydown', {key: 'K', ctrlKey: true, shiftKey: true}));
+            if (doc.activeElement !== input()) throw Error('Zotero Quick Search shortcut did not focus the tag list filter');
             filter('read');
             if (choose('Vascular fixture tag') || !choose('Read') || !choose('Reading list')) throw Error('Typing did not narrow the tag list');
             choose('Read').click();
             filter('vascular');
             choose('Vascular fixture tag').click();
-            if (found(command.title)) throw Error('Tag selection applied before Search');
             if (!doc.querySelector('[aria-label="Remove Read from selected tags"]')) throw Error('The picker lost a selected tag after filtering');
-            search().click();
             await waitFor(() => found(command.title), 'Match all did not return the paper with both tags');
             if (found(command.unreadTitle)) throw Error('Match all included a paper with only one selected tag');
             const match = doc.querySelector('[aria-label="Match selected tags"]');
             match.value = 'any'; match.dispatchEvent(new ui.view.Event('change'));
-            if (found(command.unreadTitle) || !doc.querySelector('main').textContent.includes('Your choices changed')) {
-              throw Error('Changing Match did not retain and label the last search');
-            }
-            search().click();
             await waitFor(() => found(command.unreadTitle), 'Match any did not include the paper with one tag');
+            const automatic = doc.querySelector('[data-notable-field="Show automatic tags"]');
+            automatic.checked = false;
+            automatic.dispatchEvent(new ui.view.Event('change'));
+            filter('automatic');
+            if (choose('Automatic fixture tag')) throw Error('The automatic-tag toggle did not hide imported tags');
             doc.querySelector('[aria-label="Clear search"]').click();
             if (input().value || !doc.querySelector('[aria-label="Remove Read from selected tags"]')) throw Error('Clearing text cleared the tag selection');
             const clear = [...doc.querySelectorAll('main button')].find(button => button.textContent === 'Clear selection');
@@ -237,14 +259,24 @@ async function startup({rootURI}) {
             if (choose('Read')) throw Error('Page scope showed a paper-only tag');
             changeScope('paper');
             choose('Read').click();
-            search().click();
             await waitFor(() => found(command.title) && !found(command.unreadTitle), 'Exact Read selection did not update the results');
+            parent.removeTag('Read');
+            await parent.saveTx();
+            await waitFor(() => !found(command.title) && doc.querySelector('.tag-search').textContent.includes('No papers match'),
+              'Changing a tag in Zotero did not update active tag results');
+            parent.addTag('Read');
+            await parent.saveTx();
+            await waitFor(() => found(command.title), 'Restoring a Zotero tag did not restore its result');
+            [...doc.querySelectorAll('.search-result button')].find(button => button.textContent === 'Show Zotero tags').click();
+            const native = Zotero.getMainWindow().document.getElementById('zotero-item-details');
+            await waitFor(() => Zotero.getActiveZoteroPane().getSelectedItems()[0]?.key === command.parent
+              && native.getPane('tags').open, 'Show Zotero tags did not select the paper and open its native Tags section');
             const savedBank = ui.paperTagBank;
             const savedRPC = ui.rpc;
             let searchCalls = 0;
             try {
-              ui.paperTagBank = {...savedBank, tags: Array.from({length: 1346}, (_, index) =>
-                'Fixture tag ' + String(index).padStart(4, '0') + ' with a longer name')};
+              const tags = Array.from({length: 1346}, (_, index) => 'Fixture tag ' + String(index).padStart(4, '0') + ' with a longer name');
+              ui.paperTagBank = {...savedBank, tags, manual: new Set(tags)};
               ui.rpc = (method, ...params) => {
                 if (method === 'tag_search') searchCalls++;
                 return savedRPC.call(ui, method, ...params);
@@ -298,11 +330,28 @@ async function startup({rootURI}) {
               const filter = main().querySelector('[aria-label="Filter import exceptions"]');
               filter.value = 'unavailable'; filter.dispatchEvent(new ui.view.Event('input'));
               if (!main().textContent.includes('1 of 2 import exceptions')) throw Error('Import search did not count the matching scan error');
-              main().querySelector('[aria-label="Clear search"]').click();
+              filter.closest('.paper-search-box').querySelector('[aria-label="Clear search"]').click();
               if (filter.value || !main().textContent.includes('2 of 2 import exceptions')) throw Error('Import search did not clear');
               control('Open Inbox').click();
               for (let i = 0; ui.tab !== 'inbox' && i < 50; i++) await Zotero.Promise.delay(20);
               if (ui.tab !== 'inbox') throw Error('Import did not lead to Inbox');
+              const inboxSearch = main().querySelector('[aria-label="Search Inbox"]');
+              inboxSearch.focus(); inboxSearch.value = 'missing';
+              inboxSearch.dispatchEvent(new ui.view.Event('input'));
+              if (!main().textContent.includes('No Inbox entries match this search.')
+                  || doc.activeElement !== main().querySelector('[aria-label="Search Inbox"]')) {
+                throw Error('Inbox search did not preserve keyboard focus and show its empty state');
+              }
+              doc.activeElement.dispatchEvent(new ui.view.KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+              if (main().querySelector('[aria-label="Search Inbox"]').value) throw Error('Escape did not clear Inbox search');
+              const size = Zotero.Prefs.get('fontSize');
+              try {
+                const heading = () => parseFloat(ui.view.getComputedStyle(main().querySelector('h2')).fontSize);
+                const baseline = heading();
+                Zotero.Prefs.set('fontSize', 1.5);
+                Zotero.UIProperties.setAll();
+                if (size < 1.5 && heading() <= baseline) throw Error('The workspace did not follow Zotero’s font size');
+              } finally { Zotero.Prefs.set('fontSize', size); Zotero.UIProperties.setAll(); }
               for (const tab of ['inbox', 'library', 'sync-review']) {
                 ui.openTab(tab);
                 const empty = main().querySelector('.review-empty');
@@ -940,7 +989,7 @@ async function startup({rootURI}) {
             const style = node => reader._iframeWindow.getComputedStyle(node);
             if (style(button).getPropertyValue('-moz-window-dragging') !== 'no-drag'
                 || button.textContent.trim() || !button.querySelector('svg') || button.tabIndex !== -1
-                || button.getAttribute('aria-label') !== button.title || button.title !== 'Tag this paper and/or page') {
+                || button.getAttribute('aria-label') !== button.title || button.title !== 'Edit paper and page tags') {
               throw Error('Reader tag control is missing native toolbar styling, icon, or accessible name');
             }
             const themeRoot = doc.documentElement;
@@ -1441,7 +1490,7 @@ def bulk_checks(client, root, checked, count, resume=False):
     command(root, 'snapshot')
     import shutil
     shutil.copyfile(root / 'workspace.png', root / 'tag-workspace.png')
-    assert ui_tags['readerButton'] == 'Tag this paper and/or page' and ui_tags['readerPage'] == 0
+    assert ui_tags['readerButton'] == 'Edit paper and page tags' and ui_tags['readerPage'] == 0
     assert ui_tags['savedDuringSync']
     edit = next(r for r in ui_tags['requests'] if r['method'] == 'apply_tag_edit')['params']
     assert (edit['key'], edit['page_id']) == (key, context['page_id'])
@@ -1766,11 +1815,11 @@ def maintenance_checks(client, root, checked):
     filename = 'Gurevich_et_al_UnknownJournal_2025.pdf'
     client.create('item', {'key': parent, 'itemType': 'journalArticle', 'title': title, 'date': '2025',
                            'creators': [{'creatorType': 'author', 'lastName': 'Gurevich'}],
-                           'tags': [{'tag': 'Vascular fixture tag'}, {'tag': 'Read'}]})
+                           'tags': [{'tag': 'Vascular fixture tag'}, {'tag': 'Read'}, {'tag': 'Automatic fixture tag', 'type': 1}]})
     client.create('item', {'key': unread, 'itemType': 'journalArticle', 'title': unread_title,
                            'tags': [{'tag': 'Vascular fixture tag'}, {'tag': 'Reading list'}]})
     client.create('item', {'key': 'NMTG2345', 'itemType': 'note', 'parentItem': parent,
-                           'note': '<p>Tag bank fixture</p>', 'tags': [{'tag': 'Note-only fixture tag'}]})
+                           'note': '<p>Tag bank fixture: café</p>', 'tags': [{'tag': 'Note-only fixture tag'}]})
     client.create('item', {'key': 'NMTR2345', 'itemType': 'document', 'title': 'Trashed tag fixture',
                            'deleted': 1, 'tags': [{'tag': 'Trash-only fixture tag'}]})
     client.create('item', {'key': 'NMFL2345', 'itemType': 'attachment', 'parentItem': parent,
@@ -1780,11 +1829,17 @@ def maintenance_checks(client, root, checked):
     [missing] = [row for row in result['matches'] if row['key'] == parent]
     assert missing['findings'] == [{'where': 'Zotero filename', 'name': filename, 'attachment': 'NMFL2345'}], missing
     checked('packaged_name_review_finds_zotero_attachment_even_without_local_pdf')
+    import pymupdf
+    pdf_path = root / 'Indexed search fixture.pdf'
+    with pymupdf.open() as pdf:
+        pdf.new_page().insert_text((40, 40), 'fixtureembedding')
+        pdf.save(pdf_path)
+    indexed = command(root, 'index_search_fixture', parent=parent, path=str(pdf_path))['attachment']
     command(root, 'paper_search_ui', parent=parent, title=title, filename=filename, unread=unread, unreadTitle=unread_title)
-    checked('native_paper_search_matches_citations_tags_and_filenames_and_clears_without_leaving_view')
+    checked('native_paper_search_matches_citations_tags_notes_pdf_text_and_filenames')
     checked('native_read_and_unread_filter_use_the_exact_zotero_tag_and_refresh_after_edits')
-    command(root, 'tag_search_ui', parent=parent, title=title, unreadTitle=unread_title)
-    checked('native_tag_picker_stages_exact_tags_and_runs_all_or_any_on_demand')
+    command(root, 'tag_search_ui', parent=parent, title=title, unreadTitle=unread_title, attachment=indexed)
+    checked('native_tag_picker_filters_immediately_and_opens_the_zotero_tags_section')
     checked('native_tag_bank_is_ready_without_the_worker_and_refreshes_after_tag_edits')
     checked('native_large_tag_bank_loads_on_scroll_and_keyboard_without_searching_or_jumping')
     repair_key = 'TAGR2345'

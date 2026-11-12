@@ -26,7 +26,11 @@ var NotableUI = {
     this.collectionObserver = Zotero.Notifier.registerObserver({notify: (event, type) => {
       if (type === 'collection') this.refreshCollectionNames();
       this.observeReviewChange(event, type);
-    }}, ['collection', 'item', 'collection-item', 'item-tag', 'tag', 'trash'], this.id);
+      if (type === 'setting' && event === 'modify' && this.tab === 'tags') {
+        this.paperTagEvidenceSerial = (this.paperTagEvidenceSerial || 0) + 1;
+        this.scheduleSearchRefresh();
+      }
+    }}, ['collection', 'item', 'collection-item', 'item-tag', 'tag', 'trash', 'setting'], this.id);
     this.statePath = PathUtils.join(Zotero.Profile.dir, 'notable');
     await IOUtils.makeDirectory(this.statePath, {ignoreExisting: true});
     this.folderRecents = {};
@@ -106,7 +110,7 @@ var NotableUI = {
       button.type = 'button';
       button.className = 'toolbar-button notable-page-tag';
       button.tabIndex = -1;
-      button.title = 'Tag this paper and/or page';
+      button.title = 'Edit paper and page tags';
       button.setAttribute('aria-label', button.title);
       // Use the bundled SVG inline so its stroke takes the reader's toolbar color.
       button.innerHTML = icon;
@@ -446,7 +450,7 @@ var NotableUI = {
     if (['item', 'collection-item'].includes(type) && ['add', 'modify', 'delete', 'trash', 'move', 'remove'].includes(event)) {
       this.zoteroInboxDirty = true;
     }
-    if (['item', 'item-tag', 'tag'].includes(type) && ['add', 'modify', 'delete', 'trash', 'remove'].includes(event)) {
+    if (type === 'trash' || (['item', 'item-tag', 'tag'].includes(type) && ['add', 'modify', 'delete', 'trash', 'remove'].includes(event))) {
       this.paperTagEvidenceSerial = (this.paperTagEvidenceSerial || 0) + 1;
       this.scheduleSearchRefresh();
     }
@@ -469,9 +473,13 @@ var NotableUI = {
     if (!this.view?.document || this.view.closed || !['links', 'tags'].includes(this.tab)) return;
     clearTimeout(this.searchRefreshTimer);
     this.searchRefreshTimer = setTimeout(() => {
+      if (this.tab === 'tags' && !this.tagEditor && !this.stopped && this.view?.document && !this.view.closed) {
+        this.render();
+        return;
+      }
       this.searchRefreshWaiting = this.busy;
       if (!this.busy && !this.stopped && this.view?.document && !this.view.closed
-          && (this.tab === 'links' || (this.tab === 'tags' && !this.tagEditor))) this.render();
+          && this.tab === 'links') this.render();
     }, 160);
   },
   reviewFreshnessMessage(queue = this.tab === 'review' ? 'inbox' : this.tab) {
@@ -1363,11 +1371,16 @@ var NotableUI = {
   },
   async mount(window) {
     this.view = window;
+    if (typeof Zotero !== 'undefined') Zotero.UIProperties?.registerRoot(window.document.querySelector('body'));
     window.addEventListener('keydown', event => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
-        const search = window.document.querySelector?.('[data-quick-search]');
-        if (search) { event.preventDefault(); search.focus(); search.select(); }
-      }
+      if (event.defaultPrevented || event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key !== 'f' && !(key === 'k' && event.shiftKey)) return;
+      const dialogs = window.document.querySelectorAll('dialog[open]');
+      const scope = dialogs.length ? dialogs[dialogs.length - 1] : window.document;
+      const search = [...scope.querySelectorAll('[data-quick-search]:not([disabled])')]
+        .find(field => field.getClientRects().length);
+      if (search) { event.preventDefault(); search.focus(); search.select(); }
     });
     clearInterval(this.activityTimer); this.activityTimer = setInterval(() => this.updateActivity(), 1000);
     this.latest ||= {config: {}, status: {}, reviews: [], deletions: [], links: [], types: {}};
@@ -1655,7 +1668,7 @@ var NotableUI = {
       label: option.textContent, path: option.textContent, parent: '',
       detail: settings.details?.(option) || option.dataset?.detail || ''}));
     const chooser = NotableFolderChooser.create({document: parent.ownerDocument, parent, label,
-      options: choices(), value: input.value, mode: 'record'});
+      options: choices(), value: input.value, mode: 'record', search: this.chooserSearch.bind(this)});
     input.notableRecordChooser = chooser;
     input.notableRefreshRecords = () => {chooser.setOptions(choices()); chooser.value = input.value;};
     chooser.addEventListener('change', () => {
@@ -1701,7 +1714,7 @@ var NotableUI = {
     input.tabIndex = -1;
     const chooser = NotableFolderChooser.create({document: parent.ownerDocument, parent, label,
       options: this.folderOptions(options, kind), value: multiple ? Array.from(input.selectedOptions, option => option.value) : input.value,
-      multiple, recents: this.folderRecents?.[kind] || [],
+      multiple, recents: this.folderRecents?.[kind] || [], search: this.chooserSearch.bind(this),
       onRemember: value => this.rememberFolder(kind, value),
       onNew: settings.create === false ? undefined : async parentValue => {
         const creationKind = settings.createKind || kind;
@@ -1846,12 +1859,15 @@ var NotableUI = {
   supportingInformationPicker(parent, initial = {}) {
     const panel = this.el('section', '', parent);
     this.el('p', 'Supporting information is an extra attachment under its main paper. The main paper’s citation stays unchanged.', panel, {class: 'hint'});
-    const query = this.field('Main paper title contains', panel, initial.main_query || '');
+    const {toolbar, input: query} = this.quickSearch(panel, {label: 'Search main paper titles',
+      value: initial.main_query || '', submit: () => find.click()});
+    query.dataset.notableField = 'Main paper title contains';
+    const actions = this.el('div', '', toolbar, {class: 'actions'});
     const select = this.paperSelect('Main paper in Zotero (required)', panel, [['', 'Choose the main paper…']], '');
     const status = this.el('p', '', panel, {class: 'hint', role: 'status'});
     let generation = 0;
     const load = async () => {
-      const current = ++generation, queryText = query.value.toLocaleLowerCase();
+      const current = ++generation, terms = this.searchTerms(query.value);
       const items = await Zotero.Items.getAll(Zotero.Libraries.userLibraryID, false, false);
       const choices = [];
       for (const item of items) {
@@ -1859,7 +1875,7 @@ var NotableUI = {
         await item.loadAllData();
         if (!select.isConnected || current !== generation) return;
         const record = item.toJSON(), title = record.title || '(Untitled reference)';
-        if (!title.toLocaleLowerCase().includes(queryText)) continue;
+        if (!this.matchesSearchTerms(title, terms)) continue;
         const attachments = typeof Zotero.Items.get === 'function' && typeof item.getAttachments === 'function'
           ? item.getAttachments().map(id => Zotero.Items.get(id)).filter(attachment => attachment && !attachment.deleted && attachment.isPDFAttachment?.()) : [];
         const filenames = [];
@@ -1883,7 +1899,7 @@ var NotableUI = {
       status.textContent = `${choices.length} papers found. Select the main article, not another supporting file.`;
       select.dispatchEvent(new this.view.Event('change'));
     };
-    const find = this.button('Find main paper', panel, load); find.dataset.browse = 'true';
+    const find = this.button('Find main paper', actions, load); find.dataset.browse = 'true';
     return {panel, query, select, load: () => load().catch(error => { if (status.isConnected) status.textContent = error.message; })};
   },
   openTab(tab) {
@@ -1894,13 +1910,16 @@ var NotableUI = {
     this.selected = this.queueSelections[tab] || null;
     this.reviewScrollTop = 0;
     this.render();
+    this.view?.document.querySelector?.('nav button[aria-pressed="true"]')?.focus?.({preventScroll: true});
   },
   render() {
     if (!this.view || this.view.closed) return;
     this.inboxRenderPending = false;
     this.collectionCatalog();
     this.hideButtonHelp();
-    const focus = this.captureFocus();
+    const focus = this.renderedTab === this.tab ? this.captureFocus() : null;
+    this.tagSearchFocus = this.tab === 'tags' ? focus?.label : null;
+    if (this.tagSearch) this.tagSearch.drawResults = null;
     const reviewContext = ['review', 'inbox', 'library', 'sync-review'].includes(this.tab) && this.renderedTab === this.tab ? this.captureReviewContext() : null;
     const previousList = this.view.document.querySelector('.review-layout > aside');
     if (previousList && this.renderedTab === this.tab) this.reviewScrollTop = previousList.scrollTop;
@@ -1920,6 +1939,7 @@ var NotableUI = {
         nav, () => this.openTab(tab));
       if (tab === 'sync-review') { button.dataset.syncConflicts = String(count); if (count) button.classList.add('sync-conflicts-attention'); }
       button.dataset.browse = 'true';
+      button.dataset.notableField = `Section ${label}`;
       button.setAttribute('aria-pressed', String((this.tab === 'review' ? 'inbox' : this.tab) === tab));
     }
     const status = this.el('div', '', root, {class: 'workspace-status'});
@@ -2013,6 +2033,7 @@ var NotableUI = {
   renderTags(content) {
     if (this.tagEditor) { this.renderTagEditor(content); return; }
     this.el('h2', 'Tags', content);
+    this.el('p', 'Paper tags are shared with Zotero’s Tags pane. Page tags mark individual pages of linked PDFs.', content, {class: 'hint'});
     this.renderTagSearch(content);
     this.renderTagMaintenance(content);
   },
@@ -2020,14 +2041,16 @@ var NotableUI = {
     this.renderKeywordCleanup(content);
     const finder = this.el('details', '', content, {class: 'card'});
     this.el('summary', 'Paper keywords and tag suggestions', finder);
-    this.el('p', 'Choose a stored PDF by title. Keywords can be added automatically; additional topic suggestions need your approval.', finder);
-    const titleQuery = this.field('Paper title contains', finder);
+    this.el('p', 'Find a stored PDF by title. Approve the topics you want to add as paper tags.', finder);
+    const {toolbar, input: titleQuery} = this.quickSearch(finder, {label: 'Search PDF titles', submit: () => find.click()});
+    delete titleQuery.dataset.quickSearch;
+    const actions = this.el('div', '', toolbar, {class: 'actions'});
     const results = this.el('div', '', finder);
-    this.button('Find papers', finder, async () => {
+    const find = this.button('Find papers', actions, async () => {
       const value = await this.action('paper_tag_candidates', {query: titleQuery.value}, false);
-      if (!value) return;
+      if (!value || !results.isConnected) return;
       results.replaceChildren();
-      this.el('p', `${value.total} matching PDFs${value.total > 50 ? '; showing the first 50' : ''}.`, results);
+      this.el('p', `${value.total} matching PDFs${value.total > 50 ? ' · Showing the first 50' : ''}`, results, {role: 'status'});
       for (const paper of value.candidates) {
         const card = this.el('section', '', results, {class: 'card'});
         this.el('strong', paper.title, card); this.el('p', paper.filename, card, {class: 'hint'});
@@ -2043,6 +2066,7 @@ var NotableUI = {
   },
   renderTagEntry(section, {kind, values, inputValue = '', list, empty = `No ${kind} tags yet.`, onChange}) {
     const label = `Add ${kind} tag`, tags = new Set(values);
+    const colors = kind === 'paper' && typeof Zotero !== 'undefined' && Zotero.Tags?.getColors(Zotero.Libraries.userLibraryID);
     const chips = this.el('div', '', section, {class: 'tag-chips'});
     const entry = this.el('div', '', section, {class: 'tag-editor-entry'});
     const input = this.field(label, entry, inputValue);
@@ -2066,6 +2090,8 @@ var NotableUI = {
       for (const value of [...tags].sort()) {
         const chip = this.button(`${value} ×`, chips, () => { tags.delete(value); update(); draw(); });
         chip.dataset.browse = 'true'; chip.setAttribute('aria-label', `Remove ${value} from ${kind} tags`);
+        if (colors) this.applyTagColor(chip, value, colors);
+        chip.addEventListener('click', () => input.focus());
       }
       const choices = this.recentTags.filter(tag => !tags.has(tag));
       recent.hidden = !choices.length;
@@ -2104,7 +2130,7 @@ var NotableUI = {
       this.tagDrafts.set(draftKey, {paper: [...baseline.paper], page: [...baseline.page], baseline, token: context.token});
     }
     const draft = this.tagDrafts.get(draftKey);
-    this.el('p', 'Paper tags categorize the whole reference. Page tags identify this exact page. Both sync with reMarkable.', card);
+    this.el('p', 'Paper tags appear on the Zotero reference. Page tags mark this page. Both sync with reMarkable.', card);
     if (context.interrupted) {
       this.el('p', 'A previous tag sync was interrupted. Sync normally to retry. If tags changed on both copies during that interruption, combine their current tags to recover; labels present on either copy will be retained.', card);
       this.button('Combine current tags and retry', card, async () => {
@@ -2129,13 +2155,12 @@ var NotableUI = {
         if (result) { draft.token = result.token; this.tagEditor = result; this.render(); }
       });
     }
-    const suggestions = this.el('datalist', '', card, {id: 'notable-tag-vocabulary'});
-    for (const value of context.vocabulary) this.el('option', '', suggestions, {value});
     const editor = (title, kind) => {
       const section = this.el('section', '', card, {class: 'tag-editor-scope'});
       this.el('h3', title, section);
+      const list = this.tagSuggestions(section, kind, context.vocabulary);
       return this.renderTagEntry(section, {kind, values: draft[kind], inputValue: draft[kind + 'Input'],
-        list: 'notable-tag-vocabulary', onChange: (tags, text) => { draft[kind] = tags; draft[kind + 'Input'] = text; }});
+        list, onChange: (tags, text) => { draft[kind] = tags; draft[kind + 'Input'] = text; }});
     };
     const paper = editor('Paper tags', 'paper'), page = editor('Page tags', 'page');
     this.paperTagPanel(card, {key: context.key});
@@ -2170,12 +2195,14 @@ var NotableUI = {
       this.tagDrafts.delete(draftKey); this.tagEditor = result; this.render(); this.message('Tags saved. They will reach reMarkable on the next sync.');
     }, true);
     if (context.parent_key && context.pdf_digest) save.dataset.browse = 'true';
+    const reference = context.parent_key || context.reference?.key;
+    if (reference) this.button('Show Zotero tags', footer, () => this.showZoteroTags(reference), false, 'tag').dataset.browse = 'true';
     this.button('Close page editor', footer, close).dataset.browse = 'true';
   },
   renderReferenceTagEditor(card, context, close) {
     const match = context.linkedCopy;
     if (match) {
-      this.el('p', 'This paper is already linked to reMarkable through another PDF. Open the linked copy to edit its page tags.', card);
+      this.el('p', 'This paper syncs through another PDF. Open that copy to edit its page tags.', card);
       this.button('Open linked PDF', card, async () => {
         if (context.connection !== this.filingConnection()) throw Error('The sync connection changed. Open the tag editor again.');
         const current = this.latest.links?.find(row => row.cloud === match.cloud && row.view_key === match.view_key && !row.unavailable);
@@ -2197,6 +2224,7 @@ var NotableUI = {
     this.el('h3', 'Paper tags', card);
     const draft = context.paperDraft;
     const editor = this.renderTagEntry(card, {kind: 'paper', values: draft.tags, inputValue: draft.input,
+      list: this.tagSuggestions(card, 'paper'),
       onChange: (tags, input) => Object.assign(draft, {tags, input})});
     this.button('Save paper tags', card, async () => {
       if (draft.saving) return;
@@ -2221,10 +2249,19 @@ var NotableUI = {
         this.message('Paper tags saved to this Zotero reference.');
       } finally { draft.saving = false; }
     }, true).dataset.browse = 'true';
+    this.button('Show Zotero tags', card, () => this.showZoteroTags(context.reference.key), false, 'tag').dataset.browse = 'true';
     this.button('Close page editor', card, close).dataset.browse = 'true';
   },
   tagSearchState() {
-    return this.tagSearch ||= {query: '', scope: 'paper', match: 'all', tags: new Set(), limit: 25};
+    return this.tagSearch ||= {query: '', scope: 'paper', match: 'all', tags: new Set(), limit: 25,
+      showAutomatic: Zotero.Prefs.get('tagSelector.showAutomatic') !== false};
+  },
+  tagSuggestions(parent, kind, fallback = []) {
+    const id = `notable-${kind}-tag-suggestions`;
+    const list = this.el('datalist', '', parent, {id});
+    const names = kind === 'paper' ? this.paperTagBank?.tags : this.pageTagNames();
+    for (const value of names ?? fallback) this.el('option', '', list, {value});
+    return id;
   },
   tagEvidence() {
     return `${this.paperTagEvidenceSerial || 0}:${this.tagSyncRevision || 0}`;
@@ -2253,7 +2290,8 @@ var NotableUI = {
           await Zotero.DB.queryAsync(`DROP TABLE IF EXISTS ${tmpTable}`, false, {noCache: true});
         }
       }
-      this.paperTagBank = {revision, tags: [...new Set(rows.map(row => row.tag))].sort((a, b) => a.localeCompare(b))};
+      this.paperTagBank = {revision, tags: [...new Set(rows.map(row => row.tag))].sort((a, b) => a.localeCompare(b)),
+        manual: new Set(rows.filter(row => !row.type).map(row => row.tag))};
     } catch (error) {
       this.paperTagBankError = 'Couldn’t load Zotero paper tags. ' + error.message;
     } finally {
@@ -2267,7 +2305,7 @@ var NotableUI = {
     if (this.pageTagBank?.links === links && this.pageTagBank) return this.pageTagBank.tags;
     const names = new Set();
     for (const row of links || []) {
-      if (!row.parent || !row.view_key || !row.page_tags) continue;
+      if (row.unavailable || !row.parent || !row.view_key || !row.page_tags) continue;
       const pages = new Set(row.page_map || []);
       for (const [page, tags] of Object.entries(row.page_tags)) {
         if (pages.has(page)) for (const tag of tags) names.add(tag);
@@ -2283,54 +2321,87 @@ var NotableUI = {
     }
   },
   async runTagSearch(state) {
-    if (state.pending) return;
-    const criteria = {scope: state.scope, match: state.match, tags: [...state.tags].sort()};
-    const evidence = this.tagEvidence();
-    state.pending = true;
+    const {scope, match, showAutomatic, browseAll} = state;
+    const tags = [...state.tags];
+    const signature = JSON.stringify([this.tagEvidence(), scope, match, showAutomatic, tags, !!browseAll]);
+    if (state.request?.signature === signature) return;
+    const request = state.request = {signature};
+    state.applied = null;
     state.searchError = '';
-    this.refreshTagSearchView(state);
+    state.pending = !!(tags.length || browseAll);
+    state.drawResults?.();
+    if (!state.pending) return;
     try {
-      const result = await this.rpc('tag_search', {...criteria, results_only: true});
-      const rows = result.results.sort((a, b) => (a.scope === 'page') - (b.scope === 'page')
+      const rows = [];
+      const items = await Zotero.Items.getAll(Zotero.Libraries.userLibraryID, false, false);
+      if (state.request !== request) return;
+      const pdfs = new Map(items.filter(item => item.isPDFAttachment() && !notableReviewItemInTrash(item)).map(item => [item.key, item]));
+      if (scope !== 'page') {
+        const references = items.filter(item => item.isRegularItem() && !item.deleted);
+        const withPDF = new Set([...pdfs.values()].map(item => item.parentKey));
+        for (const {item, tags: matched} of await notableMatchingPaperTags(references, tags, match, showAutomatic)) {
+          rows.push({scope: 'paper', parent: item.key, title: item.getDisplayTitle(), tags: matched, pdf: withPDF.has(item.key)});
+        }
+      }
+      if (scope !== 'paper') {
+        const parents = new Map(items.filter(item => item.isRegularItem() && !item.deleted).map(item => [item.key, item]));
+        const selected = new Set(tags);
+        for (const link of this.latest?.links || []) {
+          const parent = parents.get(link.parent);
+          if (link.unavailable || !parent || pdfs.get(link.view_key)?.parentKey !== parent.key) continue;
+          for (const [page, pageID] of (link.page_map || []).entries()) {
+            const names = link.page_tags?.[pageID] || [];
+            const matched = selected.size ? names.filter(tag => selected.has(tag)) : names;
+            if (matched.length && (match === 'any' || matched.length >= selected.size)) {
+              rows.push({scope: 'page', parent: parent.key, key: link.view_key, page, page_id: pageID,
+                title: parent.getDisplayTitle(), tags: matched});
+            }
+          }
+        }
+      }
+      if (state.request !== request) return;
+      rows.sort((a, b) => (a.scope === 'page') - (b.scope === 'page')
         || a.title.localeCompare(b.title) || (a.page ?? 0) - (b.page ?? 0));
-      state.applied = {criteria, evidence, rows};
-      state.limit = 25;
+      state.applied = rows;
     } catch (error) {
-      state.searchError = 'Couldn’t search for tagged papers or pages. ' + error.message;
+      if (state.request === request) state.searchError = 'Couldn’t load tagged items. ' + error.message;
     } finally {
-      state.pending = false;
-      this.refreshTagSearchView(state);
+      if (state.request === request) {
+        state.pending = false;
+        state.drawResults?.();
+      }
     }
   },
   renderTagSearch(content) {
     const state = this.tagSearchState();
     const paperTags = this.paperTagBank?.tags;
     const pageTags = this.pageTagNames();
-    const choicesByScope = {
-      paper: paperTags || [],
-      page: pageTags,
-      both: [...new Set([...(paperTags || []), ...pageTags])].sort((a, b) => a.localeCompare(b)),
+    const colors = Zotero.Tags.getColors(Zotero.Libraries.userLibraryID);
+    const choices = () => {
+      const papers = (paperTags || []).filter(tag => state.showAutomatic || this.paperTagBank.manual?.has(tag) || colors.has(tag));
+      if (state.scope === 'page') return pageTags;
+      const tags = state.scope === 'paper' ? papers : [...new Set([...papers, ...pageTags])];
+      return tags.sort((a, b) => (colors.get(a)?.position ?? Infinity) - (colors.get(b)?.position ?? Infinity) || a.localeCompare(b));
     };
     const tagBatchSize = 60;
     const panel = this.el('section', '', content, {class: 'tag-search'});
-    const {toolbar, input} = this.quickSearch(panel, {label: 'Filter tag list', value: state.query,
-      change: value => { state.query = value; drawTags(); }, submit: () => this.runTagSearch(state)});
-    const scope = this.searchSelect(toolbar, 'Search in', [['paper', 'Papers'], ['page', 'Pages'], ['both', 'Papers and pages']], state.scope);
+    const {toolbar, input} = this.quickSearch(panel, {label: 'Filter tag names', value: state.query,
+      change: value => { state.query = value; state.scrollTop = 0; drawTags(); }});
+    const scope = this.searchSelect(toolbar, 'Search in', [['paper', 'Paper tags'], ['page', 'Page tags'], ['both', 'Paper and page tags']], state.scope);
     const match = this.searchSelect(toolbar, 'Match selected tags', [['all', 'Match all'], ['any', 'Match any']], state.match);
-    const actions = this.el('div', '', toolbar, {class: 'actions'});
-    const search = this.button('Search', actions, () => this.runTagSearch(state), true, 'search');
-    search.dataset.browse = 'true';
-    search.dataset.notableField = 'Search selected tags';
-    search.disabled = state.pending;
-    search.setAttribute('aria-disabled', String(state.pending));
+    const automatic = this.checkbox('Show automatic tags', toolbar, state.showAutomatic);
+    automatic.dataset.browse = 'true';
+    automatic.dataset.notableField = 'Show automatic tags';
     const tagList = this.el('div', '', panel, {class: 'tag-list', role: 'group', 'aria-label': 'Available tags'});
     const selected = this.el('div', '', panel, {class: 'tag-selection'});
     const selectedList = this.el('div', '', selected, {class: 'tag-chips', 'aria-label': 'Selected tags'});
     const clear = this.button('Clear selection', selected, () => {
-      state.tags.clear(); updateTagButtons(); updateSelection(); input.focus();
+      state.tags.clear(); state.browseAll = false; updateTagButtons(); updateSelection(); apply(); input.focus();
     });
     clear.dataset.browse = 'true';
-    const count = this.el('p', '', panel, {class: 'paper-search-count', role: 'status'});
+    const browse = this.button('Show all tagged items', panel, () => { state.browseAll = true; apply(); count.focus(); });
+    browse.dataset.browse = 'true';
+    const count = this.el('p', '', panel, {class: 'paper-search-count', role: 'status', tabindex: '-1'});
     const results = this.el('div', '', panel);
     let matchingTags = [];
     let tagButtons = [];
@@ -2338,49 +2409,49 @@ var NotableUI = {
     let batchScheduled = false;
     const focusTag = (index, focus = true) => {
       if (!tagButtons[index]) return;
-      tagButtons[activeTag].tabIndex = -1;
+      if (tagButtons[activeTag]) tagButtons[activeTag].tabIndex = -1;
       activeTag = index;
       tagButtons[activeTag].tabIndex = 0;
       if (focus) tagButtons[activeTag].focus();
     };
     const drawResults = () => {
+      if (!panel.isConnected) return;
+      const moreFocused = results.contains(this.view.document.activeElement)
+        && this.view.document.activeElement.dataset?.notableField === 'More tagged items';
       results.replaceChildren();
-      const applied = state.applied;
       const scopes = {paper: 'papers', page: 'pages', both: 'papers and pages'};
-      if (state.pending) count.textContent = this.busy ? 'Tag search queued…' : 'Searching tagged papers and pages…';
-      else if (state.searchError) count.textContent = state.searchError;
-      else if (!applied) count.textContent = 'Select tags and click Search, or search with no selection to see all tagged items.';
-      else {
-        const {criteria, rows} = applied;
-        const names = criteria.tags.join(', ');
-        count.textContent = `${rows.length} ${rows.length === 1 ? 'result' : 'results'} · Searching ${scopes[criteria.scope]}`
-          + (names ? ` · ${criteria.match === 'any' ? 'Any of' : 'All of'} ${names}` : ' · All tagged items');
-        if (!rows.length) this.el('p', `No ${scopes[criteria.scope]} match this search.`, results);
-      }
-      if (!applied) return;
-      const {criteria} = applied;
-      const changed = scope.value !== criteria.scope || match.value !== criteria.match
-        || criteria.tags.length !== state.tags.size || criteria.tags.some(tag => !state.tags.has(tag));
-      if (changed || applied.evidence !== this.tagEvidence()) {
-        this.el('p', changed ? 'Your choices changed. Search again to update these results.'
-          : 'Tags changed. Search again to update these results.', results, {class: 'hint'});
-      }
-      for (const result of applied.rows.slice(0, state.limit)) this.renderTagResult(results, result);
-      if (applied.rows.length > state.limit) {
-        this.button('Show more matching results', results, () => { state.limit += 25; drawResults(); }).dataset.browse = 'true';
+      browse.closest('.actions').hidden = !!(state.tags.size || state.browseAll);
+      const rows = state.applied;
+      if (state.pending) count.textContent = 'Finding tagged items…';
+      else if (state.searchError) {
+        count.textContent = state.searchError;
+        this.button('Retry tag search', results, () => { state.request = null; apply(); }).dataset.browse = 'true';
+      } else if (!rows) count.textContent = 'Select tags to filter results.';
+      else if (!rows.length) count.textContent = `No ${scopes[state.scope]} match the current filters.`;
+      else count.textContent = `${rows.length} ${rows.length === 1 ? 'result' : 'results'}`;
+      if (!rows) return;
+      for (const result of rows.slice(0, state.limit)) this.renderTagResult(results, result);
+      if (rows.length > state.limit) {
+        const more = this.button('Show more matching results', results, () => { state.limit += 25; drawResults(); });
+        more.dataset.browse = 'true';
+        more.dataset.notableField = 'More tagged items';
+        if (moreFocused) more.focus({preventScroll: true});
+      } else if (moreFocused) {
+        results.querySelector('.search-result:last-child button')?.focus({preventScroll: true});
       }
     };
+    state.drawResults = drawResults;
+    const apply = () => { state.limit = 25; this.runTagSearch(state); };
     const updateSelection = () => {
       selected.hidden = !state.tags.size;
       selectedList.replaceChildren();
       for (const value of state.tags) {
         const chip = this.button(`${value} ×`, selectedList, () => {
-          state.tags.delete(value); updateTagButtons(); updateSelection(); input.focus();
+          state.tags.delete(value); updateTagButtons(); updateSelection(); apply(); input.focus();
         });
         chip.dataset.browse = 'true';
         chip.setAttribute('aria-label', `Remove ${value} from selected tags`);
       }
-      drawResults();
     };
     const updateTagButtons = () => {
       for (const [index, button] of tagButtons.entries()) {
@@ -2396,12 +2467,15 @@ var NotableUI = {
         tagButtons.push(choice);
         choice.tabIndex = index === 0 ? 0 : -1;
         choice.dataset.browse = 'true';
+        choice.dataset.notableField = `Filter by tag ${tag}`;
+        if (state.scope !== 'page') this.applyTagColor(choice, tag, colors);
         choice.addEventListener('click', () => {
           focusTag(index, false);
           if (state.tags.has(tag)) state.tags.delete(tag);
-          else state.tags.add(tag);
+          else { state.tags.add(tag); state.browseAll = false; }
           choice.setAttribute('aria-pressed', String(state.tags.has(tag)));
           updateSelection();
+          apply();
         });
       }
       tagList.appendChild(fragment);
@@ -2420,7 +2494,7 @@ var NotableUI = {
         if (height <= viewport) loadNearEnd();
       });
     };
-    tagList.addEventListener('scroll', loadNearEnd, {passive: true});
+    tagList.addEventListener('scroll', () => { state.scrollTop = tagList.scrollTop; loadNearEnd(); }, {passive: true});
     const drawTags = () => {
       tagList.replaceChildren();
       tagList.scrollTop = 0;
@@ -2433,10 +2507,10 @@ var NotableUI = {
       } else if (includesPapers && !paperTags) {
         this.el('p', 'Loading Zotero paper tags…', tagList, {role: 'status'});
       }
-      const query = state.query.trim().toLocaleLowerCase();
-      matchingTags = choicesByScope[state.scope].filter(tag => !query || tag.toLocaleLowerCase().includes(query));
+      const query = this.searchTerms(state.query);
+      matchingTags = choices().filter(tag => this.matchesSearchTerms(tag, query));
       if (!matchingTags.length && (!includesPapers || paperTags)) {
-        this.el('p', query ? 'No tags match this filter.' : 'No tags are available for this search scope.', tagList);
+        this.el('p', query.length ? 'No tags match this filter.' : 'No tags are available for this scope.', tagList);
       }
       if (matchingTags.length) {
         appendTagBatch();
@@ -2457,30 +2531,75 @@ var NotableUI = {
       if (next === tagButtons.length && next < matchingTags.length) appendTagBatch();
       focusTag(Math.max(0, Math.min(next, tagButtons.length - 1)));
     });
-    scope.addEventListener('change', () => { state.scope = scope.value; drawTags(); drawResults(); });
-    match.addEventListener('change', () => { state.match = match.value; drawResults(); });
+    const changeChoices = () => {
+      const available = new Set(choices());
+      state.tags = new Set([...state.tags].filter(tag => available.has(tag)));
+      state.scrollTop = 0;
+      drawTags(); updateSelection(); apply();
+    };
+    scope.addEventListener('change', () => {
+      state.scope = scope.value;
+      automatic.closest('label').hidden = state.scope === 'page';
+      changeChoices();
+    });
+    match.addEventListener('change', () => { state.match = match.value; apply(); });
+    automatic.addEventListener('change', () => { state.showAutomatic = automatic.checked; changeChoices(); });
+    automatic.closest('label').hidden = state.scope === 'page';
+    const active = this.tagSearchFocus;
+    const previousTop = state.scrollTop || 0;
+    // A native edit can delete the last use of a selected tag. Keep the active
+    // filter visible so it can be cleared without silently broadening results.
     drawTags();
+    const activeIndex = matchingTags.findIndex(tag => active === `Filter by tag ${tag}`);
+    while (tagButtons.length <= activeIndex || (tagButtons.length < matchingTags.length
+        && tagList.scrollHeight < previousTop + tagList.clientHeight)) appendTagBatch();
+    if (activeIndex >= 0) focusTag(activeIndex, false);
+    tagList.scrollTop = previousTop;
     updateSelection();
+    this.runTagSearch(state);
+    drawResults();
     if (!paperTags && !this.paperTagBankError) this.refreshPaperTagBank();
   },
   renderTagResult(parent, result) {
     const page = result.scope === 'page';
     const row = this.el('section', '', parent, {class: 'card search-result'});
     this.el('h3', result.title, row);
-    this.el('p', `${page ? 'Page ' + (result.page + 1) : 'Whole paper'} · ${result.tags.join(' · ')}`, row, {class: 'hint'});
-    if (!result.key && !page) {
-      this.reviewNavigationButton('Show reference in Zotero', row, 'references', [result.parent]);
-      return;
-    }
-    this.button(page ? 'Open page' : 'Open PDF', row, async () => {
-      if (page) {
-        const fresh = await this.rpc('tag_context', {key: result.key, page: result.page});
-        if (fresh.page_id !== result.page_id) throw new Error('The page order changed. Search again before opening this result.');
-      }
-      const item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, result.key);
-      if (!item?.isPDFAttachment() || item.deleted) throw new Error('This PDF is unavailable. Search again to refresh the results.');
-      await Zotero.Reader.open(item.id, page ? {pageIndex: result.page} : undefined);
+    this.el('p', `${page ? 'Page ' + (result.page + 1) : 'Paper tags'} · ${result.tags.join(' · ')}`, row, {class: 'hint'});
+    const show = this.button('Show Zotero tags', row, () => this.showZoteroTags(result.parent), false, 'tag');
+    show.dataset.browse = 'true';
+    if (!page && result.pdf) this.button('Open PDF', row, async () => {
+      const paper = await notableItem(result.parent);
+      const pdf = paper?.isRegularItem() && !paper.deleted
+        && (await paper.getBestAttachments()).find(item => item.isPDFAttachment() && !notableReviewItemInTrash(item));
+      if (!pdf) throw Error('This paper’s PDF is unavailable.');
+      await Zotero.Reader.open(pdf.id);
     }, false, 'book-open').dataset.browse = 'true';
+    if (page) this.button('Open page', row, async () => {
+      const fresh = await this.rpc('tag_context', {key: result.key, page: result.page});
+      if (fresh.page_id !== result.page_id) throw new Error('The page order changed. Select the page again from refreshed results.');
+      const item = await notableItem(result.key);
+      if (!item?.isPDFAttachment() || notableReviewItemInTrash(item) || item.parentKey !== result.parent) {
+        throw new Error('This PDF is unavailable.');
+      }
+      await Zotero.Reader.open(item.id, {pageIndex: result.page});
+    }, false, 'book-open').dataset.browse = 'true';
+  },
+  async showZoteroTags(key) {
+    await notableNavigateReview({target: 'references', keys: [key]});
+    const pane = Zotero.getActiveZoteroPane();
+    if (pane.itemPane?.collapsed) pane.toggleItemPane();
+    const container = Zotero.getMainWindow().document.getElementById('zotero-item-details');
+    const tags = container?.getPane?.('tags');
+    if (tags) {
+      tags.open = true;
+      await container.scrollToPane('tags', 'instant');
+    }
+  },
+  applyTagColor(node, tag, colors) {
+    const color = colors.get(tag)?.color;
+    if (!color) return;
+    node.classList.add('colored-tag');
+    node.style.setProperty('--tag-color', color);
   },
   renderKeywordCleanup(content) {
     const panel = this.el('details', '', content, {class: 'card'});
@@ -3348,11 +3467,26 @@ var NotableUI = {
 
     this.renderedReviewId = null;
     const heading = this.el('div', '', content, {class: 'review-heading'});
-    const inboxRows = queue === 'inbox' ? this.inboxDisplayRows() : null;
+    const inboxTerms = queue === 'inbox' ? this.searchTerms(this.inboxQuery || '') : [];
+    let inboxRows = queue === 'inbox' ? this.inboxDisplayRows() : null;
+    if (inboxTerms.length) {
+      if (this.inboxFilter === 'all') inboxRows = this.sortInboxRows([...new Map(
+        [...inboxRows, ...this.queueRows('inbox-waiting')].map(row => [row.id, row])).values()]);
+      inboxRows = inboxRows.filter(({payload}) => this.matchesSearchTerms(
+        [payload.title, payload.filename, payload.doi].filter(Boolean).join('\n'), inboxTerms));
+    }
     let updateInboxControls;
     if (queue) {
       this.el('h2', queue === 'inbox' ? 'Inbox' : queue === 'library' ? 'Library Issues' : 'Sync Conflicts', heading);
-      if (inboxRows) updateInboxControls = this.renderInboxControls(heading);
+      if (inboxRows) {
+        updateInboxControls = this.renderInboxControls(heading);
+        this.quickSearch(heading, {label: 'Search Inbox', value: this.inboxQuery || '', change: value => {
+          this.inboxQuery = value;
+          this.render();
+        }});
+        if (inboxTerms.length) this.el('p', `${inboxRows.length} matching Inbox entries`, heading,
+          {class: 'paper-search-count', role: 'status'});
+      }
       else this.el('p', this.queueSummary(queue), heading, {class: 'queue-summary', role: 'status', 'data-queue-summary': queue});
     }
     let recheck;
@@ -3454,7 +3588,7 @@ var NotableUI = {
       }
     }
     }
-    if (inboxRows && this.inboxFilter === 'all') this.renderInboxWaiting(content);
+    if (inboxRows && this.inboxFilter === 'all' && !inboxTerms.length) this.renderInboxWaiting(content);
     const linkedCases = queue === 'library' ? this.linkedOriginalCases() : [];
     if (linkedCases.length) this.renderLinkedOriginalCases(content, linkedCases);
     const rows = inboxRows ?? (queue ? this.queueRows(queue) : (this.latest.reviews || []).filter(row => !queuedIds.has(row.id) && (this.showAllReviews || !row.payload.routine || this.reviewNeedsUpgrade(row) || row.status === 'applying' || row.id === this.selected)));
@@ -3465,9 +3599,9 @@ var NotableUI = {
       const empty = this.el('section', '', content, {class: 'review-empty'});
       const inboxEmpty = {all: blocked ? 'No papers ready to file' : 'Inbox is empty', ready: 'No papers ready to file',
         'needs-pdf': 'No papers need a PDF', waiting: 'No papers waiting on Library Issues'};
-      this.el('h3', queue === 'inbox' ? inboxEmpty[this.inboxFilter]
+      this.el('h3', inboxTerms.length ? 'No Inbox entries match this search.' : queue === 'inbox' ? inboxEmpty[this.inboxFilter]
         : queue === 'library' ? 'No library issues' : 'No sync conflicts', empty);
-      if (blocked && this.inboxFilter === 'all') {
+      if (blocked && this.inboxFilter === 'all' && !inboxTerms.length) {
         const jump = this.button('Open Library Issues', empty, () => this.openLibraryCase(this.queueRows('inbox-waiting')[0]?.id), true, 'file-search');
         jump.dataset.browse = 'true';
       }
@@ -3663,6 +3797,7 @@ var NotableUI = {
     this.el('summary', 'Paper tags', tagDetails);
     this.el('p', 'Tags are added to the Zotero reference when you approve.', tagDetails, {class: 'hint'});
     const paperTags = this.renderTagEntry(tagDetails, {kind: 'paper', values: draft.tags || [], inputValue: draft.tag_input || '',
+      list: this.tagSuggestions(tagDetails, 'paper'),
       empty: 'No tags added to this filing.', onChange: () => saveDraft()});
     this.paperTagPanel(tagDetails, {identity: row.id});
     if (this.isInboxOfficeFile(row)) this.el('p', 'This Office file can be filed in Zotero.', filing, {class: 'hint'});
@@ -4200,7 +4335,7 @@ var NotableUI = {
     const empty = this.el('p', '', content);
     for (const row of rows.filter(row => row.issues.length && row.status !== 'dismissed')) {
       const card = this.el('section', '', content, {class: 'card decision'});
-      exceptions.push([card, [row.path, ...row.issues].join(' ').toLocaleLowerCase()]);
+      exceptions.push([card, [row.path, ...row.issues].join(' ')]);
       this.el('strong', row.path, card);
       for (const issue of row.issues) this.el('p', issue, card);
       const key = row.parent || row.existing || row.candidates?.[0]?.key;
@@ -4216,17 +4351,17 @@ var NotableUI = {
     for (const failure of plan.failures) {
       const message = failure.path + ' · ' + failure.reason;
       const card = this.el('p', message, content, {class: 'message error'});
-      exceptions.push([card, message.toLocaleLowerCase()]);
+      exceptions.push([card, message]);
     }
     const applyFilter = () => {
-      const query = (this.importFilter || '').trim().toLocaleLowerCase();
+      const query = this.searchTerms(this.importFilter || '');
       let shown = 0;
       for (const [card, text] of exceptions) {
-        card.hidden = !text.includes(query);
+        card.hidden = !this.matchesSearchTerms(text, query);
         if (!card.hidden) shown++;
       }
       count.textContent = `${shown} of ${exceptions.length} import exceptions`;
-      empty.textContent = query ? 'No import exceptions match this search.' : 'No import exceptions.';
+      empty.textContent = query.length ? 'No import exceptions match this search.' : 'No import exceptions.';
       empty.hidden = shown > 0;
     };
     applyFilter();
@@ -4252,6 +4387,41 @@ var NotableUI = {
   },
   paperSearchState() {
     return this.paperSearch ||= {view: 'linked', mode: 'citation', query: '', scope: 'all', status: '', reading: 'all', limit: 25};
+  },
+  searchText(value) {
+    return value.normalize('NFD').replace(/\p{M}/gu, '').replace(/[‘’]/g, "'")
+      .replace(/[“”]/g, '"').toLocaleLowerCase();
+  },
+  searchTerms(value) {
+    const text = this.searchText(value);
+    return (text.match(/"[^"]*"|[^\s"]+/g) || []).map(term => term.replace(/^"|"$/g, '')).filter(Boolean);
+  },
+  matchesSearchTerms(value, terms) {
+    const text = this.searchText(value);
+    return terms.every(term => text.includes(term));
+  },
+  chooserSearch(parent, label, change) {
+    const {input} = this.quickSearch(parent, {label, change});
+    return {input, terms: value => this.searchTerms(value), matches: (value, terms) => this.matchesSearchTerms(value, terms)};
+  },
+  async zoteroPaperMatches(query, mode) {
+    const search = new Zotero.Search();
+    search.libraryID = Zotero.Libraries.userLibraryID;
+    search.addCondition('quicksearch-' + {citation: 'titleCreatorYear', all: 'fields', everything: 'everything'}[mode],
+      'contains', query);
+    const ids = await search.search();
+    const keys = new Set();
+    for (const item of await Zotero.Items.getAsync(ids || [])) {
+      if (notableReviewItemInTrash(item)) continue;
+      keys.add(item.key);
+      // Quick Search can match a note or annotation under a paper.
+      let child = item;
+      while (child?.parentID) {
+        child = Zotero.Items.get(child.parentID);
+        if (child && !notableReviewItemInTrash(child)) keys.add(child.key);
+      }
+    }
+    return keys;
   },
   async loadNameReview() {
     if ((this.busy && this.operation?.method !== 'sync') || this.nameReviewLoading) return;
@@ -4287,21 +4457,17 @@ var NotableUI = {
       const items = (await Zotero.Items.getAll(Zotero.Libraries.userLibraryID, false, false)).filter(item =>
         !item.deleted && (needed.has(item.key) || (item.isFileAttachment() && needed.has(item.parentKey))));
       await Zotero.Items.loadDataTypes(items);
-      const records = new Map([...needed].map(key => [key, {citation: [], fields: [], files: []}]));
+      const records = new Map([...needed].map(key => [key, {files: []}]));
       for (const item of items) {
-        const data = item.toJSON();
+        if (notableReviewItemInTrash(item)) continue;
         if (item.isFileAttachment()) {
-          const names = [item.attachmentFilename, data.title].filter(Boolean);
+          const names = [item.attachmentFilename, item.getField('title')].filter(Boolean);
           records.get(item.parentKey)?.files.push(...names);
           records.get(item.key)?.files.push(...names);
         } else if (item.isRegularItem()) {
           const record = records.get(item.key);
-          const creators = (data.creators || []).map(person => person.name || [person.firstName, person.lastName].filter(Boolean).join(' '));
-          record.title = data.title;
-          record.read = (data.tags || []).some(tag => tag.tag === 'Read');
-          record.citation = [data.title, data.date, data.publicationTitle, data.bookTitle, ...creators];
-          record.fields = [...Object.values(data).filter(value => typeof value === 'string'),
-            ...creators, ...(data.tags || []).map(tag => tag.tag)];
+          record.title = item.getField('title');
+          record.read = item.getTags().some(tag => tag.tag === 'Read');
         }
       }
       return records;
@@ -4321,8 +4487,8 @@ var NotableUI = {
     select.value = value;
     return select;
   },
-  quickSearch(content, {label, value, change, submit, modes, mode, onMode, id}) {
-    const toolbar = this.el('div', '', content, {class: 'paper-search-toolbar', role: 'search', 'aria-label': 'Search and filters'});
+  quickSearch(content, {label, value = '', change = () => {}, submit, modes, mode, onMode, id}) {
+    const toolbar = this.el('div', '', content, {class: 'paper-search-toolbar', role: 'search', 'aria-label': label + ' controls'});
     const box = this.el('div', '', toolbar, {class: 'paper-search-box'});
     const modeBox = this.el(modes ? 'label' : 'span', '', box, {class: modes ? 'paper-search-mode' : 'paper-search-icon'});
     this.el('span', '', modeBox, {class: 'button-icon icon-search', 'aria-hidden': 'true'});
@@ -4330,7 +4496,7 @@ var NotableUI = {
       const select = this.searchSelect(modeBox, 'Search fields', modes, mode);
       select.addEventListener('change', () => onMode(select.value));
     }
-    const input = this.el('input', '', box, {type: 'text', placeholder: label, 'aria-label': label, autocomplete: 'off'});
+    const input = this.el('input', '', box, {type: 'text', role: 'searchbox', placeholder: label, 'aria-label': label, autocomplete: 'off'});
     if (id) input.id = id;
     input.value = value;
     input.dataset.quickSearch = 'true';
@@ -4339,12 +4505,14 @@ var NotableUI = {
     const clear = this.el('button', '', box, {type: 'button', 'aria-label': 'Clear search', title: 'Clear search'});
     clear.dataset.browse = 'true';
     this.el('span', '', clear, {class: 'button-icon icon-x', 'aria-hidden': 'true'});
-    const apply = () => { clear.hidden = !input.value; change(input.value); };
+    const apply = event => { clear.hidden = !input.value; if (!event?.isComposing) change(input.value); };
     const reset = () => { input.value = ''; input.focus(); apply(); };
     clear.hidden = !input.value;
     clear.addEventListener('click', reset);
     input.addEventListener('input', apply);
+    input.addEventListener('compositionend', apply);
     input.addEventListener('keydown', event => {
+      if (event.isComposing || event.defaultPrevented) return;
       if (event.key === 'Escape' && input.value) { event.preventDefault(); event.stopPropagation(); reset(); }
       if (event.key === 'Enter' && submit) { event.preventDefault(); submit(); }
     });
@@ -4358,12 +4526,23 @@ var NotableUI = {
       button.dataset.browse = 'true';
     }
     const apply = () => { state.limit = 25; update(); };
-    const {toolbar} = this.quickSearch(content, {
+    const applyQuery = () => { state.appliedQuery = state.query; state.waitingForEnter = false; apply(); };
+    const {toolbar, input} = this.quickSearch(content, {
       label: reviewing ? 'Search names to review' : 'Search linked papers', id: 'notable-paper-search',
-      value: state.query, change: value => { state.query = value; apply(); },
-      modes: [['citation', 'Title, Year, Creator'], ['files', 'Filenames'], ['all', 'All Fields & Tags']],
-      mode: state.mode, onMode: value => { state.mode = value; apply(); },
+      value: state.query, change: value => {
+        state.query = value;
+        state.waitingForEnter = state.mode !== 'files' && value.includes('"');
+        if (state.waitingForEnter) apply(); else applyQuery();
+      },
+      submit: applyQuery,
+      modes: [['citation', 'Title, Year, Creator'], ['all', 'All Fields & Tags'], ['everything', 'Everything'], ['files', 'Filenames']],
+      mode: state.mode, onMode: value => {
+        state.mode = value;
+        state.waitingForEnter = false;
+        applyQuery();
+      },
     });
+    input.setAttribute('aria-describedby', 'notable-paper-search-status');
     if (reviewing) {
       const scope = this.searchSelect(toolbar, 'Paper scope', [['all', 'All Zotero papers'], ['linked', 'Linked papers']], state.scope);
       const status = this.searchSelect(toolbar, 'Name review status', [['', 'All name issues'], ['needs', 'Needs review'],
@@ -4438,19 +4617,37 @@ var NotableUI = {
       else if (state.evidence !== this.paperTagEvidenceSerial) this.el('p', 'Zotero changed. Refresh name review for current results.', content);
       if (state.notice) this.el('p', state.notice, content, {role: 'status'});
     }
-    const count = this.el('p', '', content, {role: 'status', class: 'paper-search-count'});
+    const count = this.el('p', '', content, {id: 'notable-paper-search-status', role: 'status', class: 'paper-search-count'});
     if (!reviewing) this.el('p', `${activeLinks.length} connected papers · ${received} tablet copies received · ${links.length - activeLinks.length} unavailable`, content, {class: 'hint'});
     const results = this.el('div', '', content);
     let metadata = new Map();
     let metadataLoading = false;
     let metadataError = false;
+    let nativeSearch = null;
+    let searchTimer;
     const saveReview = async params => {
       const value = await this.maintenanceCall('names', params);
       if (value) { state.names = value; render(); }
     };
     update = () => {
-      const words = (state.query.normalize('NFC').toLocaleLowerCase().match(/"[^"]*"|[^\s"]+/g) || [])
-        .map(word => word.replace(/^"|"$/g, '')).filter(Boolean);
+      const query = state.appliedQuery || '';
+      const words = this.searchTerms(query);
+      const native = words.length && state.mode !== 'files';
+      const signature = JSON.stringify([state.mode, query]);
+      if (native && nativeSearch?.signature !== signature) {
+        clearTimeout(searchTimer);
+        const request = nativeSearch = {signature, loading: true};
+        const {mode} = state;
+        searchTimer = setTimeout(async () => {
+          if (!results.isConnected) return;
+          try { request.keys = await this.zoteroPaperMatches(query, mode); }
+          catch (error) { request.error = error.message; }
+          finally { request.loading = false; if (results.isConnected && request === nativeSearch) update(); }
+        }, 140);
+      } else if (!native && nativeSearch) {
+        clearTimeout(searchTimer);
+        nativeSearch = null;
+      }
       const visible = rows.filter(row => {
         const key = reviewing ? row.key : row.parent || row.source_key || row.view_key;
         const linked = byPaper.get(key) || [];
@@ -4465,26 +4662,33 @@ var NotableUI = {
         if (!reviewing && state.reading !== 'all' && record?.read !== (state.reading === 'read')) return false;
         if (!words.length) return true;
         const findings = row.findings || [];
-        const files = [...(record?.files || []), ...(reviewing ? linked.map(link => link.name) : [row.name]),
-          ...findings.filter(finding => finding.where !== 'Zotero title').map(finding => finding.name)];
-        const citation = [row.title || record?.title || row.name, ...(record?.citation || [])];
-        // Name review also searches the flagged name, so a
-        // placeholder shown on a result is immediately searchable.
-        const fields = state.mode === 'files' ? files : state.mode === 'all'
-          ? [...citation, ...(record?.fields || []), ...files]
-          : [...citation, ...(reviewing ? findings.map(finding => finding.name) : [])];
-        const text = fields.filter(Boolean).join('\n').normalize('NFC').toLocaleLowerCase();
-        return words.every(word => text.includes(word));
+        if (state.mode === 'files') {
+          const files = [...(record?.files || []), ...(reviewing ? linked.map(link => link.name) : [row.name]),
+            ...findings.filter(finding => finding.where !== 'Zotero title').map(finding => finding.name)];
+          return this.matchesSearchTerms(files.filter(Boolean).join('\n'), words);
+        }
+        if (nativeSearch?.keys?.has(key)) return true;
+        if (reviewing && state.mode === 'citation') return this.matchesSearchTerms(findings
+          .filter(finding => finding.where === 'Zotero title').map(finding => finding.name).join('\n'), words);
+        return !record?.title && state.mode === 'citation' && this.matchesSearchTerms(row.title || row.name || '', words);
       });
-      count.textContent = metadataLoading && (state.query.trim() || (!reviewing && state.reading !== 'all')) ? 'Searching Zotero metadata…'
+      const searching = (native && nativeSearch.loading)
+        || (metadataLoading && ((words.length && state.mode === 'files') || (!reviewing && state.reading !== 'all')));
+      count.textContent = state.waitingForEnter ? 'Press Enter to search for the quoted phrase.'
+        : searching ? 'Searching Zotero…' : nativeSearch?.error ? 'Couldn’t search Zotero. ' + nativeSearch.error
         : `${visible.length} of ${rows.length} ${reviewing ? 'papers to review' : 'linked papers'}`
           + (metadataError ? ' · Zotero metadata could not be loaded' : '');
       results.replaceChildren();
+      if (nativeSearch?.error) {
+        this.button('Retry search', results, () => { nativeSearch = null; update(); }).dataset.browse = 'true';
+        return;
+      }
+      if (searching) return;
       const remaining = reviewing ? visible.filter(row => row.token && !row.queued) : [];
       if (remaining.length > 1) this.button(`Queue ${remaining.length} matching papers for review`, results,
         () => saveReview({selected: remaining.map(({key, token}) => ({key, token}))}));
-      if (!visible.length && !metadataLoading && !this.nameReviewLoading && (state.names || !reviewing)) {
-        this.el('p', state.query.trim() || (reviewing ? state.status || state.scope === 'linked' : state.reading !== 'all') ? 'No papers match this search.'
+      if (!visible.length && !metadataLoading && !this.nameReviewLoading && (state.names || !reviewing) && !state.waitingForEnter) {
+        this.el('p', query.trim() || (reviewing ? state.status || state.scope === 'linked' : state.reading !== 'all') ? 'No papers match this search.'
           : reviewing ? 'No names need review.' : 'No paper connections yet. Approve papers in Inbox to include them in the next sync.', results);
       }
       for (const row of visible.slice(0, state.limit)) {

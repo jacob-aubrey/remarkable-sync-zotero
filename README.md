@@ -13,6 +13,12 @@ The plugin supports Zotero 10.0.6 and later in the 10.0 series.
 
 The XPI includes the Windows helper and OCR models. Zotero handles future updates through its plugin manager.
 
+## Find papers and tags
+
+In **Linked papers**, the citation, fields and tags, and full-text modes use Zotero Quick Search within the selected plugin view. Choose **Filenames** to find a Zotero attachment or reMarkable copy by name. Use **Ctrl+F** or **Ctrl+Shift+K** to focus search, and **Esc** to clear the query.
+
+In **Tags**, type to narrow the list of tag names, then select tags to filter results as you go. Paper tags are shared with the Zotero reference. **Show Zotero tags** opens the reference’s native Tags section. Page tags are saved for individual pages of linked PDFs. Use the tag button in the PDF reader to edit paper and page tags together.
+
 ### Attach a download from ToSort
 
 If a PDF in your configured ToSort folder identifies a unique Zotero reference that needs a PDF, Inbox shows the download on that reference. Choose **Attach PDF from ToSort** to store the PDF in Zotero. The plugin clears the original from ToSort after verifying the stored copy, then opens the filename and filing review. Choose **Review ToSort file separately** to use the usual ToSort workflow instead.
@@ -40,7 +46,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.18.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.19.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

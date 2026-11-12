@@ -549,18 +549,23 @@ async function notableCreateCollection(data) {
   return {collection: result};
 }
 
+async function notableMatchingPaperTags(references, tags, match, showAutomatic = true) {
+  if (!references.length) return [];
+  await Zotero.Items.loadDataTypes(references, ['tags']);
+  const selected = new Set(tags);
+  const colors = showAutomatic ? null : Zotero.Tags.getColors(Zotero.Libraries.userLibraryID);
+  const results = [];
+  for (const item of references) {
+    const itemTags = item.getTags().filter(value => showAutomatic || !value.type || colors.has(value.tag)).map(value => value.tag);
+    const matched = selected.size ? itemTags.filter(tag => selected.has(tag)) : itemTags;
+    if (matched.length && (match === 'any' || matched.length >= selected.size)) results.push({item, tags: matched});
+  }
+  return results;
+}
+
 async function notableTagCatalogItems(items, {papers, tags, match, views}) {
   const references = papers ? items.filter(item => item.isRegularItem()) : [];
-  const paperKeys = new Set();
-  if (references.length) {
-    await Zotero.Items.loadDataTypes(references, ['tags']);
-    for (const item of references) {
-      const itemTags = new Set(item.getTags().map(value => value.tag));
-      if (!itemTags.size) continue;
-      const matches = !tags.length || (match === 'any' ? tags.some(tag => itemTags.has(tag)) : tags.every(tag => itemTags.has(tag)));
-      if (matches) paperKeys.add(item.key);
-    }
-  }
+  const paperKeys = new Set((await notableMatchingPaperTags(references, tags, match)).map(({item}) => item.key));
   const pageViews = new Set(views);
   const pdfs = items.filter(item => item.isFileAttachment() && (pageViews.has(item.key)
     || (paperKeys.has(item.parentKey) && (item.isPDFAttachment() || /\.pdf$/i.test(item.attachmentFilename || '')))));

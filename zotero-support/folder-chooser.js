@@ -2,7 +2,7 @@
 var NotableFolderChooser = {
   serial: 0,
   create({document: doc, parent, label, options = [], value = '', multiple = false,
-    recents = [], onRemember, onNew, mode = 'folder'}) {
+    recents = [], onRemember, onNew, mode = 'folder', search: buildSearch}) {
     const records = mode === 'record';
     const make = (tag, text, target, attrs = {}) => {
       const node = doc.createElementNS('http://www.w3.org/1999/xhtml', tag);
@@ -24,7 +24,9 @@ var NotableFolderChooser = {
     const dialog = make('dialog', '', host, {class: 'folder-chooser-dialog', 'aria-labelledby': id + '-title'});
     make('h2', label, dialog, {id: id + '-title'});
     const toolbar = make('div', '', dialog, {class: 'folder-chooser-toolbar'});
-    const search = make('input', '', toolbar, {type: 'search', placeholder: records ? 'Search papers' : 'Search folders at any depth', 'aria-label': 'Search ' + label});
+    const searchLabel = records ? 'Search papers' : 'Search folders';
+    const control = buildSearch?.(toolbar, searchLabel, () => renderTree());
+    const search = control?.input || make('input', '', toolbar, {type: 'search', placeholder: searchLabel, 'aria-label': searchLabel});
     const newButton = onNew ? make('button', 'New…', toolbar, {type: 'button'}) : null;
     const newParent = onNew ? make('p', '', dialog, {class: 'folder-chooser-hint'}) : null;
     const recentList = make('div', '', dialog, {class: 'folder-chooser-recents'});
@@ -81,9 +83,12 @@ var NotableFolderChooser = {
     const focusAt = index => {const item = rows[Math.max(0, Math.min(rows.length - 1, index))]; item?.node.focus();};
     const renderTree = () => {
       tree.replaceChildren(); recentList.replaceChildren(); rows = [];
-      const query = search.value.trim().toLocaleLowerCase();
-      const tokens = query.split(/\s+/).filter(Boolean);
-      const matches = row => tokens.every(token => (row.path + ' ' + (row.detail || '')).toLocaleLowerCase().includes(token));
+      const query = search.value.trim();
+      const tokens = control?.terms(query) || query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
+      const matches = row => {
+        const text = row.path + ' ' + (row.detail || '');
+        return control ? control.matches(text, tokens) : tokens.every(token => text.toLocaleLowerCase().includes(token));
+      };
       const visible = [], visited = new Set();
       const walk = (row, depth) => {
         if (visited.has(row.value)) return;
@@ -143,7 +148,7 @@ var NotableFolderChooser = {
             if (expanded.has(row.value)) {expanded.delete(row.value); renderTree(); rows.find(entry => entry.option.value === row.value)?.node.focus();}
             else rows.find(entry => entry.option.value === row.parent)?.node.focus();
           } else if (event.key.length === 1 && event.key !== ' ' && !event.ctrlKey && !event.metaKey && !event.altKey) {
-            event.preventDefault(); search.value += event.key; search.focus(); renderTree();
+            event.preventDefault(); search.value += event.key; search.focus(); updateSearch();
           }
         });
         rows.push({node: item, option: row});
@@ -168,7 +173,7 @@ var NotableFolderChooser = {
       staged = [...selected]; focused = selected.find(key => byValue(key)) || '';
       error.hidden = true;
       for (const key of selected) expandParents(key);
-      search.value = ''; renderTree();
+      search.value = ''; updateSearch();
       if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open', '');
       search.focus();
     };
@@ -177,7 +182,8 @@ var NotableFolderChooser = {
     apply?.addEventListener('click', () => commit(staged));
     dialog.addEventListener('cancel', event => {event.preventDefault(); close();});
     dialog.addEventListener('keydown', event => {if (event.key === 'Escape') {event.preventDefault(); close();}});
-    search.addEventListener('input', renderTree);
+    if (!control) search.addEventListener('input', renderTree);
+    const updateSearch = () => search.dispatchEvent(new doc.defaultView.Event('input'));
     search.addEventListener('keydown', event => {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {event.preventDefault(); focusAt(event.key === 'ArrowUp' ? rows.length - 1 : 0);}
       else if (event.key === 'Enter' && rows.length === 1) {event.preventDefault(); choose(rows[0].option.value);}

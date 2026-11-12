@@ -1,4 +1,4 @@
-:root { color-scheme: light dark; font: 14px/1.5 "Segoe UI", system-ui, sans-serif; background: Canvas; }
+:root { color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; background: Canvas; }
 body { margin: 0; min-block-size: 100vh; background: Canvas; color: CanvasText; overflow: auto; }
 *, *::before, *::after { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -6,7 +6,7 @@ body { margin: 0; min-block-size: 100vh; background: Canvas; color: CanvasText; 
 header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px 24px; }
 header > div:first-child { flex: 1 1 320px; min-width: 0; }
 header .actions { margin: 0; }
-h1 { font-size: 28px; margin: 0; } h2 { font-size: 19px; margin: 0 0 12px; }
+h1 { font-size: 2em; margin: 0; } h2 { font-size: 1.36em; margin: 0 0 12px; }
 p { margin: 8px 0 18px; } header p { color: light-dark(#526273, #b3becb); }
 nav, .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 16px 0; }
 nav, .workspace-status { border-bottom: 1px solid GrayText; padding-bottom: 12px; }
@@ -34,8 +34,11 @@ button { display: inline-flex; align-items: center; justify-content: center; gap
 .icon-folder-sync { --button-icon: url("icons/folder-sync.svg"); }
 .icon-file-text { --button-icon: url("icons/file-text.svg"); }
 button:hover { background: color-mix(in srgb, Highlight 10%, ButtonFace); }
-button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible {
+  outline: 2px solid Highlight; outline-offset: 2px;
+}
 button.primary, nav button[aria-pressed="true"] { background: #2166a8; color: #fff; border-color: #2166a8; }
+button.primary:hover:not(:disabled), nav button[aria-pressed="true"]:hover { background: #194f84; }
 aside button[aria-pressed="true"] { border-color: Highlight; background: color-mix(in srgb, Highlight 14%, ButtonFace); }
 button.danger { color: light-dark(#a12626, #ffb0b0); }
 button:disabled { opacity: .55; cursor: wait; }
@@ -73,6 +76,9 @@ button:disabled { opacity: .55; cursor: wait; }
 .paper-search-box button { flex: none; padding: 4px 8px; min-height: 36px; }
 .paper-search-box button:hover { background: color-mix(in srgb, Highlight 15%, transparent); }
 .paper-search-count { color: light-dark(#526273, #b3becb); margin-block: 10px 12px; }
+.paper-search-toolbar > .checkbox-field { margin: 0; }
+.folder-chooser-toolbar > .paper-search-toolbar { flex: 1 1 auto; min-inline-size: 0; margin: 0; }
+.colored-tag::before { content: ""; inline-size: .65em; block-size: .65em; flex: none; background: var(--tag-color); border-radius: 2px; }
 .tag-list { display: flex; flex-wrap: wrap; align-items: flex-start; align-content: start; gap: 5px; max-block-size: 190px; overflow: auto; scrollbar-gutter: stable; padding: 8px; border: 1px solid color-mix(in srgb, GrayText 45%, Canvas); border-radius: 5px; }
 .tag-list p { margin: 4px; }
 .tag-list > button { min-height: 30px; padding: 3px 8px; justify-content: flex-start; text-align: start; overflow-wrap: anywhere; }
@@ -122,7 +128,7 @@ input, select { box-sizing: border-box; width: 100%; padding: 8px; font: inherit
 select { appearance: auto; min-width: 0; max-width: 100%; }
 input[type="checkbox"] { width: auto; }
 details { margin: 18px 0; } summary { cursor: pointer; font-weight: 600; }
-.hint { font-size: 12px; color: light-dark(#526273, #b3becb); }
+.hint { font-size: .86em; color: light-dark(#526273, #b3becb); }
 .folder-pair { margin: 12px 0 20px; padding: 12px 14px; border-left: 3px solid Highlight; background: color-mix(in srgb, Highlight 6%, Canvas); }
 .folder-pair p { margin: 3px 0; overflow-wrap: anywhere; }
 .queued-filing { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; }
@@ -216,8 +222,11 @@ nav button.sync-conflicts-attention[aria-pressed="true"] .button-icon { color: #
 .review-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 16px; margin-bottom: 12px; }
 .review-heading > h2 { margin: 0; }
 .review-heading > .queue-summary { grid-column: 1; margin: 0; }
+.review-heading > .paper-search-toolbar, .review-heading > .paper-search-count { grid-column: 1 / -1; }
+.review-heading > .paper-search-toolbar { margin-block: 4px; }
+.review-heading > .paper-search-count { margin: 0; }
 .review-heading > .review-recheck { grid-column: 2; grid-row: 1 / span 2; gap: 8px; }
-.review-heading > .review-recheck > p { flex: auto; max-inline-size: 40ch; font-size: 12px; }
+.review-heading > .review-recheck > p { flex: auto; max-inline-size: 40ch; font-size: .86em; }
 @media (min-width: 701px) { .review-heading:has(.inbox-controls) > .review-recheck { grid-row: 1; } }
 .inbox-controls { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
 .inbox-filters { display: flex; flex-wrap: wrap; gap: 6px; }
