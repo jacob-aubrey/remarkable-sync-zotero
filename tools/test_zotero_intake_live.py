@@ -32,8 +32,37 @@ BRANCH = r"""
             lookup.click();
             for (let i = 0; i < 100 && !doc.querySelector('.reference-comparison'); i++) await Zotero.Promise.delay(50);
             ensure(doc.querySelector('.reference-comparison')?.textContent.includes('Existing article record'), 'Matching DOI comparison missing: ' + doc.getElementById('message').textContent);
-            ensure(doc.querySelector('.reference-pdf-actions').open === false, 'PDF actions should start collapsed');
+            ensure(doc.querySelector('.reference-pdf-actions').textContent.includes('Save the PDF to Downloads'),
+              'Inbox did not show where to save the download');
+            ensure([...doc.querySelectorAll('.reference-pdf-actions button')].every(button => button.getClientRects().length && !button.disabled),
+              'PDF actions should be visible and usable without expanding a section');
             ensure(doc.querySelector('[data-queue-summary]').textContent.includes('1 needs a PDF'), 'Wrong Inbox summary');
+            const referenceActions = [...doc.querySelectorAll('button')].filter(button =>
+              ['Attach downloaded PDF', 'Find and attach PDF online', 'Dismiss this reference'].includes(button.textContent));
+            const originalRPC = ui.rpc;
+            const originalConfig = ui.latest.config;
+            let finishCheck;
+            ui.latest = {...ui.latest, config: {...originalConfig, inbox: 'synthetic'}};
+            ui.lastInboxFolderCheck = 0;
+            ui.inboxRenderPending = false;
+            ui.rpc = method => {
+              ensure(method === 'scan_inbox', 'Background check called an unexpected action');
+              return new Promise(resolve => { finishCheck = resolve; });
+            };
+            try {
+              const poll = ui.checkInbox();
+              ensure(ui.inboxChecking && finishCheck, 'Synthetic background check did not start');
+              ui.disable(ui.busy);
+              ensure(referenceActions.length === 3 && referenceActions.every(button => button.disabled),
+                'The regression fixture must start with disabled reference actions');
+              finishCheck(ui.latest);
+              await poll;
+              ensure(referenceActions.every(button => button.isConnected && !button.disabled),
+                'Unchanged background check left the reference actions disabled');
+            } finally {
+              ui.rpc = originalRPC;
+              ui.latest = {...ui.latest, config: originalConfig};
+            }
             ui.busy = false; ui.operation = null; ui.updateActivity();
             const main = doc.querySelector('main'), top = main.getBoundingClientRect().top;
             for (const text of ['Ready', 'VeryLongFilename'.repeat(150), 'Short again']) {
@@ -216,6 +245,7 @@ def checks(client, root, checked):
     assert result['parentKey'] in catalog['parents']
     assert 'missing_pdf_parents' in catalog
     checked('native_item_events_reference_actions_and_bounded_filename_status_' + result['version'])
+    checked('native_unchanged_background_check_unlocks_pdf_and_dismiss_buttons')
     source = root / 'inbox-lifecycle.pdf'
     source.write_bytes(live.pdf_bytes())
     office = root / 'inbox-lifecycle.docx'

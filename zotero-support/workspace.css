@@ -180,7 +180,6 @@ nav button.sync-conflicts-attention[aria-pressed="true"] .button-icon { color: #
 .reference-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-block: 8px; }
 .reference-comparison > section { border: 1px solid GrayText; border-radius: 5px; padding: 12px; }
 .reference-comparison p { margin: 6px 0; }
-.reference-pdf-actions > summary { cursor: pointer; }
 @media (max-width: 700px) {
   .review-heading, .reference-comparison { grid-template-columns: minmax(0, 1fr); }
   .review-heading > .review-recheck { grid-column: 1; grid-row: auto; }

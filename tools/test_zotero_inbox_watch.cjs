@@ -10,7 +10,11 @@ const ui = context.NotableUI;
 async function main() {
   let calls = 0, renders = 0;
   ui.latest = {config: {inbox: 'ToSort', automatic: false, sync_paused: true}, reviews: []};
-  ui.view = {closed: false}; ui.tab = 'inbox'; ui.badge = () => {}; ui.message = () => {};
+  const referenceActions = ['Find and attach PDF online', 'Attach downloaded PDF', 'Dismiss this reference']
+    .map(label => ({label, dataset: {}}));
+  const querySelectorAll = selector => selector === 'button' ? referenceActions : [];
+  ui.view = {closed: false, document: {querySelectorAll, getElementById: () => null}};
+  ui.tab = 'inbox'; ui.badge = () => {}; ui.message = () => {};
   ui.refreshCollectionNames = () => {};
   ui.render = () => {assert.equal(ui.busy, false); ui.inboxRenderPending = false; renders++;};
   ui.rpc = async method => {assert.equal(method, 'scan_inbox'); calls++; return {config: ui.latest.config, reviews: [{id: 'new'}]};};
@@ -44,7 +48,7 @@ async function main() {
   assert.deepEqual(settlingChecks, [true, true], 'Unsettled native files trigger another discovery on the next idle poll');
   assert.equal(ui.zoteroInboxDirty, false, 'A settled follow-up ends fast discovery');
   const panel = {}, message = {}, attrs = {}, label = {}, syncStatus = {}, syncDetails = {}, syncStep = {};
-  ui.view.document = {getElementById: id => ({activity: panel, message,
+  ui.view.document = {querySelectorAll, getElementById: id => ({activity: panel, message,
     'notable-sync-status': syncStatus, 'notable-sync-details': syncDetails, 'notable-sync-step': syncStep,
     app: {setAttribute: (key, value) => {attrs[key] = value;}},
     'notable-pause': {querySelector: () => label}}[id])};
@@ -53,6 +57,8 @@ async function main() {
   now += 15000;
   const check = ui.checkInbox();
   assert.equal(ui.busy, true, 'The worker remains serialized during intake');
+  ui.disable(ui.busy); // A selection or render while the background check is running.
+  assert.ok(referenceActions.every(button => button.disabled));
   let messages = 0;
   ui.message = () => {messages++;};
   ui.receiveProgress({message: 'Checking Zotero file 534 of 537'});
@@ -62,7 +68,10 @@ async function main() {
   assert.equal(message.hidden, false, 'Ready status must remain visible');
   assert.equal(attrs['aria-busy'], 'false');
   assert.equal(label.textContent, 'Pause sync');
+  const beforeUnchangedCheck = renders;
   finish(ui.latest); await check;
+  assert.equal(renders, beforeUnchangedCheck, 'An unchanged scan keeps the active form');
+  assert.ok(referenceActions.every(button => !button.disabled), 'The existing PDF and Dismiss buttons are re-enabled');
   ui.busy = true; ui.updateActivity();
   assert.equal(panel.hidden, false, 'User operations retain the loading panel');
   assert.equal(label.textContent, 'Stop');
@@ -102,9 +111,10 @@ async function main() {
   modalOpen = false; ui.rpc = async () => ui.latest;
   now += 15000;
   await ui.checkInbox(); assert.equal(renders, beforeModal + 1, 'Render postponed arrivals after the dialog closes');
-  ui.rpc = async () => {throw Error('Temporarily unavailable');};
+  ui.rpc = async () => {ui.disable(ui.busy); throw Error('Temporarily unavailable');};
   now += 15000;
   await timers.get(ui.inboxTimer).fn(); assert.equal(ui.busy, false); assert.ok(ui.inboxTimer);
+  assert.ok(referenceActions.every(button => !button.disabled), 'A failed background check also unlocks the existing controls');
   ui.stopped = true; await timers.get(ui.inboxTimer).fn(); assert.equal(timers.size, 0);
   console.log('PASS: local monitoring with workspace open, sync paused, retries, no repeated renders, busy guards, and shutdown');
 }

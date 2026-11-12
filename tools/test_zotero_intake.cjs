@@ -6,7 +6,7 @@ const {viewFixture} = require('./test_zotero_ui_recovery.cjs');
 async function referenceViewChecks() {
   const key = 'PARENT23', attachment = 'FILE2345';
   const row = {id: 'reference-review', identity: key, kind: 'reference', status: 'pending', digest: 'current',
-    payload: {title: 'Reference', parent: key, pdf_state: 'none'}};
+    payload: {title: 'Reference', parent: key, url: 'https://example.org/paper', pdf_state: 'none'}};
   const fixture = state => {
     const f = viewFixture({notableReferencePDFState: state});
     const el = f.ui.el;
@@ -50,12 +50,55 @@ async function referenceViewChecks() {
     assert.deepEqual(statuses, [expected]);
     assert.equal(f.buttons.has('Attach downloaded PDF'), expected === 'none');
     assert.equal(f.buttons.has('Find and attach PDF online'), expected === 'none');
+    assert.equal(descendants(detail).some(node => node.textContent.includes('Save the PDF to Downloads')), expected === 'none');
     assert.equal(f.buttons.get('Dismiss this reference')[0].hidden, !['none', 'unavailable'].includes(expected));
     if (navigation) {
       const button = f.buttons.get(navigation)[0];
       assert.equal(button.keys[0], attachment);
       assert.equal(button.target, ['unavailable', 'unsupported', 'file'].includes(expected) ? 'attachment' : 'pdf');
     }
+  }
+  for (const cancel of [false, true]) {
+    let result = {state: 'none'}, resolvePicker;
+    const f = fixture(async () => result);
+    const downloads = 'C:/Users/Example/Downloads';
+    const chosen = downloads + '/Article.pdf';
+    let pickerCount = 0, attaches = 0;
+    f.context.Services = {dirsvc: {get: name => {
+      assert.equal(name, 'DfltDwnld'); return {path: downloads};
+    }}};
+    f.context.Ci = {nsIFile: {}};
+    f.context.ChromeUtils = {importESModule: () => ({FilePicker: class {
+      modeOpen = 0;
+      returnOK = 0;
+      file = chosen;
+      init(_window, title, mode) { assert.equal(title, 'Attach downloaded PDF'); assert.equal(mode, 0); }
+      appendFilter(label, pattern) { assert.equal(label, 'PDF files'); assert.equal(pattern, '*.pdf'); }
+      show() {
+        assert.equal(this.displayDirectory, downloads);
+        pickerCount++;
+        return new Promise(resolve => { resolvePicker = resolve; });
+      }
+    }})};
+    f.context.notableIsPDFFile = () => true;
+    f.context.notableAcquirePDF = async (selected, file) => {
+      assert.equal(selected, key); assert.equal(file, chosen);
+      attaches++;
+      result = {state: 'available', attachment};
+      return {outcome: 'added', attachment: {}};
+    };
+    f.ui.checkInbox = async () => {};
+    const detail = Object.assign(f.node(), {classList: {add() {}}});
+    await f.ui.renderReferenceIntake(row, detail);
+    const button = f.buttons.get('Attach downloaded PDF')[0];
+    const choose = button.click();
+    assert.equal(f.ui.acquiringPDF, true, 'Keep background checks out of the native picker');
+    await button.click();
+    assert.equal(pickerCount, 1, 'A second click cannot open another picker');
+    resolvePicker(cancel ? 1 : 0);
+    await choose;
+    assert.equal(attaches, cancel ? 0 : 1);
+    assert.equal(f.ui.acquiringPDF, false, 'Confirming or canceling restores the controls');
   }
   {
     let result = {state: 'none'};

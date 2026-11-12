@@ -623,9 +623,11 @@ var NotableUI = {
       this.inboxChecking = false;
       this.busy = false;
       this.inboxRenderPending ||= changed;
-      if (!this.stopped && this.inboxRenderPending && this.view && !this.view.closed
-        && !this.view.document?.querySelector?.('dialog[open]')
-        && ['inbox', 'library', 'sync-review'].includes(this.tab)) this.render();
+      if (!this.stopped && this.view && !this.view.closed) {
+        if (this.inboxRenderPending && !this.view.document?.querySelector?.('dialog[open]')
+          && ['inbox', 'library', 'sync-review'].includes(this.tab)) this.render();
+        else this.disable(false);
+      }
     }
   },
   schedule(sooner) {
@@ -1604,7 +1606,7 @@ var NotableUI = {
     else if (this.tab === 'links') this.renderLinks(content);
     else if (this.tab === 'tags') this.renderTags(content);
     else this.renderReview(content, this.tab === 'review' ? 'inbox' : this.tab);
-    this.disable(this.busy);
+    this.disable(this.busy || this.acquiringPDF);
     this.restoreReviewContext(reviewContext);
     this.restoreReviewList();
     this.restoreFocus(focus);
@@ -2299,6 +2301,12 @@ var NotableUI = {
     const status = this.el('p', '', detail, {role: 'status', 'data-reference-pdf-state': 'checking'});
     const reference = this.reviewNavigationButton('Show reference in Zotero', detail, 'references', [row.identity],
       {inbox: true, onOpened: () => inspectPDF()});
+    const url = row.payload.url;
+    const hasSourceLink = /^https?:\/\//i.test(url || '');
+    if (hasSourceLink) {
+      const open = this.button('Open source link', detail, () => Zotero.launchURL(url), false, 'external-link');
+      open.dataset.browse = 'true';
+    }
     const pdfControls = this.el('div', '', detail);
     const lookup = this.el('div', '', detail);
     lookup.hidden = true;
@@ -2330,16 +2338,10 @@ var NotableUI = {
     }, true, 'file-search');
     find.dataset.browse = 'true';
     const results = this.el('div', '', lookup, {role: 'region', 'aria-label': 'Possible duplicate references'});
-    const url = row.payload.url;
-    if (/^https?:\/\//i.test(url || '')) {
-      const open = this.button('Open source link', detail, () => Zotero.launchURL(url), false, 'external-link');
-      open.dataset.browse = 'true';
-    }
     const dismiss = this.button('Dismiss this reference', detail, () => this.action('dismiss_review', {identity: row.id, digest: row.digest}));
     let serial = 0;
     const inspectPDF = async () => {
       const request = ++serial;
-      const wasExpanded = pdfControls.querySelector?.('.reference-pdf-actions')?.open;
       status.setAttribute('data-reference-pdf-state', 'checking');
       status.textContent = 'Checking this Zotero reference for a PDF…';
       lookup.hidden = true;
@@ -2373,7 +2375,7 @@ var NotableUI = {
       reference.hidden = state === 'removed';
       lookup.hidden = !['none', 'unavailable'].includes(state);
       dismiss.hidden = lookup.hidden;
-      if (state === 'none') this.renderReferencePDFActions(row, pdfControls, inspectPDF, wasExpanded);
+      if (state === 'none') this.renderReferencePDFActions(row, pdfControls, inspectPDF, hasSourceLink);
       else if (result.attachment) {
         const showAttachment = ['unavailable', 'unsupported', 'file'].includes(result.state);
         const label = result.state === 'file' ? 'Show attached file in Zotero'
@@ -2383,38 +2385,41 @@ var NotableUI = {
           [result.attachment], {inbox: true, onOpened: inspectPDF});
       }
       if (this.referencePDFState(row) !== state) this.zoteroInboxDirty = true;
-      if (this.busy) this.disable(true);
+      if (this.busy || this.acquiringPDF) this.disable(true);
     };
     return inspectPDF();
   },
-  renderReferencePDFActions(row, parent, inspectPDF, expanded) {
-    const pdfActions = this.el('details', '', parent, {class: 'reference-pdf-actions', 'data-review-detail': 'reference-pdf'});
-    pdfActions.open = !!expanded;
-    this.el('summary', 'Add a PDF', pdfActions);
-    const acquire = async file => {
+  renderReferencePDFActions(row, parent, inspectPDF, hasSourceLink) {
+    const pdfActions = this.el('div', '', parent, {class: 'reference-pdf-actions'});
+    if (hasSourceLink) this.el('p', 'Save the PDF to Downloads in your browser, then attach it here.', pdfActions, {class: 'hint'});
+    const acquire = async chooseFile => {
       if (this.busy || this.acquiringPDF || !pdfActions.isConnected) return;
       this.acquiringPDF = true; this.disable(true);
-      let acquired;
+      let acquired, attempted = false;
       try {
+        const file = chooseFile ? await chooseFile() : null;
+        if (chooseFile && !file) return;
+        attempted = true;
         acquired = await notableAcquirePDF(row.identity, file, {describe: true});
         this.zoteroInboxDirty = true;
       } finally {
-        this.acquiringPDF = false; this.disable(false);
-        if (parent.isConnected) await inspectPDF();
+        this.acquiringPDF = false; this.disable(this.busy);
+        if (attempted && parent.isConnected) await inspectPDF();
       }
       await this.checkInbox();
       this.message(acquired.outcome === 'existing' ? 'A PDF was already attached in Zotero.'
         : notableIsPDFFile(acquired.attachment) ? 'PDF attached in Zotero.'
           : 'Zotero attached another file type. This reference still needs a PDF for reMarkable.');
     };
-    this.button('Find and attach PDF online', pdfActions, () => acquire(null), false, 'file-search');
-    this.button('Attach downloaded PDF', pdfActions, async () => {
+    this.button('Attach downloaded PDF', pdfActions, () => acquire(async () => {
       const {FilePicker} = ChromeUtils.importESModule('chrome://zotero/content/modules/filePicker.mjs');
       const picker = new FilePicker(); picker.init(this.view, 'Attach downloaded PDF', picker.modeOpen);
       picker.appendFilter('PDF files', '*.pdf');
-      if (await picker.show() !== picker.returnOK) return;
-      await acquire(picker.file);
-    }, false, 'folder-input');
+      try { picker.displayDirectory = Services.dirsvc.get('DfltDwnld', Ci.nsIFile).path; }
+      catch (_) {} // Use the native picker default when Windows has no Downloads directory.
+      return await picker.show() === picker.returnOK ? picker.file : null;
+    }), true, 'folder-input');
+    this.button('Find and attach PDF online', pdfActions, () => acquire(null), false, 'file-search');
   },
   renderReview(content, queue = null) {
 
