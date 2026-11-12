@@ -10,7 +10,7 @@ var NotableUI = {
     ['title-asc', 'Title · A–Z'], ['title-desc', 'Title · Z–A']],
   inboxTitleOrder: new Intl.Collator(undefined, {numeric: true, sensitivity: 'base'}),
   inboxSort: 'added-asc', inboxFilter: 'all',
-  recentTags: [],
+  recentTags: [], tagEdits: [], afterSync: [],
   async start(rootURI) {
     this.stopped = false;
     this.rootURI = rootURI;
@@ -47,6 +47,16 @@ var NotableUI = {
         this.filingQueuePaused = !!saved.jobs.length;
       } catch (_) { this.queueError = 'The saved filing queue could not be read. Your papers remain pending.'; }
     }
+    const tagPath = PathUtils.join(this.statePath, 'tag-edits.json');
+    if (await IOUtils.exists(tagPath)) {
+      try {
+        const saved = JSON.parse(await IOUtils.readUTF8(tagPath));
+        if (!Array.isArray(saved) || !saved.every(job => job.edit_id && job.connection && job.page_id
+            && Array.isArray(job.paper?.before) && Array.isArray(job.paper?.after)
+            && Array.isArray(job.page?.before) && Array.isArray(job.page?.after))) throw Error('Invalid tag edit queue');
+        this.tagEdits = saved;
+      } catch (_) { this.tagEditError = 'The saved tag edits could not be read.'; this.tagEditsUnreadable = true; }
+    }
     for (const [target, label] of [['main/menubar/tools', this.shortName], ['main/library/item', this.name + '…']]) {
       Zotero.MenuManager.registerMenu({menuID: 'notable-' + target.replaceAll('/', '-'), pluginID: this.id, target,
         menus: [{menuType: 'menuitem', icon: target === 'main/menubar/tools' ? 'chrome://notable/content/icons/tablet.svg' : undefined,
@@ -72,6 +82,7 @@ var NotableUI = {
           }
         }
         this.schedule(5000);
+        this.drainTagEdits();
       }
     });
   },
@@ -166,6 +177,7 @@ var NotableUI = {
   detach(window) { window.document.getElementById('notable-open')?.remove(); this.windows.delete(window); },
   async stop() {
     this.stopped = true;
+    this.cancelAfterSync('The plugin closed before this action could start.');
     this.hideButtonHelp();
     Zotero.Reader.unregisterEventListener('renderToolbar', this.readerToolbar);
     if (this.collectionObserver) Zotero.Notifier.unregisterObserver(this.collectionObserver);
@@ -670,7 +682,8 @@ var NotableUI = {
   },
   automaticAllowed() {
     return !this.stopped && !this.busy && !this.paperTagChecking && !this.acquiringPDF && !this.drainingFilings
-      && (!this.filingQueue.length || this.filingQueuePaused) && this.canSync()
+      && (!this.filingQueue.length || this.filingQueuePaused) && !this.drainingTagEdits
+      && (!this.tagEdits.length || this.tagEditError) && !this.afterSync.length && !this.drainingAfterSync && this.canSync()
       && !this.latest.config.sync_paused && !!this.latest.config.automatic
       && !this.view?.document?.querySelector?.('dialog[open]');
   },
@@ -691,6 +704,7 @@ var NotableUI = {
   async pauseSync() {
     if (this.pausing) return;
     this.pausing = true; clearTimeout(this.timer); this.timer = null;
+    this.cancelAfterSync('Sync was paused. Review the item and choose the action again.');
     this.filingQueuePaused = true;
     try { await this.saveFilingQueue(); } catch (_) { this.queueError = 'The queue could not be saved. Sync is being paused.'; }
     if (this.operation) { this.operation.stopping = true; this.operation.yielding = false; }
@@ -700,7 +714,7 @@ var NotableUI = {
       this.latest = await this.rpc('pause_sync'); this.badge();
       if (this.view && !this.view.closed) this.render();
     } catch (error) { this.message(error.message, true); throw error; }
-    finally { this.pausing = false; this.disable(this.busy); this.schedule(); this.badge(); }
+    finally { this.pausing = false; this.disable(this.busy); this.schedule(); this.badge(); this.drainTagEdits(); }
   },
   clearFolderEditor() {
     this.changingFolder = false; this.setupDirty = false; this.setupDraft = null;
@@ -726,22 +740,45 @@ var NotableUI = {
     if (!Number.isInteger(page)) throw new Error('Wait for this PDF page to finish loading.');
     const item = await Zotero.Items.getAsync(reader.itemID);
     if (!item?.isPDFAttachment()) throw new Error('Choose a PDF first.');
-    const context = await this.rpc('tag_context', {key: item.key, page});
+    const context = {key: item.key, page, title: 'Page tags', loading: true,
+      connection: this.filingConnection()};
     this.tagEditor = context;
     if (this.view && !this.view.closed && this.view.document.getElementById('app')?.querySelector('h1')) {
+      this.tabNavigationSerial = (this.tabNavigationSerial || 0) + 1;
       this.tab = 'tags';
       this.render();
     } else {
       this.requestedTab = 'tags';
     }
     this.open();
+    try {
+      const link = (this.latest?.links || []).find(row => row.view_key === item.key && !row.unavailable);
+      const parent = link?.page_map?.[page] && item.parentID ? await Zotero.Items.getAsync(item.parentID) : null;
+      if (parent && !parent.deleted && parent.key === link.parent && link.page_map_digest) {
+        await parent.loadAllData?.();
+        const pageID = link.page_map[page];
+        Object.assign(context, {cloud: link.cloud, parent_key: parent.key, pdf_digest: link.page_map_digest,
+          title: parent.getField('title') || link.name, page_id: pageID,
+          paper_tags: parent.getTags().map(row => row.tag), page_tags: link.page_tags?.[pageID] || [],
+          vocabulary: [...new Set([...(this.paperTagBank?.tags || []), ...this.pageTagNames()])].sort(),
+          interrupted: !!link.tag_pending, orphaned_pages: Object.fromEntries(Object.entries(link.page_tags || {})
+            .filter(([id, values]) => !link.page_map.includes(id) && values.length))});
+      } else Object.assign(context, await this.rpc('tag_context', {key: item.key, page}));
+    } catch (error) { context.error = error.message; }
+    finally {
+      context.loading = false;
+      if (this.tagEditor === context && this.tab === 'tags' && this.view?.document && !this.view.closed) this.render();
+    }
   },
   async action(method, params = {}, render = true) {
     if (this.paperTagChecking) { try { await this.paperTagRequest; } catch (_) {} }
     if (this.inboxChecking) { try { await this.inboxRequest; } catch (_) {} }
     const syncing = method === 'sync';
     if (syncing && (params.automatic ? !this.automaticAllowed() : !this.canSync())) return;
-    if (this.busy) return;
+    if (this.busy) {
+      if (!syncing && this.operation?.method === 'sync') return this.deferUntilAfterSync(method, params, render);
+      return;
+    }
     clearTimeout(this.timer);
     this.timer = null;
     if (syncing) this.syncDue = null;
@@ -759,7 +796,7 @@ var NotableUI = {
       confirm_folder_change: 'Checking the changed folder',
       recheck_review: 'Rechecking local Zotero evidence', check_inbox: 'Checking Zotero for new papers…',
       acknowledge_review_finding: 'Saving this library decision', reindex: 'Rebuilding the search index', folders: 'Loading folders',
-      maintenance: 'Running the selected local library action'};
+      maintenance: 'Running the selected local library action', apply_tag_edit: 'Applying saved tag changes'};
     const detail = checkingInbox ? '' : 'Starting…';
     this.operation = {method, automatic: !!params.automatic, title: labels[method] || 'Updating your setup',
       started: Date.now(), updated: Date.now(), detail};
@@ -777,7 +814,7 @@ var NotableUI = {
         if (this.inboxReferenceSelection?.id === reference) this.inboxReferenceSelection.attachment = key;
         this.zoteroInboxDirty ||= result.native_files_settling;
       }
-      if (['sync', 'set_page_tags', 'combine_tag_copies', 'remove_unavailable_page_tags'].includes(method)) {
+      if (['sync', 'set_page_tags', 'apply_tag_edit', 'combine_tag_copies', 'remove_unavailable_page_tags'].includes(method)) {
         this.tagSyncRevision = (this.tagSyncRevision || 0) + 1;
       }
       if (syncing && !this.operation.stopping) {
@@ -791,6 +828,7 @@ var NotableUI = {
       } else if (method === 'sync' && reviewChangeSerial === (this.reviewChangeSerial || 0)) this.reviewStale = false;
       if (connection !== this.filingConnection()) {
         this.reviewDrafts.clear(); this.tagDrafts.clear(); this.linkDrafts.clear(); this.batchCollection = null; this.selected = null;
+        this.tagEditor = null;
         this.inboxReferenceSelection = null;
         this.inboxHandoffWaiting = null;
         this.separateIntakePDFs?.clear();
@@ -824,6 +862,7 @@ var NotableUI = {
       if (syncing) {
         this.failures = (this.failures || 0) + 1;
         this.syncFailure = error.message;
+        this.cancelAfterSync('Sync stopped before the current state could be checked. Review the item and choose the action again.');
       }
       if (this.latest) this.latest.status = {state: 'needs_attention', message: error.message};
       this.badge(); this.message(error.message, true); throw error;
@@ -839,6 +878,8 @@ var NotableUI = {
       if (this.reviewUpgradeWaiting && this.view && !this.view.closed) {
         this.reviewUpgradeWaiting = false; this.prepareReviewGuidance();
       } else if (!localReviewAction && this.filingQueue.length && !this.drainingFilings) this.drainFilings().catch(error => this.message(error.message, true));
+      if (!this.drainingTagEdits) this.drainTagEdits();
+      if (!this.drainingAfterSync) this.drainAfterSync();
     }
   },
   async refreshInbox() {
@@ -863,6 +904,142 @@ var NotableUI = {
   filingConnection() {
     const config = this.latest?.config || {};
     return JSON.stringify([config.connection_id || 'legacy', config.zotero_root, config.tablet_root]);
+  },
+  actionEvidence(method, params) {
+    const identity = params.identity;
+    const list = method === 'delete_decision' ? this.latest?.deletions
+      : method === 'local_delete_decision' ? this.latest?.local_deletions : null;
+    if (list) return JSON.stringify(list.find(row => row.id === identity));
+    if (['link', 'cancel_filename_cleanup', 'undo_filename_cleanup'].includes(method)) {
+      const link = this.latest?.links?.find(row => row.cloud === identity);
+      return JSON.stringify(link && [link.parent, link.view_key, link.revision, link.paused, link.filename_cleanup, link.filename_repair]);
+    }
+    return null;
+  },
+  deferUntilAfterSync(method, params, render) {
+    if (this.pausing || this.stopped) throw Error('This action could not start while sync is pausing. Try again.');
+    const request = JSON.parse(JSON.stringify(params));
+    const connection = this.filingConnection(), evidence = this.actionEvidence(method, request);
+    const labels = {check_inbox: 'Check Inbox', recheck_review: 'Recheck Zotero', dismiss_review: 'Dismiss Inbox reference',
+      attach_intake_pdf: 'Attach PDF from ToSort', confirm_folder_change: 'Apply folder decision',
+      delete_decision: 'Apply deletion decision', local_delete_decision: 'Apply deletion decision', resolve_conflict: 'Resolve conflict',
+      create_destination: 'Create folder', link: 'Update paper link', move_link: 'Rename or move paper',
+      repair_link: 'Repair paper link', reindex: 'Rebuild search index', scan_library: 'Scan library', import_library: 'Import library',
+      retry_bulk: 'Update import review', save_paper_tags: 'Save paper tags', paper_tag_candidates: 'Find paper tags'};
+    const signature = JSON.stringify([method, request, connection]);
+    const existing = this.afterSync.find(job => job.signature === signature);
+    if (existing) return existing.result;
+    const job = {method, request, render, connection, evidence, signature, label: labels[method] || 'Apply plugin action'};
+    job.result = new Promise((resolve, reject) => { job.resolve = resolve; job.reject = reject; });
+    this.afterSync.push(job);
+    this.refreshAfterSync();
+    return job.result;
+  },
+  async drainAfterSync() {
+    if (this.drainingAfterSync || this.busy || this.pausing || this.acquiringPDF || this.drainingTagEdits || this.stopped) return;
+    this.drainingAfterSync = true;
+    try {
+      while (this.afterSync.length && !this.busy && !this.pausing && !this.acquiringPDF && !this.stopped) {
+        const job = this.afterSync[0];
+        this.activeAfterSync = job;
+        try {
+          if (job.connection !== this.filingConnection() || job.evidence !== this.actionEvidence(job.method, job.request)) {
+            throw Error(`${job.label} needs review because the item or sync connection changed.`);
+          }
+          const result = await this.action(job.method, job.request, job.render);
+          job.resolve(result);
+        } catch (error) { job.reject(error); }
+        finally { this.activeAfterSync = null; this.afterSync = this.afterSync.filter(row => row !== job); this.refreshAfterSync(); }
+      }
+    } finally { this.drainingAfterSync = false; this.schedule(); }
+  },
+  cancelAfterSync(message) {
+    for (const job of this.afterSync) if (job !== this.activeAfterSync) job.reject(Error(message));
+    this.afterSync = this.afterSync.filter(job => job === this.activeAfterSync);
+    this.refreshAfterSync();
+  },
+  refreshAfterSync() {
+    const host = this.view?.document?.getElementById('notable-after-sync');
+    if (!host || this.view.closed) return;
+    host.hidden = !this.afterSync.length;
+    host.textContent = this.afterSync.length ? 'Waiting for the worker · ' + this.afterSync.map(job => job.label).join(' · ') : '';
+  },
+  changeTagEdits(change) {
+    this.tagEditWrite = (this.tagEditWrite || Promise.resolve()).catch(() => {}).then(async () => {
+      if (this.tagEditsUnreadable) throw Error(this.tagEditError);
+      const jobs = change(this.tagEdits);
+      const path = PathUtils.join(this.statePath, 'tag-edits.json');
+      await IOUtils.writeUTF8(path, JSON.stringify(jobs), {tmpPath: path + '.tmp', flush: true});
+      this.tagEdits = jobs;
+    });
+    return this.tagEditWrite;
+  },
+  overlayTagEdits(context) {
+    const paper = new Set(context.paper_tags), page = new Set(context.page_tags);
+    for (const job of this.tagEdits) {
+      if (JSON.stringify(job.connection) !== this.filingConnection() || job.parent_key !== context.parent_key) continue;
+      const apply = (tags, edit) => {
+        for (const tag of edit.before) if (!edit.after.includes(tag)) tags.delete(tag);
+        for (const tag of edit.after) if (!edit.before.includes(tag)) tags.add(tag);
+      };
+      apply(paper, job.paper);
+      if (job.cloud === context.cloud && job.key === context.key && job.page_id === context.page_id
+          && job.pdf_digest === context.pdf_digest) apply(page, job.page);
+    }
+    return {paper: [...paper], page: [...page]};
+  },
+  async drainTagEdits() {
+    if (this.stopped || this.busy || this.pausing || this.acquiringPDF || this.drainingTagEdits
+        || this.tagEditError || !this.tagEdits.length || !this.latest?.config?.tablet_root) return;
+    this.drainingTagEdits = true;
+    try {
+      while (this.tagEdits.length && !this.stopped && !this.busy && !this.pausing && !this.acquiringPDF) {
+        const job = this.tagEdits[0];
+        if (JSON.stringify(job.connection) !== this.filingConnection()) throw Error('A saved tag edit belongs to a different sync connection.');
+        const {title, ...params} = job;
+        const result = await this.action('apply_tag_edit', params, false);
+        if (!result) break;
+        if (result.tag_edit_applied !== job.edit_id) throw Error('The helper did not confirm this tag edit.');
+        await this.changeTagEdits(jobs => jobs.filter(row => row.edit_id !== job.edit_id));
+        const context = this.tagEditor;
+        if (context?.parent_key === job.parent_key) {
+          const apply = (values, edit) => [...new Set(values.filter(tag => !edit.before.includes(tag) || edit.after.includes(tag))
+            .concat(edit.after.filter(tag => !edit.before.includes(tag))))];
+          context.paper_tags = apply(context.paper_tags, job.paper);
+          if (context.cloud === job.cloud && context.page_id === job.page_id && context.pdf_digest === job.pdf_digest) {
+            const link = this.latest.links?.find(row => row.cloud === job.cloud);
+            context.page_tags = link?.page_tags?.[job.page_id] || [];
+          }
+        }
+      }
+    } catch (error) { this.tagEditError = error.message; }
+    finally {
+      this.drainingTagEdits = false;
+      this.refreshTagEditQueue();
+      this.schedule();
+      if (this.afterSync.length) this.drainAfterSync();
+    }
+  },
+  refreshTagEditQueue() {
+    const host = this.view?.document?.getElementById('notable-tag-edits');
+    if (!host || this.view.closed) return;
+    const open = host.querySelector('details')?.open;
+    host.replaceChildren();
+    if (!this.tagEdits.length && !this.tagEditError) return;
+    const details = this.el('details', '', host, {class: 'filing-queue'});
+    details.open = !!open;
+    this.el('summary', this.tagEditError ? 'Saved tag changes need attention'
+      : `${this.tagEdits.length} saved tag ${this.tagEdits.length === 1 ? 'edit' : 'edits'} waiting to apply`, details);
+    if (this.tagEditError) this.el('p', this.tagEditError, details, {class: 'message error', role: 'alert'});
+    for (const job of this.tagEdits) this.el('p', job.title || 'Page tags', details);
+    if (this.tagEditError && this.tagEdits.length && !this.tagEditsUnreadable) {
+      this.button('Retry saved tag changes', details, () => { this.tagEditError = ''; this.drainTagEdits(); }).dataset.browse = 'true';
+      this.button('Discard first saved tag edit', details, async () => {
+        if (!this.view.confirm('Discard the first saved tag edit? Any changes already applied in Zotero will remain.')) return;
+        await this.changeTagEdits(jobs => jobs.slice(1));
+        this.tagEditError = ''; this.refreshTagEditQueue(); this.drainTagEdits();
+      }).dataset.browse = 'true';
+    }
   },
   saveFilingQueue() {
     const path = PathUtils.join(this.statePath, 'filing-queue.json');
@@ -1005,6 +1182,7 @@ var NotableUI = {
     }
   },
   disable(value) {
+    const syncing = value && this.operation?.method === 'sync' && !this.pausing;
     if (this.view && !this.view.closed) for (const button of this.view.document.querySelectorAll('button')) {
       if (button.id === 'notable-pause') { button.disabled = !!this.pausing; continue; }
       if (button.dataset.browse === 'true') { button.disabled = false; continue; }
@@ -1014,10 +1192,13 @@ var NotableUI = {
         if (button.dataset.approve === 'true') button.querySelector('.button-label').textContent = value ? 'Add to filing queue' : button.dataset.idleLabel || 'Approve & file';
         continue;
       }
-      button.disabled = value || !!this.pausing || button.dataset.invalid === 'true' || (button.id === 'notable-sync' && !this.canSync());
+      button.disabled = (this.acquiringPDF && (button.dataset.pdfAcquisition === 'true' || button.id === 'notable-sync'))
+        || (value && (!syncing || button.dataset.exclusive === 'true' || button.id === 'notable-sync'))
+        || !!this.pausing || button.dataset.invalid === 'true' || (button.id === 'notable-sync' && !this.canSync());
     }
     if (this.view && !this.view.closed) for (const field of this.view.document.querySelectorAll('input, select, textarea')) {
-      field.disabled = field.dataset?.browse !== 'true' && !field.closest('.review-form') && (value || !!this.pausing);
+      field.disabled = field.dataset?.browse !== 'true' && !field.closest('.review-form')
+        && ((value && (!syncing || field.dataset?.exclusive === 'true')) || !!this.pausing);
     }
     this.updateActivity();
   },
@@ -1608,6 +1789,7 @@ var NotableUI = {
     this.render();
   },
   render() {
+    if (!this.view || this.view.closed) return;
     this.inboxRenderPending = false;
     this.collectionCatalog();
     this.hideButtonHelp();
@@ -1652,6 +1834,10 @@ var NotableUI = {
     this.el('progress', '', announcement, {id: 'activity-progress', 'aria-label': 'Current step progress'});
     this.el('small', '', info, {id: 'activity-time', 'aria-live': 'off', tabindex: '0'});
     this.renderFilingQueue(root);
+    this.el('p', '', root, {id: 'notable-after-sync', class: 'hint', role: 'status'});
+    this.refreshAfterSync();
+    this.el('div', '', root, {id: 'notable-tag-edits', 'aria-live': 'polite'});
+    this.refreshTagEditQueue();
     const content = this.el('main', '', root);
     if (this.tab === 'setup') this.renderSetup(content);
     else if (this.tab === 'import') this.renderImport(content);
@@ -1791,18 +1977,32 @@ var NotableUI = {
   },
   renderTagEditor(content) {
     const context = this.tagEditor;
-    const draftKey = JSON.stringify([this.filingConnection(), context.key, context.page_id ?? context.page]);
-    if (!this.tagDrafts.has(draftKey)) this.tagDrafts.set(draftKey, {paper: [...context.paper_tags], page: [...context.page_tags], token: context.token});
-    const draft = this.tagDrafts.get(draftKey);
     const card = this.el('section', '', content, {class: 'card'});
     this.el('h2', `${context.title} — page ${context.page + 1}`, card);
+    const close = () => { this.tagEditor = null; this.render(); };
+    if (context.loading || context.error) {
+      this.el('p', context.error || (this.busy ? 'Waiting for the current operation to load this page’s tags…' : 'Loading tags…'),
+        card, {role: context.error ? 'alert' : 'status'});
+      this.button('Close page editor', card, close).dataset.browse = 'true';
+      return;
+    }
+    const connection = context.connection || this.filingConnection();
+    const draftKey = JSON.stringify([connection, context.key, context.page_id ?? context.page]);
+    if (!this.tagDrafts.has(draftKey)) {
+      const baseline = this.overlayTagEdits(context);
+      this.tagDrafts.set(draftKey, {paper: [...baseline.paper], page: [...baseline.page], baseline, token: context.token});
+    }
+    const draft = this.tagDrafts.get(draftKey);
     this.el('p', 'Paper tags categorize the whole reference. Page tags identify this exact page. Both sync with reMarkable.', card);
     if (context.interrupted) {
       this.el('p', 'A previous tag sync was interrupted. Sync normally to retry. If tags changed on both copies during that interruption, combine their current tags to recover; labels present on either copy will be retained.', card);
       this.button('Combine current tags and retry', card, async () => {
-        const result = await this.action('combine_tag_copies', {key: context.key, page: context.page, token: context.token}, false);
+        const fresh = await this.rpc('tag_context', {key: context.key, page: context.page});
+        if (fresh.page_id !== context.page_id || connection !== this.filingConnection()) throw Error('The page changed. Reopen the PDF first.');
+        const result = await this.action('combine_tag_copies', {key: context.key, page: context.page, token: fresh.token}, false);
         if (result) {
           draft.paper = [...new Set([...draft.paper, ...result.paper_tags])]; draft.page = [...new Set([...draft.page, ...result.page_tags])];
+          draft.baseline = this.overlayTagEdits(result);
           draft.token = result.token; this.tagEditor = result; this.render();
         }
       });
@@ -1810,7 +2010,11 @@ var NotableUI = {
     for (const [pageID, tags] of Object.entries(context.orphaned_pages || {})) {
       this.el('p', 'A removed or unavailable page still has these tags: ' + tags.join(' · '), card);
       this.button('Remove tags from that unavailable page', card, async () => {
-        const result = await this.action('remove_unavailable_page_tags', {key: context.key, page: context.page, page_id: pageID, token: context.token}, false);
+        const fresh = await this.rpc('tag_context', {key: context.key, page: context.page});
+        if (JSON.stringify(fresh.orphaned_pages?.[pageID]) !== JSON.stringify(tags) || connection !== this.filingConnection()) {
+          throw Error('The unavailable page’s tags changed. Reopen the editor to review them.');
+        }
+        const result = await this.action('remove_unavailable_page_tags', {key: context.key, page: context.page, page_id: pageID, token: fresh.token}, false);
         if (result) { draft.token = result.token; this.tagEditor = result; this.render(); }
       });
     }
@@ -1825,8 +2029,28 @@ var NotableUI = {
     const paper = editor('Paper tags', 'paper'), page = editor('Page tags', 'page');
     this.paperTagPanel(card, {key: context.key});
     const footer = this.el('div', '', card, {class: 'actions tag-editor-footer'});
-    this.button('Save tags', footer, async () => {
+    const save = this.button('Save tags', footer, async () => {
+      if (draft.saving) return;
       paper.add(); page.add();
+      if (context.parent_key && context.pdf_digest) {
+        if (connection !== this.filingConnection()) throw Error('The sync connection changed. Reopen the PDF before saving tags.');
+        const job = {edit_id: Services.uuid.generateUUID().toString(), connection: JSON.parse(connection),
+          cloud: context.cloud, key: context.key, parent_key: context.parent_key,
+          page_id: context.page_id, pdf_digest: context.pdf_digest, title: `${context.title} — page ${context.page + 1}`,
+          paper: {before: draft.baseline.paper, after: [...paper.tags]}, page: {before: draft.baseline.page, after: [...page.tags]}};
+        const differs = ({before, after}) => before.length !== after.length || before.some(tag => !after.includes(tag));
+        if (!differs(job.paper) && !differs(job.page)) return;
+        draft.saving = true;
+        try { await this.changeTagEdits(jobs => [...jobs, job]); }
+        finally { draft.saving = false; }
+        draft.baseline = {paper: job.paper.after, page: job.page.after};
+        this.rememberRecentTags(job.paper.after.filter(tag => !job.paper.before.includes(tag))
+          .concat(job.page.after.filter(tag => !job.page.before.includes(tag))));
+        this.refreshTagEditQueue();
+        this.message('Tag changes saved on this computer. They’ll be applied when the worker is free.');
+        this.drainTagEdits();
+        return;
+      }
       const result = await this.action('set_page_tags', {key: context.key, page: context.page, page_id: context.page_id,
         tags: [...page.tags], paper_tags: [...paper.tags], token: draft.token}, false);
       if (!result) return;
@@ -1834,7 +2058,8 @@ var NotableUI = {
         .concat([...page.tags].filter(tag => !context.page_tags.includes(tag))));
       this.tagDrafts.delete(draftKey); this.tagEditor = result; this.render(); this.message('Tags saved. They will reach reMarkable on the next sync.');
     }, true);
-    this.button('Close page editor', footer, () => { this.tagEditor = null; this.render(); }).dataset.browse = 'true';
+    if (context.parent_key && context.pdf_digest) save.dataset.browse = 'true';
+    this.button('Close page editor', footer, close).dataset.browse = 'true';
   },
   tagSearchState() {
     return this.tagSearch ||= {query: '', scope: 'paper', match: 'all', tags: new Set(), limit: 25};
@@ -2655,12 +2880,14 @@ var NotableUI = {
     const pdfActions = this.el('div', '', parent, {class: 'reference-pdf-actions'});
     if (hasSourceLink) this.el('p', 'Save the PDF to Downloads in your browser, then attach it here.', pdfActions, {class: 'hint'});
     const acquire = async chooseFile => {
-      if (this.busy || this.acquiringPDF || !pdfActions.isConnected) return;
+      if ((this.busy && this.operation?.method !== 'sync') || this.acquiringPDF || !pdfActions.isConnected) return;
       this.acquiringPDF = true; this.disable(true);
+      progress.textContent = chooseFile ? 'Choosing a PDF…' : 'Looking for an available PDF…';
       let acquired, attempted = false;
       try {
         const file = chooseFile ? await chooseFile() : null;
         if (chooseFile && !file) return;
+        if (file) progress.textContent = 'Attaching the PDF in Zotero…';
         attempted = true;
         acquired = await notableAcquirePDF(row.identity, file, {describe: true});
         if (this.inboxReferenceSelection?.id === row.id && this.selected === row.id
@@ -2669,14 +2896,16 @@ var NotableUI = {
         }
         this.zoteroInboxDirty = true;
       } finally {
-        this.acquiringPDF = false; this.disable(this.busy);
+        this.acquiringPDF = false; this.disable(this.busy); progress.textContent = '';
         if (attempted && parent.isConnected) await inspectPDF();
+        this.drainTagEdits(); this.drainAfterSync();
       }
       await this.checkInbox();
       this.message(acquired.outcome === 'existing' ? 'A PDF was already attached in Zotero.'
         : notableIsPDFFile(acquired.attachment) ? 'PDF attached in Zotero.'
           : 'Zotero attached another file type. This reference still needs a PDF for reMarkable.');
     };
+    const progress = this.el('p', '', pdfActions, {class: 'hint', role: 'status'});
     this.button('Attach downloaded PDF', pdfActions, () => acquire(async () => {
       const {FilePicker} = ChromeUtils.importESModule('chrome://zotero/content/modules/filePicker.mjs');
       const picker = new FilePicker(); picker.init(this.view, 'Attach downloaded PDF', picker.modeOpen);
@@ -2684,8 +2913,8 @@ var NotableUI = {
       try { picker.displayDirectory = Services.dirsvc.get('DfltDwnld', Ci.nsIFile).path; }
       catch (_) {} // Use the native picker default when Windows has no Downloads directory.
       return await picker.show() === picker.returnOK ? picker.file : null;
-    }), true, 'folder-input');
-    this.button('Find and attach PDF online', pdfActions, () => acquire(null), false, 'file-search');
+    }), true, 'folder-input').dataset.pdfAcquisition = 'true';
+    this.button('Find and attach PDF online', pdfActions, () => acquire(null), false, 'file-search').dataset.pdfAcquisition = 'true';
   },
   renderReview(content, queue = null) {
 
@@ -3564,7 +3793,7 @@ var NotableUI = {
     return this.paperSearch ||= {view: 'linked', mode: 'citation', query: '', scope: 'all', status: '', reading: 'all', limit: 25};
   },
   async loadNameReview() {
-    if (this.busy || this.nameReviewLoading) return;
+    if ((this.busy && this.operation?.method !== 'sync') || this.nameReviewLoading) return;
     const state = this.paperSearchState();
     const connection = this.filingConnection();
     this.nameReviewLoading = true;
@@ -3899,10 +4128,11 @@ var NotableUI = {
     content = this.el(connected ? 'details' : 'section', '', main, {class: 'card'});
     this.el(connected ? 'summary' : 'h2', connected ? 'Zotero and tablet connection settings' : 'Connect Zotero and reMarkable', content);
     const steps = this.el('div', '', content, {class: 'actions'});
-    this.button('Connect Zotero', steps, async () => { await this.action('connect'); if (config.tablet_root) await this.loadFolders(); });
+    this.button('Connect Zotero', steps, async () => { await this.action('connect'); if (config.tablet_root) await this.loadFolders(); }).dataset.exclusive = 'true';
     this.button('Get reMarkable pairing code', steps, () => Zotero.launchURL('https://my.remarkable.com/device/desktop/connect'));
     const code = this.field('Single-use reMarkable pairing code', content, '', 'input', {sensitive: true}); code.maxLength = 8; code.autocomplete = 'off'; code.className = 'pairing-code';
-    this.button('Pair reMarkable', content, async () => { const value = code.value; code.value = ''; await this.action('pair', {code: value}); await this.loadFolders(); });
+    code.dataset.exclusive = 'true';
+    this.button('Pair reMarkable', content, async () => { const value = code.value; code.value = ''; await this.action('pair', {code: value}); await this.loadFolders(); }).dataset.exclusive = 'true';
     if (!connected) this.button('Refresh folders', content, () => this.loadFolders());
     const scope = this.el('section', '', main, {class: 'card'});
     this.el('h2', connected ? 'Your synced folders' : 'Choose your synced folders', scope);

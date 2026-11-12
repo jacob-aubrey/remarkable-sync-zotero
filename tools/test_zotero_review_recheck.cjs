@@ -138,13 +138,15 @@ async function main() {
     const {ui, writes, nativeDisable} = fixture();
     const button = {dataset: {queue: 'true', approve: 'true'}, querySelector: () => ({})};
     const browse = {dataset: {browse: 'true'}, closest: () => null};
-    const mutation = {dataset: {}, closest: () => null};
-    ui.view = {document: {querySelectorAll: query => query === 'button' ? [button] : [browse, mutation]}};
+    const mutation = {dataset: {exclusive: 'true'}, closest: () => null};
+    const ordinary = {dataset: {}, closest: () => null};
+    ui.view = {document: {querySelectorAll: query => query === 'button' ? [button] : [browse, mutation, ordinary]}};
     ui.operation = {method}; ui.busy = true;
     nativeDisable.call(ui, true);
     assert.equal(button.disabled, method !== 'sync', 'Approvals wait for local evidence checks; normal sync still allows queued filing');
     assert.equal(browse.disabled, false, 'Local filters and draft fields stay available');
     assert.equal(mutation.disabled, true, 'Connection fields stay guarded during worker writes');
+    assert.equal(ordinary.disabled, method !== 'sync', 'Ordinary fields stay editable during transfer');
     if (method !== 'sync') {
       await assert.rejects(ui.queueFiling('approve', {identity: 'a', digest: 'bytes'}), /Wait for the local review check/);
       assert.equal(ui.filingQueue.length, 0); assert.equal(writes.length, 0);

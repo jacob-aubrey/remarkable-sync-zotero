@@ -2723,6 +2723,7 @@ class Worker:
                        'orphaned_pages': {pid: values for pid, values in row.get('page_tags', {}).items()
                                           if pid not in row['page_map'] and values}}
             context['token'] = fingerprint(context)
+            context.update(parent_key=row['parent'], pdf_digest=row['page_map_digest'])
             return context
         finally:
             client.close()
@@ -2766,6 +2767,63 @@ class Worker:
         links[context['cloud']]['page_tags'].pop(page_id)
         self.state.write('documents', links)
         return self.tag_context(key, page)
+
+    def apply_tag_edit(self, edit_id, connection, cloud, key, parent_key, page_id, pdf_digest, paper, page):
+        """Apply a saved editor's additions and removals to the latest tags."""
+        from .zotero_tags import names
+
+        def changes(edit):
+            before, after = set(names(edit['before'])), set(names(edit['after']))
+            return after - before, before - after
+
+        if connection != [self.config.get('connection_id') or 'legacy', self.config.get('zotero_root'),
+                          self.config.get('tablet_root')]:
+            raise PilotError('This tag edit belongs to a different sync connection.')
+        paper_add, paper_remove = changes(paper)
+        page_add, page_remove = changes(page)
+        links = self.state.read('documents', {})
+        row = links.get(cloud)
+        if not row or row.get('parent') != parent_key or row.get('view_key') != key:
+            raise PilotError('The Zotero reference or its PDF link changed. Reopen the PDF to review the edit.')
+        if row.get('last_tag_edit') == edit_id:
+            return {'tag_edit_applied': edit_id}
+        if page_id not in row.get('page_map', []) or row.get('page_map_digest') != pdf_digest:
+            raise PilotError('The PDF changed. Reopen it and check the page before adding its tags again.')
+        if row.get('tag_pending'):
+            raise PilotError('Finish the interrupted tag sync before applying this edit.')
+
+        client = self.zotero()
+        try:
+            if file_sha(client.file_path(key)) != pdf_digest:
+                raise PilotError('The PDF changed. Reopen it and check the page before adding its tags again.')
+            parent = client.get('item', parent_key)
+            attachment = client.get('item', key)
+            if not parent or parent.get('deleted') or not attachment or attachment.get('deleted') or attachment.get('parentItem') != parent_key:
+                raise PilotError('This reference or its attachment is unavailable in Zotero.')
+            existing = {v['tag']: v for v in parent.get('tags', [])}
+            desired = (set(existing) | paper_add) - paper_remove
+            if desired != set(existing):
+                version = parent.get('version', 0)
+                pending = row.get('tag_edit_writing')
+                if pending and pending['id'] == edit_id and version != pending['version']:
+                    raise PilotError('Zotero tags changed while this edit was being saved. Review the paper before trying again.')
+                row['tag_edit_writing'] = {'id': edit_id, 'version': version}
+                self.state.write('documents', links)
+                parent['tags'] = [existing.get(tag, {'tag': tag}) for tag in sorted(desired)]
+                client.authorize()
+                client.update(parent)
+        finally:
+            client.close()
+        pages = row.setdefault('page_tags', {})
+        tags = sorted((set(pages.get(page_id, [])) | page_add) - page_remove)
+        if tags:
+            pages[page_id] = tags
+        else:
+            pages.pop(page_id, None)
+        row.pop('tag_edit_writing', None)
+        row['last_tag_edit'] = edit_id
+        self.state.write('documents', links)
+        return {'tag_edit_applied': edit_id}
 
     def set_page_tags(self, key, page, page_id, tags, token, paper_tags=None):
         from .zotero_tags import names
@@ -2960,7 +3018,7 @@ class Worker:
     def dispatch(self, method, params):
         allowed = {"status", "connect", "pair", "folders", "configure", "preview_connection", "preview_disconnect", "disconnect_folder", "pause_sync", "sync", "preview", "approve", "delete_decision", "resolve_conflict", "link", "reindex", "local_delete_decision", "move_link", "scan_library", "import_library", "approve_routine", "tag_context", "set_page_tags", "tag_search", "combine_tag_copies", "remove_unavailable_page_tags"}
         allowed.update({'create_destination', 'scan_inbox', 'paper_tag_candidates', 'suggest_paper_tags', 'save_paper_tags', 'preview_keyword_cleanup', 'remove_reviewed_keywords', 'preview_filename_cleanup', 'queue_filename_cleanup', 'cancel_filename_cleanup', 'retry_bulk', 'dismiss_review', 'runtime_health', 'recheck_review', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source'})
-        allowed.update({'maintenance', 'undo_filename_cleanup', 'attach_intake_pdf', 'confirm_folder_change'})
+        allowed.update({'maintenance', 'undo_filename_cleanup', 'attach_intake_pdf', 'confirm_folder_change', 'apply_tag_edit'})
         if method not in allowed:
             raise PilotError("Unsupported plugin request.")
         if method not in {'status', 'pause_sync', 'preview_disconnect', 'runtime_health', 'scan_inbox'}:

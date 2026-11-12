@@ -217,7 +217,7 @@ async function main() {
     const {ui, context} = fixture({Zotero: {Items: {getAsync: async () => ({key: 'PDF', isPDFAttachment: () => true})}}});
     const order = [], pageContext = {key: 'PDF', page: 0};
     ui.open = () => {
-      assert.equal(ui.tagEditor, pageContext, 'The page context is ready when the tag editor opens');
+      assert.equal(ui.tagEditor.loading, true, 'Open before the worker replies');
       assert.equal(ui.requestedTab, 'tags');
       order.push('open');
     };
@@ -228,7 +228,66 @@ async function main() {
       return pageContext;
     };
     await ui.openPageTags({_internalReader: {_state: {primaryViewStats: {pageIndex: 0}}}, itemID: 1});
-    assert.deepEqual(order, ['context', 'open']);
+    assert.deepEqual(order, ['open', 'context']);
+    assert.equal(ui.tagEditor.loading, false);
+  }
+  {
+    const {ui, fields, buttons, node, writes} = viewFixture({Services: {uuid: {generateUUID: () => 'edit-1'}},
+      Zotero: {Items: {getAsync: async id => id === 1
+        ? {key: 'PDF', parentID: 2, isPDFAttachment: () => true}
+        : {key: 'REF', getField: () => 'Paper', getTags: () => [{tag: 'Existing'}]}},
+      Prefs: {set() {}}}});
+    ui.latest.links = [{cloud: 'R', view_key: 'PDF', parent: 'REF', page_map: ['PAGE'], page_map_digest: 'digest',
+      page_tags: {PAGE: ['Existing page']}}];
+    ui.open = () => {};
+    ui.busy = true;
+    ui.operation = {method: 'sync'};
+    ui.rpc = () => { throw Error('Opening and saving must never wait for the worker'); };
+    await ui.openPageTags({_internalReader: {_state: {primaryViewStats: {pageIndex: 0}}}, itemID: 1});
+    assert.equal(ui.tagEditor.page_id, 'PAGE');
+    ui.renderTagEditor(node());
+    fields.get('Add page tag').value = 'New page';
+    await buttons.get('Save tags')[0].click();
+    assert.deepEqual(writes[0][0].page, {before: ['Existing page'], after: ['Existing page', 'New page']});
+    assert.equal(writes[0][0].pdf_digest, 'digest');
+    const restarted = fixture().ui;
+    restarted.tagEdits = writes[0];
+    restarted.action = async (method, params) => {
+      assert.equal(method, 'apply_tag_edit');
+      assert.equal(params.edit_id, 'edit-1');
+      return {tag_edit_applied: 'edit-1'};
+    };
+    await restarted.drainTagEdits();
+    assert.equal(restarted.tagEdits.length, 0);
+  }
+  {
+    const {ui} = fixture();
+    ui.busy = true; ui.operation = {method: 'sync'};
+    ui.latest.deletions = [{id: 'case', payload: {current: 'first'}}];
+    const decision = ui.action('delete_decision', {identity: 'case', choice: 'mirror'});
+    const error = assert.rejects(decision, /needs review/);
+    const inbox = ui.action('check_inbox');
+    assert.equal(ui.afterSync.length, 2);
+    const calls = [];
+    ui.action = async method => calls.push(method);
+    ui.latest.deletions[0].payload.current = 'changed';
+    ui.busy = false;
+    await ui.drainAfterSync();
+    await Promise.all([error, inbox]);
+    assert.deepEqual(calls, ['check_inbox']);
+  }
+  {
+    const {ui} = fixture();
+    let failSync;
+    ui.rpc = method => {
+      assert.equal(method, 'sync', 'No queued writes start after an unverified sync failure');
+      return new Promise((_resolve, reject) => { failSync = reject; });
+    };
+    const sync = assert.rejects(ui.action('sync'), /worker stopped/);
+    const pending = assert.rejects(ui.action('dismiss_review', {identity: 'ref', digest: 'original'}), /could be checked/);
+    failSync(Error('worker stopped'));
+    await Promise.all([sync, pending]);
+    assert.equal(ui.afterSync.length, 0);
   }
   {
     let releaseLaunch, exited = false, kills = 0; const writes = [];

@@ -798,7 +798,15 @@ async function startup({rootURI}) {
             const saved = {latest: ui.latest, tab: ui.tab, rpc: ui.rpc};
             const ensure = (value, reason) => { if (!value) throw new Error(reason); };
             const settle = () => Zotero.Promise.delay(200);
+            const requests = [];
             try {
+              ui.rpc = async (method, params) => {
+                requests.push({method, params});
+                if (method === 'suggest_paper_tags') return {proposal: command.proposal};
+                if (method === 'save_paper_tags') return {saved: true, deferred_until_filing: true};
+                if (method === 'status') return command.snapshot;
+                throw new Error('Unexpected tag UI request');
+              };
               ui.latest = command.snapshot; ui.tab = 'review'; ui.selected = null; ui.showAllReviews = true; ui.reviewScrollTop = 0;
               ui.render(); ui.view.resizeTo(1040, 900); await settle();
               const doc = ui.view.document;
@@ -822,15 +830,7 @@ async function startup({rootURI}) {
               doc.querySelector('.paper-tag-proposal').open = true; await settle();
               response.expanded = sizes();
               ensure(Math.abs(response.expanded.list - response.expanded.detail) < 2, 'List failed to follow expanded details');
-              const requests = [];
-              ui.rpc = async (method, params) => {
-                requests.push({method, params});
-                if (method === 'suggest_paper_tags') return {proposal: command.proposal};
-                if (method === 'save_paper_tags') return {saved: true, deferred_until_filing: true};
-                if (method === 'status') return command.snapshot;
-                throw new Error('Unexpected tag UI request');
-              };
-              [...doc.querySelectorAll('button')].find(b => b.textContent === 'Find keywords and suggest tags').click(); await settle();
+              await ui.preparePaperTags(); await settle();
               const checks = [...doc.querySelector('.paper-tag-proposal').querySelectorAll('input[type="checkbox"]')];
               ensure(checks.length && checks.every(input => !input.checked), 'Suggestions applied without selection');
               checks[0].checked = true;
@@ -960,16 +960,25 @@ async function startup({rootURI}) {
               else themeRoot.setAttribute('data-color-scheme', initialScheme);
             }
             const activeUI = Zotero.Notable;
-            const original = activeUI.rpc; response.requests = [];
+            if (!activeUI.latest) activeUI.latest = await activeUI.rpc('status');
+            const original = activeUI.rpc, previousLinks = activeUI.latest.links, previousConfig = activeUI.latest.config;
+            response.requests = [];
+            const ctx = command.context;
+            activeUI.latest.config = {...previousConfig, tablet_root: 'reader-test-connection', automatic: false};
+            activeUI.latest.links = [{cloud: ctx.cloud, parent: ctx.parent_key, view_key: ctx.key,
+              page_map: [ctx.page_id], page_map_digest: ctx.pdf_digest, page_tags: {[ctx.page_id]: ctx.page_tags}}];
             activeUI.rpc = async function(method, params) {
-              if (method === 'tag_context') { response.requests.push({method, params}); return command.context; }
-              if (method === 'set_page_tags') {
+              if (method === 'tag_context') throw Error('Opening a linked PDF must use its local page map during sync');
+              if (method === 'apply_tag_edit') {
                 response.requests.push({method, params});
-                return {...command.context, page_tags: params.tags, paper_tags: params.paper_tags};
+                return {tag_edit_applied: params.edit_id};
               }
+              if (method === 'status') return activeUI.latest;
               return original.call(this, method, params);
             };
             try {
+              activeUI.busy = true;
+              activeUI.operation = {method: 'sync', started: Date.now(), updated: Date.now(), detail: 'Synthetic transfer'};
               button.click();
               const saveButton = () => [...(activeUI.view?.document.querySelectorAll('button') || [])]
                 .find(b => b.textContent === 'Save tags');
@@ -978,11 +987,18 @@ async function startup({rootURI}) {
               const inputs = [...activeUI.view.document.querySelectorAll('main input')];
               inputs[0].value = 'Native paper tag'; inputs[1].value = 'Native page tag';
               saveButton().click();
-              await waitFor(() => response.requests.some(r => r.method === 'set_page_tags') && !activeUI.busy,
-                'Reader tags did not save');
+              await waitFor(() => activeUI.tagEdits.length === 1, 'Reader tags were not queued during sync');
+              const editsPath = PathUtils.join(activeUI.statePath, 'tag-edits.json');
+              response.savedDuringSync = JSON.parse(await IOUtils.readUTF8(editsPath)).length === 1 && !response.requests.length;
+              activeUI.busy = false; activeUI.operation = null;
+              await activeUI.drainTagEdits();
+              if (activeUI.tagEdits.length) throw Error(activeUI.tagEditError || 'Reader tag queue did not drain');
               response.readerPage = reader._internalReader._state.primaryViewStats.pageIndex;
               response.readerButton = button.title;
-            } finally { activeUI.rpc = original; }
+            } finally {
+              activeUI.rpc = original; activeUI.latest.links = previousLinks; activeUI.latest.config = previousConfig;
+              activeUI.busy = false; activeUI.operation = null;
+            }
           }
           else if (command.action === 'snapshot') {
             const win = command.mainWindow ? Zotero.getMainWindow() : ui.view, canvas = win.document.createElementNS('http://www.w3.org/1999/xhtml', 'canvas');
@@ -1426,9 +1442,13 @@ def bulk_checks(client, root, checked, count, resume=False):
     import shutil
     shutil.copyfile(root / 'workspace.png', root / 'tag-workspace.png')
     assert ui_tags['readerButton'] == 'Tag this paper and/or page' and ui_tags['readerPage'] == 0
-    assert ui_tags['requests'][0]['params'] == {'key': key, 'page': 0}
-    edit = next(r for r in ui_tags['requests'] if r['method'] == 'set_page_tags')['params']
-    worker.dispatch('set_page_tags', edit)
+    assert ui_tags['savedDuringSync']
+    edit = next(r for r in ui_tags['requests'] if r['method'] == 'apply_tag_edit')['params']
+    assert (edit['key'], edit['page_id']) == (key, context['page_id'])
+    # The test's paired worker uses a synthetic cloud and its own state directory.
+    edit['connection'] = [worker.config.get('connection_id') or 'legacy', worker.config.get('zotero_root'),
+                          worker.config.get('tablet_root')]
+    worker.dispatch('apply_tag_edit', edit)
     before_pdf = client.file_path(key).read_bytes()
     worker.sync()
     remote = next(i for i in cloud.library() if i.id == tag_id)
@@ -1487,15 +1507,16 @@ def tagging_checks(client, root, checked):
     import copy
     import pymupdf
     from note_organizer.zotero_worker import file_sha
+    client.authorize()
     source = root / 'Keyword papers'; source.mkdir()
     path = source / 'Keyword fixture.pdf'
     with pymupdf.open() as document:
         page = document.new_page()
         page.insert_text((40, 80), 'Spectral CT nanoparticle research\n\nIntroduction\nSpectral CT measures iodine concentration. Nanoparticles improve contrast.\nIodine concentration is measured with spectral imaging.')
-        document.set_metadata({'keywords': 'Spectral CT\x02nanoparticles'})
+        document.set_metadata({'keywords': 'Spectral CT; nanoparticles'})
         document.save(path)
     digest = file_sha(path)
-    collection = client.collections()[0]['key']
+    collection = client.create('collection', {'key': 'TAGG2345', 'name': 'Tagging fixture'})['key']
     native = client.review_action('bulk_import', {'root': str(source), 'source': str(path), 'digest': digest,
         'md5': hashlib.md5(path.read_bytes()).hexdigest(), 'collection': collection, 'lookup': False,
         'title': 'Keyword fixture paper', 'dois': [], 'evidence': ''})
@@ -1518,6 +1539,10 @@ def tagging_checks(client, root, checked):
     assert (selected, 0) in [(tag['tag'], tag.get('type', 0)) for tag in client.get('item', native['parent'])['tags']]
     assert file_sha(path) == digest and file_sha(native['path']) == digest
     checked('native_selected_suggestion_is_explicit_and_original_PDF_bytes_are_unchanged')
+    reader = command(root, 'reader_tags', context={'key': native['attachment'], 'parent_key': native['parent'], 'page': 0,
+                     'cloud': 'reader-test-link', 'page_id': 'stable-page-1', 'page_tags': [], 'pdf_digest': digest})
+    assert reader['savedDuringSync'] and reader['requests'][0]['params']['page_id'] == 'stable-page-1'
+    checked('native_reader_opens_and_persists_page_edit_while_worker_is_busy')
     snapshot = command(root, 'rpc', method='status')['result']
     snapshot.update(config={'zotero_root': collection, 'tablet_root': 'fixture', 'automatic': False},
         collections=[{'key': collection, 'name': 'Literature', 'parentCollection': False}], mappings={collection: {'cloud': 'fixture'}},

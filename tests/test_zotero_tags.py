@@ -189,6 +189,32 @@ class TagTests(unittest.TestCase):
         self.assertFalse(context['interrupted'])
         self.assertEqual(set(context['paper_tags']), {'Publisher', 'Tablet', 'New local edit', 'Concurrent tablet edit'})
 
+    def test_saved_tag_edit_merges_current_changes_and_is_safe_to_replay(self):
+        worker = Worker(self.root / 'worker', zotero_factory=lambda: self.zot)
+        key = 'VIEW2345'
+        pdf = self.current()[1][self.item.id + '.pdf']
+        self.zot.file_path(key).write_bytes(pdf)
+        self.zot.items[key] = {'key': key, 'parentItem': 'PARENT23'}
+        digest = hashlib.sha256(pdf).hexdigest()
+        link = {**self.row, 'parent': 'PARENT23', 'view_key': key, 'page_map': [self.pid], 'page_map_digest': digest,
+                'page_tags': {self.pid: ['Old page tag', 'Concurrent page tag']}}
+        worker.state.write('documents', {self.item.id: link})
+        parent = self.zot.items['PARENT23']
+        parent['tags'].append({'tag': 'Concurrent paper tag', 'type': 1})
+        request = dict(edit_id='edit', connection=['legacy', worker.config.get('zotero_root'), worker.config.get('tablet_root')],
+                       cloud=self.item.id, key=key, parent_key='PARENT23', page_id=self.pid, pdf_digest=digest,
+                       paper={'before': ['Publisher'], 'after': ['New paper tag']},
+                       page={'before': ['Old page tag'], 'after': ['New page tag']})
+        with self.assertRaisesRegex(PilotError, 'PDF changed'):
+            worker.apply_tag_edit(**{**request, 'pdf_digest': 'old-digest'})
+        self.assertEqual(worker.apply_tag_edit(**request), {'tag_edit_applied': 'edit'})
+        self.assertEqual(self.zot.items['PARENT23']['tags'], [{'tag': 'Concurrent paper tag', 'type': 1}, {'tag': 'New paper tag'}])
+        self.assertEqual(worker.state.read('documents')[self.item.id]['page_tags'][self.pid], ['Concurrent page tag', 'New page tag'])
+        self.zot.items['PARENT23']['tags'].pop()
+        reopened = Worker(self.root / 'worker', zotero_factory=lambda: self.zot)
+        self.assertEqual(reopened.apply_tag_edit(**request), {'tag_edit_applied': 'edit'})
+        self.assertEqual(self.zot.items['PARENT23']['tags'], [{'tag': 'Concurrent paper tag', 'type': 1}])
+
 
 if __name__ == '__main__':
     unittest.main()
