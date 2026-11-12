@@ -380,6 +380,7 @@ class Worker:
             waiting.update(source for identity, source in staged.items() if identity not in suspended)
         return {"config": config, "status": self.last, "last_sync_at": self.state.read("last_sync_at"),
                 "reviews": pending_reviews, "review_guidance": review_guidance,
+                "linked_original_matches": self.state.read("linked_original_matches", []),
                 "deletions": self.review.deletions(), "local_deletions": self.review.local_deletions(), "types": DOCUMENT_TYPE_LABELS,
                 "collections": self.collections, "mappings": self.state.read("folders", {}),
                 'folder_issues': folder_blocks.get('issues', []), 'blocked_collections': folder_blocks.get('zotero', []),
@@ -1916,7 +1917,8 @@ class Worker:
             self._catalog(client, cloud)
             self.trace.event("stage", name="refreshing_review_policy")
             self.progress('Checking Zotero matches and saved review decisions…')
-            self.refresh_review_policy(client)
+            native_catalog = client.review_action('catalog')
+            self.refresh_review_policy(client, native_catalog)
             self.trace.event("stage", name="syncing_bridge")
             excluded = connections.exclusions(self.directory, self.config)
             excluded['documents'].update(issue['cloud'] for issue in self.catalog_issues if issue.get('cloud'))
@@ -1947,6 +1949,22 @@ class Worker:
                 result['review'].append({'cloud': identity, 'title': title,
                     'reason': outcome + (f': {detail}' if detail else '') + '. ' + recovery})
             result['partial_indexes'] = partial_indexes
+            from .zotero_bulk import library_index
+            indexed, _ = library_index(native_catalog, cancelled=self.stop.is_set, cache=self.file_digests)
+            candidates = {}
+            for identity, link in links.items():
+                if not link.get('view_key') or link.get('unavailable') or not link.get('baseline'):
+                    continue
+                for value in indexed.get(link['baseline'], []):
+                    record = value['data']
+                    parent = record.get('parentItem')
+                    if (not parent or parent == link.get('parent') or record.get('contentType') != 'application/pdf'
+                            or record['key'] == link['view_key'] or 'Notable pilot:' in record.get('note', '')):
+                        continue
+                    key = (record['key'], identity)
+                    candidates[key] = {'attachment': record['key'], 'parent': parent, 'cloud': identity, 'digest': link['baseline'],
+                                       'title': native_catalog['parents'].get(parent, {}).get('title') or record.get('title')}
+            self.state.write('linked_original_matches', list(candidates.values()))
             self.collections = client.collections()
             completed_at = time.time()
             self.state.write("last_sync_at", completed_at)

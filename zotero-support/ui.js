@@ -777,6 +777,34 @@ var NotableUI = {
           vocabulary: [...new Set([...(this.paperTagBank?.tags || []), ...this.pageTagNames()])].sort(),
           interrupted: !!link.tag_pending, orphaned_pages: Object.fromEntries(Object.entries(link.page_tags || {})
             .filter(([id, values]) => !link.page_map.includes(id) && values.length))});
+      } else if (item.parentID) {
+        const reference = await Zotero.Items.getAsync(item.parentID);
+        if (!reference?.isRegularItem() || reference.deleted) throw Error('The Zotero reference is unavailable.');
+        await reference.loadAllData();
+        const paperTags = reference.getTags().map(row => row.tag);
+        const links = (this.latest?.links || []).filter(row => row.view_key && row.baseline && !row.unavailable);
+        Object.assign(context, {paperOnly: true, reference, title: reference.getField('title'), pageMapUnavailable: !!link,
+          checkingOriginal: !link && links.length > 0, paperTags, paperDraft: {tags: [...paperTags], input: ''}});
+        context.loading = false;
+        if (this.tagEditor === context && this.tab === 'tags') this.render();
+        if (!link && links.length) {
+          this.readerOriginalMatches?.delete(item.key);
+          try {
+            const digest = await notablePDFDigest(item, Zotero.getMainWindow().crypto);
+            if (context.connection !== this.filingConnection()) return;
+            const matches = links.filter(row => row.baseline === digest && row.view_key !== item.key);
+            if (matches.length === 1) {
+              const [match] = matches;
+              context.linkedCopy = match;
+              this.readerOriginalMatches ||= new Map();
+              this.readerOriginalMatches.set(item.key, {attachment: item.key, parent: reference.key,
+                cloud: match.cloud, digest, title: context.title, connection: context.connection});
+            } else if (matches.length > 1) context.ambiguousCopies = true;
+          } catch (_) { context.matchUnavailable = true; }
+          finally { context.checkingOriginal = false; }
+        }
+      } else if (this.busy) {
+        context.error = 'This PDF has no Zotero reference or available reMarkable page link.';
       } else Object.assign(context, await this.rpc('tag_context', {key: item.key, page}));
     } catch (error) { context.error = error.message; }
     finally {
@@ -1888,7 +1916,7 @@ var NotableUI = {
     const nav = this.el('nav', '', root, {'aria-label': this.shortName + ' sections'});
     for (const [tab, label] of [['inbox', 'Inbox'], ['library', 'Library Issues'], ['sync-review', 'Sync Conflicts'], ['links', 'Linked papers'], ['tags', 'Tags'], ['import', 'Import library'], ['setup', 'Setup']]) {
       const count = ['inbox', 'library', 'sync-review'].includes(tab) ? this.queueRows(tab).length
-        + (tab === 'sync-review' ? this.syncDecisionCount() : 0) : 0;
+        + (tab === 'sync-review' ? this.syncDecisionCount() : tab === 'library' ? this.linkedOriginalCases().length : 0) : 0;
       const button = this.button(label + (['inbox', 'library', 'sync-review'].includes(tab) ? ` (${count})` : ''),
         nav, () => this.openTab(tab));
       if (tab === 'sync-review') { button.dataset.syncConflicts = String(count); if (count) button.classList.add('sync-conflicts-attention'); }
@@ -2060,6 +2088,10 @@ var NotableUI = {
     const card = this.el('section', '', content, {class: 'card'});
     this.el('h2', `${context.title} — page ${context.page + 1}`, card);
     const close = () => { this.tagEditor = null; this.render(); };
+    if (context.paperOnly) {
+      this.renderReferenceTagEditor(card, context, close);
+      return;
+    }
     if (context.loading || context.error) {
       this.el('p', context.error || (this.busy ? 'Waiting for the current operation to load this page’s tags…' : 'Loading tags…'),
         card, {role: context.error ? 'alert' : 'status'});
@@ -2140,6 +2172,57 @@ var NotableUI = {
     }, true);
     if (context.parent_key && context.pdf_digest) save.dataset.browse = 'true';
     this.button('Close page editor', footer, close).dataset.browse = 'true';
+  },
+  renderReferenceTagEditor(card, context, close) {
+    const match = context.linkedCopy;
+    if (match) {
+      this.el('p', 'This paper is already linked to reMarkable through another PDF. Open the linked copy to edit its page tags.', card);
+      this.button('Open linked PDF', card, async () => {
+        if (context.connection !== this.filingConnection()) throw Error('The sync connection changed. Open the tag editor again.');
+        const current = this.latest.links?.find(row => row.cloud === match.cloud && row.view_key === match.view_key && !row.unavailable);
+        const item = current && await notableItem(current.view_key);
+        if (!item?.isPDFAttachment() || item.deleted || item.parentKey !== current.parent
+            || current.baseline !== match.baseline) throw Error('The linked PDF changed. Open the tag editor again.');
+        await Zotero.Reader.open(item.id, {pageIndex: context.page});
+        this.tagEditor = null;
+        this.view?.close();
+      }, true, 'book-open').dataset.browse = 'true';
+      this.button('Compare copies in Library Issues', card, () => this.openTab('library')).dataset.browse = 'true';
+    } else {
+      this.el('p', context.checkingOriginal ? 'Checking this PDF for an existing reMarkable link…'
+        : context.pageMapUnavailable ? 'The linked PDF has no available page map for this page. Sync to refresh it.'
+        : context.ambiguousCopies ? 'Several reMarkable links match this PDF. Choose the intended copy in Linked papers.'
+          : context.matchUnavailable ? 'The PDF could not be checked for an existing link. Paper tags are still available.'
+            : 'Page tags require a linked PDF. You can edit this Zotero reference’s paper tags here.', card);
+    }
+    this.el('h3', 'Paper tags', card);
+    const draft = context.paperDraft;
+    const editor = this.renderTagEntry(card, {kind: 'paper', values: draft.tags, inputValue: draft.input,
+      onChange: (tags, input) => Object.assign(draft, {tags, input})});
+    this.button('Save paper tags', card, async () => {
+      if (draft.saving) return;
+      editor.add();
+      const desired = [...editor.tags];
+      const before = context.paperTags;
+      const added = desired.filter(tag => !before.includes(tag));
+      const removed = before.filter(tag => !desired.includes(tag));
+      draft.saving = true;
+      try {
+        await Zotero.DB.executeTransaction(async () => {
+          const reference = await notableItem(context.reference.key);
+          if (!reference?.isRegularItem() || reference.deleted) throw Error('The Zotero reference is unavailable.');
+          for (const tag of removed) reference.removeTag(tag);
+          for (const tag of added) reference.addTag(tag, 0);
+          if (added.length || removed.length) await reference.save();
+          context.paperTags = reference.getTags().map(row => row.tag);
+        });
+        draft.tags = [...context.paperTags];
+        this.rememberRecentTags(added);
+        if (this.tagEditor === context && this.tab === 'tags') this.render();
+        this.message('Paper tags saved to this Zotero reference.');
+      } finally { draft.saving = false; }
+    }, true).dataset.browse = 'true';
+    this.button('Close page editor', card, close).dataset.browse = 'true';
   },
   tagSearchState() {
     return this.tagSearch ||= {query: '', scope: 'paper', match: 'all', tags: new Set(), limit: 25};
@@ -2743,7 +2826,10 @@ var NotableUI = {
       ].filter(Boolean).join(' · ');
     }
     const count = this.queueRows(queue).length;
-    if (queue === 'library') return `${count} ${count === 1 ? 'case' : 'cases'} to inspect`;
+    if (queue === 'library') {
+      const total = count + this.linkedOriginalCases().length;
+      return `${total} ${total === 1 ? 'case' : 'cases'} to inspect`;
+    }
     const decisions = count + this.syncDecisionCount();
     return `${decisions} sync ${decisions === 1 ? 'decision' : 'decisions'}`;
   },
@@ -3192,6 +3278,63 @@ var NotableUI = {
     }), true, 'folder-input').dataset.pdfAcquisition = 'true';
     this.button('Find and attach PDF online', pdfActions, () => acquire(null), false, 'file-search').dataset.pdfAcquisition = 'true';
   },
+  linkedOriginalCases() {
+    const connection = this.filingConnection();
+    const cases = new Map();
+    for (const issue of [...(this.latest?.linked_original_matches || []), ...(this.readerOriginalMatches?.values() || [])]) {
+      if (issue.connection && issue.connection !== connection) continue;
+      const link = this.latest?.links?.find(row => row.cloud === issue.cloud && !row.unavailable);
+      if (link?.view_key && issue.digest === link.baseline && issue.attachment !== link.view_key
+          && issue.parent && issue.parent !== link.parent) {
+        cases.set(JSON.stringify([issue.attachment, issue.cloud]), {issue, link});
+      }
+    }
+    return [...cases.values()];
+  },
+  renderLinkedOriginalCases(content, cases) {
+    for (const {issue, link} of cases) {
+      const card = this.el('section', '', content, {class: 'card'});
+      this.el('h3', issue.title || link.name || 'Two Zotero records for the same original PDF', card);
+      this.el('p', 'The first PDF matches the original saved with the reMarkable link. Compare the records before merging.', card);
+      const comparison = this.el('div', '', card, {class: 'reference-comparison'});
+      const sides = [['Zotero record', issue.parent, issue.attachment],
+        ['Record linked to reMarkable', link.parent, link.view_key]];
+      const pending = sides.map(async ([label, parentKey, attachmentKey]) => {
+        const pane = this.el('section', '', comparison);
+        this.el('h4', label, pane);
+        const info = this.el('p', 'Reading Zotero details…', pane);
+        const [parent, pdf] = await Promise.all([notableItem(parentKey), notableItem(attachmentKey)]);
+        if (!pane.isConnected) return null;
+        if (!parent?.isRegularItem() || parent.deleted || !pdf?.isPDFAttachment() || pdf.deleted || pdf.parentKey !== parent.key) {
+          info.textContent = 'This record or attachment changed. Sync to refresh the comparison.';
+          return null;
+        }
+        if (attachmentKey === issue.attachment && await notablePDFDigest(pdf, Zotero.getMainWindow().crypto) !== issue.digest) {
+          info.textContent = 'This PDF changed since the match was found. Sync to refresh the comparison.';
+          return null;
+        }
+        if (!pane.isConnected) return null;
+        info.textContent = parent.getDisplayTitle();
+        const doi = parent.getField('DOI');
+        this.el('p', Zotero.ItemTypes.getLocalizedString(parent.itemTypeID) + (doi ? ' · DOI ' + doi : ''), pane);
+        const children = await Zotero.Items.getAsync([...parent.getAttachments(), ...parent.getNotes()]);
+        for (const item of children) {
+          await item.loadAllData();
+          if (!pane.isConnected) return null;
+          if (item.deleted) continue;
+          const notes = item.isPDFAttachment() ? ` · ${item.getAnnotations().length} annotations` : '';
+          this.el('p', item.getDisplayTitle() + notes, pane, {class: 'hint'});
+        }
+        this.reviewNavigationButton('Open PDF in Zotero', pane, 'pdf', [attachmentKey]);
+        return parent;
+      });
+      Promise.all(pending).then(([left, right]) => {
+        if (!card.isConnected || !left || !right) return;
+        if (left.itemType !== right.itemType) this.el('p', 'Zotero requires matching item types to merge. Check the correct item type before merging.', card);
+        this.reviewNavigationButton('Compare both records in Zotero', card, 'references', [left.key, right.key]);
+      }).catch(() => { if (card.isConnected) this.el('p', 'Could not read both Zotero records. Reopen Library Issues to retry.', card); });
+    }
+  },
   renderReview(content, queue = null) {
 
     this.renderedReviewId = null;
@@ -3305,7 +3448,10 @@ var NotableUI = {
     }
     }
     if (inboxRows && this.inboxFilter === 'all') this.renderInboxWaiting(content);
+    const linkedCases = queue === 'library' ? this.linkedOriginalCases() : [];
+    if (linkedCases.length) this.renderLinkedOriginalCases(content, linkedCases);
     const rows = inboxRows ?? (queue ? this.queueRows(queue) : (this.latest.reviews || []).filter(row => !queuedIds.has(row.id) && (this.showAllReviews || !row.payload.routine || this.reviewNeedsUpgrade(row) || row.status === 'applying' || row.id === this.selected)));
+    if (!rows.length && linkedCases.length) return;
     if (!rows.length && queue === 'sync-review' && content.querySelector?.('.decision')) return;
     if (!rows.length && queue) {
       const blocked = queue === 'inbox' && this.queueRows('inbox-waiting').length;

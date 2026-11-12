@@ -214,6 +214,24 @@ async function main() {
     assert.equal(select.options.length, 2, 'Live collection updates include new options and remove deleted ones');
   }
   {
+    const reference = {key: 'REF', isRegularItem: () => true, loadAllData: async () => {},
+      getTags: () => [{tag: 'Existing'}], getField: () => 'Full citation'};
+    const item = {key: 'ORIGINAL', parentID: 2, isPDFAttachment: () => true};
+    const {ui} = fixture({Zotero: {Items: {getAsync: async id => id === 2 ? reference : item},
+      getMainWindow: () => ({crypto: {}})}, notablePDFDigest: async () => 'same-original'});
+    ui.latest.links = [{cloud: 'linked', view_key: 'ANNOTATED', parent: 'OTHER', baseline: 'same-original'}];
+    ui.busy = true; ui.operation = {method: 'sync'};
+    ui.open = () => {};
+    ui.rpc = () => { throw Error('Reader must not wait for sync'); };
+    await ui.openPageTags({_internalReader: {_state: {primaryViewStats: {pageIndex: 2}}}, itemID: 1});
+    assert.equal(ui.tagEditor.loading, false);
+    assert.equal(ui.tagEditor.paperOnly, true);
+    assert.equal(ui.tagEditor.linkedCopy.view_key, 'ANNOTATED');
+    assert.equal(ui.linkedOriginalCases().length, 1, 'Approved papers can appear without an Inbox review');
+    ui.latest.links[0].parent = 'REF';
+    assert.equal(ui.linkedOriginalCases().length, 0, 'A consolidated reference is no longer a duplicate case');
+  }
+  {
     const {ui, context} = fixture({Zotero: {Items: {getAsync: async () => ({key: 'PDF', isPDFAttachment: () => true})}}});
     const order = [], pageContext = {key: 'PDF', page: 0};
     ui.open = () => {

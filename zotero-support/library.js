@@ -6,6 +6,19 @@ async function notableItem(key) {
   return item;
 }
 
+async function notablePDFDigest(item, crypto) {
+  const path = await item.getFilePathAsync();
+  if (!path) return null;
+  const before = await IOUtils.stat(path);
+  const bytes = await IOUtils.read(path);
+  const after = await IOUtils.stat(path);
+  if (bytes.length !== after.size || before.size !== after.size || before.lastModified !== after.lastModified) {
+    throw Error('The PDF changed while it was being checked. Open the tag editor again.');
+  }
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 function notableNavigationError(message, status = 409) {
   const error = new Error(message);
   error.navigationStatus = status;

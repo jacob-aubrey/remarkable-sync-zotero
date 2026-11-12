@@ -172,6 +172,8 @@ BRANCH = r"""
             await waitFor(() => doc.querySelector('.reference-pdf-actions'), 'Inbox hid PDF actions for a reference without a PDF');
 
             const pdf = await importPDF(article);
+            ensure(await native.notablePDFDigest(pdf, Zotero.getMainWindow().crypto) === command.digest,
+              'The reader did not compute the same PDF digest as the sync worker');
             await expectState(article.key, 'available', article.key, pdf.key);
             await expectNoAdd(articleRow, initial, 'available');
             const existing = await native.notableAcquirePDF(article.key, command.source, {describe: true});
@@ -599,7 +601,8 @@ def checks(client, root, checked):
     word = Document()
     word.add_paragraph('Synthetic Word attachment for Inbox review.')
     word.save(office)
-    lifecycle = live.command(root, 'reference_pdf_lifecycle', source=str(source), office=str(office))
+    from note_organizer.zotero_worker import file_sha
+    lifecycle = live.command(root, 'reference_pdf_lifecycle', source=str(source), office=str(office), digest=file_sha(source))
     for name in lifecycle['checks']:
         checked(name)
     for width in [1040, 640]:
