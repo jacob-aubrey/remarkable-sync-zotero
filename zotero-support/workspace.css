@@ -79,7 +79,7 @@ button:disabled { opacity: .55; cursor: wait; }
 .paper-search-toolbar > .checkbox-field { margin: 0; }
 .folder-chooser-toolbar > .paper-search-toolbar { flex: 1 1 auto; min-inline-size: 0; margin: 0; }
 .colored-tag::before { content: ""; inline-size: .65em; block-size: .65em; flex: none; background: var(--tag-color); border-radius: 2px; }
-.tag-list { display: flex; flex-wrap: wrap; align-items: flex-start; align-content: start; gap: 5px; max-block-size: 190px; overflow: auto; scrollbar-gutter: stable; padding: 8px; border: 1px solid color-mix(in srgb, GrayText 45%, Canvas); border-radius: 5px; }
+.tag-list { display: flex; flex-wrap: wrap; align-items: flex-start; align-content: start; gap: 5px; max-block-size: 190px; overflow: auto; overflow-anchor: none; scrollbar-gutter: stable; padding: 8px; border: 1px solid color-mix(in srgb, GrayText 45%, Canvas); border-radius: 5px; }
 .tag-list p { margin: 4px; }
 .tag-list > button { min-height: 30px; padding: 3px 8px; justify-content: flex-start; text-align: start; overflow-wrap: anywhere; }
 .tag-list > button[aria-pressed="true"] { background: color-mix(in srgb, Highlight 16%, Canvas); border-color: Highlight; font-weight: 600; }

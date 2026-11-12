@@ -267,20 +267,18 @@ async function startup({rootURI}) {
             parent.addTag('Read');
             await parent.saveTx();
             await waitFor(() => found(command.title), 'Restoring a Zotero tag did not restore its result');
-            [...doc.querySelectorAll('.search-result button')].find(button => button.textContent === 'Show Zotero tags').click();
-            const native = Zotero.getMainWindow().document.getElementById('zotero-item-details');
-            await waitFor(() => Zotero.getActiveZoteroPane().getSelectedItems()[0]?.key === command.parent
-              && native.getPane('tags').open, 'Show Zotero tags did not select the paper and open its native Tags section');
+            await waitFor(() => ui.paperTagBank.revision === ui.paperTagBankRevision,
+              'The tag bank did not settle after restoring the native tag');
             const savedBank = ui.paperTagBank;
             const savedRPC = ui.rpc;
             let searchCalls = 0;
             try {
               const tags = Array.from({length: 1346}, (_, index) => 'Fixture tag ' + String(index).padStart(4, '0') + ' with a longer name');
-              ui.paperTagBank = {...savedBank, tags, manual: new Set(tags)};
               ui.rpc = (method, ...params) => {
                 if (method === 'tag_search') searchCalls++;
                 return savedRPC.call(ui, method, ...params);
               };
+              ui.paperTagBank = {...savedBank, tags, manual: new Set(tags)};
               ui.render();
               const bank = doc.querySelector('.tag-list');
               const initial = choices().length;
@@ -293,7 +291,7 @@ async function startup({rootURI}) {
               await waitFor(() => choices().length > initial, 'Scrolling did not load the next tag batch');
               if (choices().length !== 120 || choices()[0] !== first || first.getAttribute('aria-pressed') !== 'true'
                   || Math.abs(bank.scrollTop - previousTop) > 1) {
-                throw Error('Appending tags lost the scroll position, selection, or first batch');
+                throw Error(`Appending tags changed the first batch, selection, or scroll position (${choices().length} tags, ${previousTop} to ${bank.scrollTop})`);
               }
               const last = choices().at(-1);
               last.dispatchEvent(new ui.view.KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}));
@@ -310,6 +308,11 @@ async function startup({rootURI}) {
               ui.rpc = savedRPC;
               ui.render();
             }
+            await waitFor(() => found(command.title), 'Restoring the tag bank did not restore the exact tag result');
+            [...doc.querySelectorAll('.search-result button')].find(button => button.textContent === 'Show Zotero tags').click();
+            const native = Zotero.getMainWindow().document.getElementById('zotero-item-details');
+            await waitFor(() => Zotero.getActiveZoteroPane().getSelectedItems()[0]?.key === command.parent
+              && native.getPane('tags').open, 'Show Zotero tags did not select the paper and open its native Tags section');
           }
           else if (command.action === 'workspace_consistency') {
             const original = ui.latest;

@@ -2487,11 +2487,12 @@ var NotableUI = {
         batchScheduled = false;
         if (!tagList.isConnected || tagButtons.length >= matchingTags.length) return;
         const viewport = tagList.clientHeight;
-        const height = tagList.scrollHeight;
-        if (!viewport || height - tagList.scrollTop - viewport > viewport / 2) return;
+        const top = tagList.scrollTop;
+        if (!viewport || tagList.scrollHeight - top - viewport > viewport / 2) return;
         appendTagBatch();
+        tagList.scrollTop = top;
         // A wide window can fit a full batch without a scroll bar.
-        if (height <= viewport) loadNearEnd();
+        while (tagButtons.length < matchingTags.length && tagList.scrollHeight <= viewport) appendTagBatch();
       });
     };
     tagList.addEventListener('scroll', () => { state.scrollTop = tagList.scrollTop; loadNearEnd(); }, {passive: true});
