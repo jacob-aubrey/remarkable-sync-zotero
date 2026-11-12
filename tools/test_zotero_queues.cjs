@@ -63,6 +63,25 @@ assert.equal([...separate.buttons.keys()].some(label => label === 'Review: two')
 
 const nodeText = root => [root.textContent || '', ...(root.children || []).map(nodeText)].join(' ');
 const descendants = root => [root, ...(root.children || []).flatMap(descendants)];
+const reference = (id, payload = {}) => ({...paper(id, 'reference'), payload: {title: id, parent: id, ...payload}});
+{
+  const f = viewFixture();
+  f.ui.latest.reviews = [source, zotero, tablet, reference('needs-pdf'), reference('missing-file', {missing_file: true}),
+    reference('unknown', {pdf_state: 'unknown'}), {...paper('resume', 'zotero'), status: 'applying'}];
+  assert.equal(f.ui.queueSummary('inbox'), '3 ready to file · 1 needs a PDF · 1 PDF unavailable here · 1 to check in Zotero · 1 filing to resume · 0 waiting on Library Issues');
+  assert.match(f.ui.inboxRowCaption(reference('missing-file', {missing_file: true})), /PDF unavailable here/);
+  assert.match(f.ui.inboxRowCaption(tablet), /reMarkable.*PDF filing/);
+}
+{
+  const f = viewFixture();
+  const office = {...zotero, payload: {...zotero.payload, path: 'slides.pptx'}};
+  f.ui.latest.reviews = [office];
+  const view = f.node(); f.ui.renderReview(view, 'inbox');
+  assert.match(nodeText(view), /Zotero · Office file/);
+  assert.match(nodeText(view), /This Office file can be filed in Zotero/);
+  assert.doesNotMatch(nodeText(view), /Attach a PDF/);
+  assert.ok(f.buttons.has('Approve & file'));
+}
 {
   const waiting = viewFixture(); waiting.ui.latest = ui.latest;
   waiting.ui.render = () => {}; waiting.ui.tab = 'inbox'; waiting.ui.selected = 'local';

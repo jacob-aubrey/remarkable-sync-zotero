@@ -22,9 +22,26 @@ function notableReviewItemInTrash(item) {
   return item.deleted || (typeof item.isInTrash === 'function' && item.isInTrash());
 }
 
+function notableIsPDFFile(item) {
+  return item.isFileAttachment() && (item.isPDFAttachment() || /\.pdf$/i.test(item.attachmentFilename || ''));
+}
+
+async function notablePDFFileState(item) {
+  try {
+    const path = await item.getFilePathAsync();
+    if (!path) return {state: 'unavailable'};
+    const managed = (item.getNote() || '').includes('Notable pilot:');
+    const state = managed ? 'managed' : /\.pdf$/i.test(path) ? 'available' : 'unsupported';
+    return {state, path};
+  } catch (error) {
+    Zotero.logError(error);
+    return {state: 'unknown'};
+  }
+}
+
 // Native merges retain dc:replaces relations. Follow those exact identities for
 // inspection only; the sync ledger and its attachment/annotation links stay put.
-async function notableReviewNavigationItem(key, target) {
+async function notableReviewNavigationItem(key, target, {allowMissing = false} = {}) {
   const libraryID = Zotero.Libraries.userLibraryID;
   let item = await notableItem(key), currentKey = key;
   const seen = new Set();
@@ -53,6 +70,7 @@ async function notableReviewNavigationItem(key, target) {
     const oldURI = item ? uri.getItemURI(item) : uri.getLibraryURI(libraryID) + '/items/' + currentKey;
     const matches = await relations.getByPredicateAndObject('item', relations.replacedItemPredicate, oldURI);
     if (!Array.isArray(matches) || !matches.length) {
+      if (allowMissing && Array.isArray(matches)) return null;
       throw notableNavigationError(item ? 'This Zotero item is in Trash. Restore it in Zotero, then recheck the review.'
         : 'A Zotero item in this review is no longer available. Recheck the review before navigating.');
     }
@@ -76,6 +94,37 @@ async function notableReviewNavigationItem(key, target) {
     if (!item) {
       throw notableNavigationError('The surviving Zotero item is unavailable. Recheck this review before navigating.');
     }
+  }
+}
+
+async function notableReferencePDFState(key) {
+  try {
+    const parent = await notableReviewNavigationItem(key, 'references', {allowMissing: true});
+    if (!parent) return {state: 'removed', parent: key, replacement: false};
+    const attachments = (await Zotero.Items.getAsync(parent.getAttachments()))
+      .filter(attachment => attachment && attachment.parentKey === parent.key
+        && !notableReviewItemInTrash(attachment) && attachment.isFileAttachment());
+    const pdfs = attachments.filter(notableIsPDFFile);
+    await Zotero.Items.loadDataTypes(pdfs, ['note']);
+    const best = {state: 'none', parent: parent.key, replacement: parent.key !== key};
+    const priority = ['none', 'unknown', 'unavailable', 'unsupported', 'managed', 'available'];
+    for (const attachment of pdfs) {
+      const {state} = await notablePDFFileState(attachment);
+      if (priority.indexOf(state) > priority.indexOf(best.state)) Object.assign(best, {state, attachment: attachment.key});
+      if (state === 'available') break;
+    }
+    if (best.state === 'none') {
+      for (const attachment of attachments) {
+        if (/\.(docx|pptx)$/i.test(attachment.attachmentFilename || '')
+            && /\.(docx|pptx)$/i.test(await attachment.getFilePathAsync() || '')) {
+          return {...best, state: 'file', attachment: attachment.key};
+        }
+      }
+    }
+    return best;
+  } catch (error) {
+    if (!error.navigationStatus) Zotero.logError(error);
+    return {state: 'unknown', parent: key, replacement: false};
   }
 }
 
@@ -434,7 +483,8 @@ function notableRegisterLibraryEndpoint(Base) {
         return reply(200, job.result);
       }
       if (data.action === 'catalog') {
-        const attachments = [], parents = {}, missing_pdf_parents = [];
+        const attachments = [], parents = {}, missingPDFParents = new Set(), pdfInventory = {};
+        const full = !data.parents_only && !data.names_only && !data.tag_lookup;
         let items = (await Zotero.Items.getAll(Zotero.Libraries.userLibraryID, false, false))
           .filter(item => !item.deleted && (item.isRegularItem() || (!data.parents_only && item.isFileAttachment())));
         if (data.tag_lookup) {
@@ -449,6 +499,7 @@ function notableRegisterLibraryEndpoint(Base) {
         // reads on a cold library. Annotation bodies are not catalog entries.
         await Zotero.Items.loadDataTypes(items);
         for (const item of items) {
+          if (notableReviewItemInTrash(item)) continue;
           if (item.isRegularItem()) { parents[item.key] = item.toJSON(); continue; }
           if (!item.isFileAttachment()) continue;
           if (data.names_only) {
@@ -457,10 +508,17 @@ function notableRegisterLibraryEndpoint(Base) {
             attachments.push({data: item.toJSON(), path: item.attachmentFilename || ''});
             continue;
           }
-          const path = await item.getFilePathAsync();
-          if (item.isPDFAttachment() && item.parentKey && (!path || !await IOUtils.exists(path))) {
-            missing_pdf_parents.push(item.parentKey); continue;
-          }
+          let path;
+          if (notableIsPDFFile(item)) {
+            const pdf = await notablePDFFileState(item);
+            path = pdf.path;
+            const key = item.parentKey;
+            if (key) {
+              if (full) (pdfInventory[key] ??= {available: [], managed: [], unavailable: [], unknown: [], unsupported: []})[pdf.state].push(item.key);
+              if (pdf.state === 'unavailable') missingPDFParents.add(key);
+            }
+            if (pdf.state === 'unsupported') continue;
+          } else path = await item.getFilePathAsync();
           if (!path || !/\.(pdf|docx|pptx)$/i.test(path)) continue;
           attachments.push({data: item.toJSON(), path});
           if (item.parentKey && !parents[item.parentKey]) {
@@ -468,7 +526,8 @@ function notableRegisterLibraryEndpoint(Base) {
             if (parent && !parent.deleted) parents[item.parentKey] = parent.toJSON();
           }
         }
-        return reply(200, {attachments, parents, missing_pdf_parents, data_directory: Zotero.DataDirectory.dir});
+        return reply(200, {attachments, parents, missing_pdf_parents: [...missingPDFParents],
+          ...(full ? {pdf_inventory: pdfInventory} : {}), data_directory: Zotero.DataDirectory.dir});
       }
       if (data.action === 'reparent') {
         const item = await notableItem(data.key), parent = await notableItem(data.parent);
@@ -597,17 +656,25 @@ function notableRegisterLibraryEndpoint(Base) {
 }
 
 // Reuse Zotero's maintained retrieval and storage; never create another reference.
-async function notableAcquirePDF(key, file = null) {
-  const item = await notableItem(key);
-  if (!item || notableReviewItemInTrash(item) || !item.isRegularItem()) throw Error('This reference is unavailable. Refresh Inbox.');
-  // Recheck after selection: another sync may already have delivered the PDF.
-  for (const id of item.getAttachments()) {
-    const attachment = await Zotero.Items.getAsync(id);
-    if (attachment && !attachment.deleted && attachment.isPDFAttachment() && await attachment.fileExists()) return attachment;
+async function notableAcquirePDF(key, file = null, {describe = false} = {}) {
+  // Recheck after selection: Zotero may have delivered a PDF or merged the item
+  // while the file picker was open.
+  const status = await notableReferencePDFState(key);
+  if (status.replacement || status.state === 'removed') throw Error('This reference is unavailable. Check Inbox for its current Zotero entry.');
+  if (status.state === 'unknown') throw Error('Zotero could not verify the PDF attachments. Check Inbox and try again.');
+  if (status.state === 'unavailable') throw Error('Zotero already lists a PDF for this reference. Open it in Zotero to download or locate the file.');
+  if (status.state === 'unsupported') throw Error('The attached PDF needs a .pdf filename. Rename it in Zotero, then check Inbox again.');
+  if (status.state === 'file') throw Error('Zotero already has a file for this reference. Check Inbox for its filing review.');
+  if (status.attachment) {
+    const attachment = await notableItem(status.attachment);
+    if (!attachment || notableReviewItemInTrash(attachment) || attachment.parentKey !== key) throw Error('The PDF attachment changed. Check Inbox again.');
+    return describe ? {attachment, outcome: 'existing'} : attachment;
   }
-  if (file) return Zotero.Attachments.importFromFile({file, parentItemID: item.id, contentType: 'application/pdf'});
-  if (typeof Zotero.Attachments.addAvailableFile !== 'function') throw Error('This Zotero version cannot retrieve files here. Open the source link, download its PDF, and use Attach downloaded PDF.');
-  const attachment = await Zotero.Attachments.addAvailableFile(item);
-  if (!attachment) throw Error('No available file found. Open the source link, download its PDF, and use Attach downloaded PDF.');
-  return attachment;
+  const item = await notableItem(key);
+  if (!item?.isRegularItem() || notableReviewItemInTrash(item)) throw Error('This reference is unavailable. Check Inbox again.');
+  if (!file && typeof Zotero.Attachments.addAvailableFile !== 'function') throw Error('This Zotero version cannot retrieve files here. Open the source link, download the PDF, and use Attach downloaded PDF.');
+  const attachment = file ? await Zotero.Attachments.importFromFile({file, parentItemID: item.id, contentType: 'application/pdf'})
+    : await Zotero.Attachments.addAvailableFile(item);
+  if (!attachment) throw Error('No available file found. Open the source link, download the PDF, and use Attach downloaded PDF.');
+  return describe ? {attachment, outcome: 'added'} : attachment;
 }

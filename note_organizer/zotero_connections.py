@@ -40,7 +40,7 @@ def same_roots(left, right):
 
 
 def exclusions(directory, config):
-    result = {'zotero': set(), 'tablet': set(), 'documents': set(), 'sources': set()}
+    result = {'zotero': set(), 'tablet': set(), 'documents': set(), 'sources': set(), 'parents': set(), 'source_parents': set()}
     for entry in config.get('connection_history', []):
         if entry['connection_id'] == config.get('connection_id', 'legacy'):
             continue
@@ -55,6 +55,10 @@ def exclusions(directory, config):
         if same_server:
             for row in saved['documents'].values():
                 result['sources'].update(row.get(key) for key in ('source_key', 'view_key') if row.get(key))
+                if row.get('parent'):
+                    result['parents'].add(row['parent'])
+                    if not row.get('unavailable'):
+                        result['source_parents'].update((row[key], row['parent']) for key in ('source_key', 'view_key') if row.get(key))
     result['zotero'].discard(config.get('zotero_root'))
     result['tablet'].discard(config.get('tablet_root'))
     return result

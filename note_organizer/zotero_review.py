@@ -203,15 +203,21 @@ class ReviewStore(Ledger):
         return False
 
     def offer(self, kind, identity, digest, payload):
-        key = fingerprint([kind, identity])[:24]
         with self.connect() as db:
-            old = db.execute("SELECT digest,status,approval FROM review_queue WHERE id=?", (key,)).fetchone()
-            if old and old[0] == digest and old[1] in {"approved", "ignored"}:
+            return self._offer(db, kind, identity, digest, payload)
+
+    @staticmethod
+    def _offer(db, kind, identity, digest, payload):
+        key = fingerprint([kind, identity])[:24]
+        encoded = json.dumps(payload)
+        old = db.execute("SELECT digest,status,payload FROM review_queue WHERE id=?", (key,)).fetchone()
+        if old and old[0] == digest:
+            if old[1] in {"approved", "ignored"} or (old[1] in {"pending", "applying"} and old[2] == encoded):
                 return key
-            # Keep an explicitly approved action journal during recovery. A
-            # changed input gets a new pending review instead of stale consent.
-            db.execute("INSERT INTO review_queue(id,kind,identity,digest,payload,status) VALUES(?,?,?,?,?,'pending') ON CONFLICT(id) DO UPDATE SET digest=excluded.digest,payload=excluded.payload,status=CASE WHEN review_queue.digest=excluded.digest AND review_queue.status='applying' THEN 'applying' ELSE 'pending' END,approval=CASE WHEN review_queue.digest=excluded.digest THEN review_queue.approval ELSE '{}' END",
-                       (key, kind, identity, digest, json.dumps(payload)))
+        # Keep an explicitly approved action journal during recovery. A
+        # changed input gets a new pending review instead of stale consent.
+        db.execute("INSERT INTO review_queue(id,kind,identity,digest,payload,status) VALUES(?,?,?,?,?,'pending') ON CONFLICT(id) DO UPDATE SET digest=excluded.digest,payload=excluded.payload,status=CASE WHEN review_queue.digest=excluded.digest AND review_queue.status='applying' THEN 'applying' ELSE 'pending' END,approval=CASE WHEN review_queue.digest=excluded.digest THEN review_queue.approval ELSE '{}' END",
+                   (key, kind, identity, digest, encoded))
         return key
 
     def rows(self, *, pending_only=True):
@@ -247,12 +253,14 @@ class ReviewStore(Ledger):
                 if row['identity'] != current_identity and Path(json.loads(row['payload']).get('path', '')).resolve() == Path(path).resolve():
                     db.execute("UPDATE review_queue SET status='superseded' WHERE id=?", (row['id'],))
 
-    def retire_missing_references(self, current_keys):
-        """A complete local catalog confirms a PDF arrived or a reference left."""
+    def reconcile_references(self, references):
+        """Publish one complete local pass while retaining dismissed history."""
         with self.connect() as db:
-            for row in db.execute("SELECT id,identity FROM review_queue WHERE kind='reference' AND status='pending'").fetchall():
-                if row['identity'] not in current_keys:
-                    db.execute("UPDATE review_queue SET status='superseded' WHERE id=?", (row['id'],))
+            for key, payload in references.items():
+                self._offer(db, 'reference', key, fingerprint(['reference', key]), payload)
+            rows = db.execute("SELECT id,identity FROM review_queue WHERE kind='reference' AND status='pending'").fetchall()
+            db.executemany("UPDATE review_queue SET status='superseded' WHERE id=? AND status='pending'",
+                           [(row['id'],) for row in rows if row['identity'] not in references])
 
     def retire_missing_inbox(self, current_paths):
         """Retain vanished inputs as history instead of presenting dead approvals."""

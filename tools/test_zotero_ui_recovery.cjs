@@ -215,10 +215,20 @@ async function main() {
   }
   {
     const {ui, context} = fixture({Zotero: {Items: {getAsync: async () => ({key: 'PDF', isPDFAttachment: () => true})}}});
-    const order = []; ui.open = () => { order.push('open'); };
-    ui.rpc = async () => { order.push('context'); return {}; };
+    const order = [], pageContext = {key: 'PDF', page: 0};
+    ui.open = () => {
+      assert.equal(ui.tagEditor, pageContext, 'The page context is ready when the tag editor opens');
+      assert.equal(ui.requestedTab, 'tags');
+      order.push('open');
+    };
+    ui.rpc = async (method, params) => {
+      assert.equal(method, 'tag_context');
+      assert.equal(params.key, pageContext.key); assert.equal(params.page, pageContext.page);
+      order.push('context');
+      return pageContext;
+    };
     await ui.openPageTags({_internalReader: {_state: {primaryViewStats: {pageIndex: 0}}}, itemID: 1});
-    assert.deepEqual(order, ['open', 'context']);
+    assert.deepEqual(order, ['context', 'open']);
   }
   {
     let releaseLaunch, exited = false, kills = 0; const writes = [];

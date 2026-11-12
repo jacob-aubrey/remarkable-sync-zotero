@@ -609,7 +609,10 @@ var NotableUI = {
       this.inboxRequest = this.rpc('scan_inbox', {discover});
       const result = await this.inboxRequest;
       if (this.stopped) return;
-      if (discover) this.lastZoteroInboxCheck = Date.now();
+      if (discover) {
+        this.lastZoteroInboxCheck = Date.now();
+        if (result.native_files_settling) this.zoteroInboxDirty = true;
+      }
       changed = JSON.stringify(this.latest?.reviews) !== JSON.stringify(result.reviews);
       this.latest = result;
       this.refreshCollectionNames();
@@ -808,7 +811,10 @@ var NotableUI = {
     if (discover) this.zoteroInboxDirty = false;
     try {
       const result = await this.rpc('scan_inbox', {discover});
-      if (discover) this.lastZoteroInboxCheck = Date.now();
+      if (discover) {
+        this.lastZoteroInboxCheck = Date.now();
+        if (result.native_files_settling) this.zoteroInboxDirty = true;
+      }
       if (this.latest.config.inbox) this.lastInboxFolderCheck = Date.now();
       return {...result, review_recheck: checked.review_recheck};
     } catch (error) {
@@ -1077,7 +1083,7 @@ var NotableUI = {
     if (itemSelection) return 'Select this item to inspect its details. Selection does not approve, merge, or transfer it.';
     const label = text.replace(/ \(\d+\)$/, '');
     const help = {
-      'Inbox': 'Review incoming papers ready for filing. Papers waiting on Library Issues are listed separately.',
+      'Inbox': 'Review files ready for filing and Zotero references that need a PDF. Papers waiting on Library Issues are listed separately.',
       'Library Issues': 'Inspect duplicate references, repeated attachments, and source-file problems in Zotero.',
       'Sync Conflicts': 'Resolve competing device changes and confirmed deletion decisions.',
       'Linked papers': 'Inspect and manage existing paper connections.',
@@ -1096,6 +1102,10 @@ var NotableUI = {
       'Recheck Zotero': 'Reread local Zotero items and files without syncing or applying queued filings.',
       'Check Inbox': 'Look for new papers and PDFs, and refresh existing Inbox reviews. This check runs on your computer.',
       'Check my Zotero library': 'Search your Zotero library for another reference with the same DOI or title. View its attachments and collections before deciding what to do.',
+      'Open source link': 'Open the web address saved on this reference.',
+      'Find and attach PDF online': 'Ask Zotero to look for a PDF online and attach it to this reference.',
+      'Attach downloaded PDF': 'Choose a PDF from your computer to attach to this Zotero reference.',
+      'Dismiss this reference': 'Remove this entry from Inbox while keeping the reference in Zotero.',
       'Check connection': 'Inspect the native merge survivor, connected PDFs, retained original, and tablet document. Preview only; no files or links are changed.',
       'Reconnect surviving reference': 'Recheck the preview and update this private connection to Zotero’s exact merge survivor. Keep the same PDFs, tablet document, notes, and pause state.',
       'Close unavailable review': 'Verify that this unlinked source is no longer live in Zotero, then close its saved review. Files, references, and tablet connections are kept. A restored source can return to Inbox.',
@@ -2206,14 +2216,32 @@ var NotableUI = {
     const paperKey = row => ['zotero', 'reference'].includes(row.kind) ? row.payload.parent || row.id : row.id;
     const current = this.inboxRows(), known = new Set(previous.map(paperKey));
     const added = new Set(current.map(paperKey).filter(key => !known.has(key))).size;
-    if (added) return `${added} new paper${added === 1 ? '' : 's'} in Inbox`;
+    if (added) return `${added} added to Inbox`;
     return JSON.stringify(current) === JSON.stringify(previous) ? 'Inbox is up to date' : 'Inbox updated';
   },
-  queueSummary(queue) {
-    const count = this.queueRows(queue).length;
-    const references = queue === 'inbox' ? this.queueRows(queue).filter(row => row.kind === 'reference').length : 0;
-    if (references) return `${count - references} ready to file · ${references} need a PDF · ${this.queueRows('inbox-waiting').length} waiting on Library Issues`;
-    if (queue === 'inbox') return `${count} ready to file · ${this.queueRows('inbox-waiting').length} waiting on Library Issues`;
+  referencePDFState(row) {
+    return row.payload.pdf_state || (row.payload.missing_file ? 'unavailable' : 'none');
+  },
+  queueSummary(queue, liveReference = null) {
+    const rows = this.queueRows(queue), count = rows.length;
+    if (queue === 'inbox') {
+      const references = rows.filter(row => row.kind === 'reference');
+      const states = references.map(row => row.id === liveReference?.id ? liveReference.state : this.referencePDFState(row));
+      const needsPDF = states.filter(state => state === 'none').length;
+      const unavailable = states.filter(state => state === 'unavailable').length;
+      const check = references.length - needsPDF - unavailable;
+      const interrupted = rows.filter(row => row.kind !== 'reference' && row.status === 'applying').length;
+      const update = rows.filter(row => row.status !== 'applying' && this.reviewNeedsUpgrade(row)).length;
+      return [
+        `${count - references.length - interrupted - update} ready to file`,
+        needsPDF && `${needsPDF} ${needsPDF === 1 ? 'needs' : 'need'} a PDF`,
+        unavailable && `${unavailable} PDF${unavailable === 1 ? '' : 's'} unavailable here`,
+        check && `${check} to check in Zotero`,
+        interrupted && `${interrupted} filing${interrupted === 1 ? '' : 's'} to resume`,
+        update && `${update} awaiting review update`,
+        `${this.queueRows('inbox-waiting').length} waiting on Library Issues`
+      ].filter(Boolean).join(' · ');
+    }
     if (queue === 'library') return `${count} ${count === 1 ? 'case' : 'cases'} to inspect`;
     const decisions = count + (this.latest.deletions || []).length + (this.latest.local_deletions || []).length;
     return `${decisions} sync ${decisions === 1 ? 'decision' : 'decisions'}`;
@@ -2244,7 +2272,20 @@ var NotableUI = {
   inboxActionLabel(row, match = '') {
     if (row.status === 'applying') return 'Resume saved filing';
     if (match) return row.kind === 'cloud' ? 'Link to existing Zotero reference' : 'Link to existing reMarkable copy';
-    return row.kind === 'cloud' ? 'Add to Zotero' : row.kind === 'zotero' ? 'Approve for reMarkable' : 'Approve & file';
+    return row.kind === 'cloud' ? 'Add to Zotero' : row.kind === 'zotero' && !this.isInboxOfficeFile(row) ? 'Approve for reMarkable' : 'Approve & file';
+  },
+  isInboxOfficeFile(row) {
+    return /\.(docx|pptx)$/i.test(row.payload.path || '');
+  },
+  inboxRowCaption(row, state = this.referencePDFState(row)) {
+    if (row.kind === 'reference') {
+      return state === 'none' ? 'Zotero · Needs a PDF'
+        : state === 'unavailable' ? 'Zotero · PDF unavailable here' : 'Zotero · Needs a check';
+    }
+    const source = row.kind === 'cloud' ? 'reMarkable' : row.kind === 'inbox' ? 'ToSort' : 'Zotero';
+    if (row.status === 'applying') return source + ' · Resume filing';
+    if (this.reviewNeedsUpgrade(row)) return source + ' · Awaiting review update';
+    return source + (this.isInboxOfficeFile(row) ? ' · Office file' : ' · PDF filing');
   },
   reviewProposalValue(row, draft, field) {
     if (draft[field] === undefined) return row.payload[field];
@@ -2252,22 +2293,26 @@ var NotableUI = {
     if (!draft.edited_fields?.includes(field) && baseline !== undefined && draft[field] === baseline) return row.payload[field];
     return draft[field];
   },
-  renderReferenceIntake(row, detail) {
+  renderReferenceIntake(row, detail, onStatus = () => {}) {
     this.el('h2', row.payload.title, detail);
     detail.classList.add('reference-intake');
-    this.el('p', row.payload.missing_file ? 'The PDF has not downloaded to this computer. Let Zotero finish file sync, or attach a downloaded copy.' : 'This saved reference needs a PDF before you can review its filename and destination.', detail);
-    this.el('p', 'Look for another record for this paper.', detail, {class: 'hint'});
-    const find = this.button('Check my Zotero library', detail, async () => {
+    const status = this.el('p', '', detail, {role: 'status', 'data-reference-pdf-state': 'checking'});
+    const reference = this.reviewNavigationButton('Show reference in Zotero', detail, 'references', [row.identity],
+      {inbox: true, onOpened: () => inspectPDF()});
+    const pdfControls = this.el('div', '', detail);
+    const lookup = this.el('div', '', detail);
+    lookup.hidden = true;
+    const find = this.button('Check my Zotero library', lookup, async () => {
       find.disabled = true;
       try {
         const {source, matches} = await notableReferenceMatches(row.identity);
         if (!results.isConnected) return;
         results.replaceChildren();
         if (!matches.length) {
-          this.el('p', 'No matching DOI or title found. Use Show reference in Zotero to inspect or remove this entry.', results);
+          this.el('p', 'No matching DOI or title found in your personal Zotero library.', results);
           return;
         }
-        this.el('p', 'Compare the records in Zotero. Use Merge Items for a duplicate, or move the redundant reference to Trash after checking its attachments and notes.', results);
+        this.el('p', 'Compare the attachments and notes. Zotero can merge duplicates with the same item type.', results);
         for (const match of matches) {
           this.el('h3', match.reason, results);
           const comparison = this.el('div', '', results, {class: 'reference-comparison'});
@@ -2284,26 +2329,83 @@ var NotableUI = {
       } finally { find.disabled = false; }
     }, true, 'file-search');
     find.dataset.browse = 'true';
-    const results = this.el('div', '', detail, {role: 'region', 'aria-label': 'Possible duplicate references'});
+    const results = this.el('div', '', lookup, {role: 'region', 'aria-label': 'Possible duplicate references'});
     const url = row.payload.url;
     if (/^https?:\/\//i.test(url || '')) {
       const open = this.button('Open source link', detail, () => Zotero.launchURL(url), false, 'external-link');
       open.dataset.browse = 'true';
-      this.el('p', url, detail, {class: 'hint'});
     }
-    this.reviewNavigationButton('Show reference in Zotero', detail, 'references', [row.identity]);
-    const pdfActions = this.el('details', '', detail, {class: 'reference-pdf-actions'});
+    const dismiss = this.button('Dismiss this reference', detail, () => this.action('dismiss_review', {identity: row.id, digest: row.digest}));
+    let serial = 0;
+    const inspectPDF = async () => {
+      const request = ++serial;
+      const wasExpanded = pdfControls.querySelector?.('.reference-pdf-actions')?.open;
+      status.setAttribute('data-reference-pdf-state', 'checking');
+      status.textContent = 'Checking this Zotero reference for a PDF…';
+      lookup.hidden = true;
+      dismiss.hidden = true;
+      pdfControls.replaceChildren();
+      let result;
+      try { result = await notableReferencePDFState(row.identity); }
+      catch (_) { result = {state: 'unknown'}; }
+      if (request !== serial || !status.isConnected) return;
+      const hasConnection = result.state === 'none' && (this.latest.links || []).some(link => link.parent === row.identity);
+      const state = result.replacement ? 'replaced' : hasConnection ? 'linked' : result.state;
+      status.setAttribute('data-reference-pdf-state', state);
+      onStatus(state);
+      const text = {
+        none: 'This Zotero reference needs a PDF before it can be filed.',
+        unavailable: 'Zotero lists a PDF for this reference. Open it in Zotero to download or locate the file, then use Check Inbox.',
+        available: 'This Zotero reference already has a PDF. Use Check Inbox to refresh its filing status.',
+        managed: 'This reference already has a reMarkable notes PDF. Use Check Inbox to refresh its filing status.',
+        file: 'This reference already has a Word or PowerPoint file. Use Check Inbox to review it for filing in Zotero.',
+        unsupported: 'Zotero has this PDF. Give the attachment filename a .pdf extension in Zotero, then use Check Inbox.',
+        linked: 'This Zotero reference already has a reMarkable connection. Use Check Inbox to refresh this entry.',
+        removed: 'This reference is unavailable in Zotero. Use Check Inbox to refresh this entry.',
+        replaced: 'This reference changed after a Zotero merge. Use Check Inbox to review the surviving reference.',
+        unknown: 'The PDF status could not be checked. Use Check Inbox to check Zotero again.'
+      };
+      status.textContent = state === 'replaced' && result.state === 'managed'
+        ? 'The surviving Zotero reference already has a reMarkable notes PDF. Use Check Inbox to refresh its filing status.'
+        : state === 'replaced' && result.state === 'available'
+          ? 'The surviving Zotero reference already has a PDF. Use Check Inbox to refresh its filing status.'
+          : text[state] || text.unknown;
+      reference.hidden = state === 'removed';
+      lookup.hidden = !['none', 'unavailable'].includes(state);
+      dismiss.hidden = lookup.hidden;
+      if (state === 'none') this.renderReferencePDFActions(row, pdfControls, inspectPDF, wasExpanded);
+      else if (result.attachment) {
+        const showAttachment = ['unavailable', 'unsupported', 'file'].includes(result.state);
+        const label = result.state === 'file' ? 'Show attached file in Zotero'
+          : showAttachment ? 'Show PDF attachment in Zotero'
+            : result.state === 'managed' ? 'Open notes PDF in Zotero' : 'Open PDF in Zotero';
+        this.reviewNavigationButton(label, pdfControls, showAttachment ? 'attachment' : 'pdf',
+          [result.attachment], {inbox: true, onOpened: inspectPDF});
+      }
+      if (this.referencePDFState(row) !== state) this.zoteroInboxDirty = true;
+      if (this.busy) this.disable(true);
+    };
+    return inspectPDF();
+  },
+  renderReferencePDFActions(row, parent, inspectPDF, expanded) {
+    const pdfActions = this.el('details', '', parent, {class: 'reference-pdf-actions', 'data-review-detail': 'reference-pdf'});
+    pdfActions.open = !!expanded;
     this.el('summary', 'Add a PDF', pdfActions);
-    this.el('p', 'Zotero can look online and attach a PDF to this reference if it finds one.', pdfActions, {class: 'hint'});
     const acquire = async file => {
-      if (this.busy || this.acquiringPDF) return;
+      if (this.busy || this.acquiringPDF || !pdfActions.isConnected) return;
       this.acquiringPDF = true; this.disable(true);
+      let acquired;
       try {
-        await notableAcquirePDF(row.identity, file);
+        acquired = await notableAcquirePDF(row.identity, file, {describe: true});
         this.zoteroInboxDirty = true;
-      } finally { this.acquiringPDF = false; this.disable(false); }
+      } finally {
+        this.acquiringPDF = false; this.disable(false);
+        if (parent.isConnected) await inspectPDF();
+      }
       await this.checkInbox();
-      this.message('File retrieved. PDFs appear for sorting once their download is complete.');
+      this.message(acquired.outcome === 'existing' ? 'A PDF was already attached in Zotero.'
+        : notableIsPDFFile(acquired.attachment) ? 'PDF attached in Zotero.'
+          : 'Zotero attached another file type. This reference still needs a PDF for reMarkable.');
     };
     this.button('Find and attach PDF online', pdfActions, () => acquire(null), false, 'file-search');
     this.button('Attach downloaded PDF', pdfActions, async () => {
@@ -2313,15 +2415,15 @@ var NotableUI = {
       if (await picker.show() !== picker.returnOK) return;
       await acquire(picker.file);
     }, false, 'folder-input');
-    this.button('Dismiss this reference', detail, () => this.action('dismiss_review', {identity: row.id, digest: row.digest}));
   },
   renderReview(content, queue = null) {
 
     this.renderedReviewId = null;
     const heading = this.el('div', '', content, {class: 'review-heading'});
+    let summary;
     if (queue) {
       this.el('h2', queue === 'inbox' ? 'Inbox' : queue === 'library' ? 'Library Issues' : 'Sync Conflicts', heading);
-      this.el('p', this.queueSummary(queue), heading, {class: 'queue-summary', role: 'status', 'data-queue-summary': queue});
+      summary = this.el('p', this.queueSummary(queue), heading, {class: 'queue-summary', role: 'status', 'data-queue-summary': queue});
     }
     let recheck;
     if (queue !== 'sync-review') {
@@ -2406,9 +2508,14 @@ var NotableUI = {
     }
     if (!rows.length) { this.el('h2', 'No individual reviews needed', content); this.el('p', 'Routine documents can be filed together above. Approved transfers run at the next sync. Use Import library to bring in an existing Windows collection.', content); return; }
     if (!rows.some(row => row.id === this.selected)) this.selected = rows[0].id;
-    const layout = this.el('div', '', content, {class: 'review-layout'}), list = this.el('aside', '', layout, {'aria-label': 'Documents awaiting review'});
+    const layout = this.el('div', '', content, {class: 'review-layout'}), list = this.el('aside', '', layout, {'aria-label': queue === 'inbox' ? 'Inbox entries' : 'Documents awaiting review'});
+    let selectedCaption;
     for (const row of rows) {
       const button = this.button(row.payload.title || row.payload.desktop?.[0] || 'Folder conflict', list, () => { this.selected = row.id; this.reviewFocus = true; this.render(); }, false, 'file-text');
+      if (queue === 'inbox') {
+        const caption = this.el('span', this.inboxRowCaption(row), button.querySelector?.('.button-label') || button, {class: 'inbox-row-status'});
+        if (row.id === this.selected) selectedCaption = caption;
+      }
       button.dataset.browse = 'true';
       button.setAttribute('aria-pressed', String(row.id === (this.selected || rows[0].id)));
       button.addEventListener('keydown', event => {
@@ -2444,10 +2551,17 @@ var NotableUI = {
       }
       return;
     }
-    if (row.kind === 'reference') { this.renderReferenceIntake(row, detail); return; }
+    if (row.kind === 'reference') {
+      this.renderReferenceIntake(row, detail, state => {
+        if (selectedCaption) selectedCaption.textContent = this.inboxRowCaption(row, state);
+        if (queue === 'inbox') summary.textContent = this.queueSummary(queue, {id: row.id, state});
+      });
+      return;
+    }
     if (queue === 'inbox' && row.status === 'applying') { this.renderApplyingReview(row, detail); return; }
-    this.el('h2', queue === 'inbox' ? 'Incoming paper' : 'Review document', detail);
-    this.el('p', 'From: ' + (row.kind === 'cloud' ? 'reMarkable' : row.kind === 'inbox' ? 'ToSort' : 'Zotero'), detail, {class: 'review-link-badge'});
+    this.el('h2', queue === 'inbox' ? (row.payload.title || row.payload.filename || 'Incoming file') : 'Review document', detail);
+    this.el('p', queue === 'inbox' ? this.inboxRowCaption(row)
+      : 'From: ' + (row.kind === 'cloud' ? 'reMarkable' : row.kind === 'inbox' ? 'ToSort' : 'Zotero'), detail, {class: 'review-link-badge'});
     if (queue === 'inbox' && row.status !== 'applying' && this.libraryFindings(row).length) {
       this.el('p', 'Resolve the matching items or file problem before filing this paper.', detail);
       this.reviewOpenButton(row, detail);
@@ -2455,6 +2569,7 @@ var NotableUI = {
       jump.dataset.browse = 'true'; return;
     }
     this.reviewOpenButton(row, detail);
+    if (queue === 'inbox' && row.payload.parent) this.reviewNavigationButton('Show reference in Zotero', detail, 'references', [row.payload.parent], {inbox: true});
     if (this.reviewNeedsUpgrade(row)) this.renderSavedReviewUpdate(row, detail);
     else if (row.payload.findings?.length) {
       const active = row.payload.findings.filter(finding => queue !== 'inbox' || !finding.acknowledgement?.acknowledged);
@@ -2542,8 +2657,8 @@ var NotableUI = {
     const details = row.payload.details || {};
     this.el('p', `Correct citation fields in Zotero, then use ${queue === 'inbox' ? 'Check Inbox' : 'Recheck Zotero'}.`, citation, {class: 'hint'});
     this.el('p', [details.primary_creator, details.year, details.venue_or_publisher, details.identifier?.doi].filter(Boolean).join(' · ') || 'No reliable citation fields found. You can edit the reference in Zotero.', citation);
-    if (row.payload.parent) this.reviewNavigationButton('Open reference in Zotero', citation, 'references', [row.payload.parent]);
-    if (!(row.payload.path || '').toLowerCase().endsWith('.pdf')) this.el('p', 'Attach a PDF version in Zotero to read this document on reMarkable.', filing, {class: 'hint'});
+    if (queue !== 'inbox' && row.payload.parent) this.reviewNavigationButton('Open reference in Zotero', citation, 'references', [row.payload.parent]);
+    if (this.isInboxOfficeFile(row)) this.el('p', 'This Office file can be filed in Zotero.', filing, {class: 'hint'});
     const approve = this.button(this.busy ? 'Add to filing queue' : queue === 'inbox' ? this.inboxActionLabel(row, match?.value) : 'Approve & file', filing, async () => {
       if (!main.panel.hidden && !main.select.value) throw Error('Choose the main paper in Zotero for this supporting information.');
       await this.queueFiling('approve', {identity: row.id, digest: row.digest, filename: filename.value, title: title.value,
@@ -2636,8 +2751,11 @@ var NotableUI = {
       }
       if (!this.busy) this.message(result.replacements?.length
         ? (context.conflict ? 'Opened the surviving item after a Zotero merge. Use Sync now to refresh this device conflict; its sync links have not been changed.'
-          : 'Opened the surviving item after a Zotero merge. Recheck this review; its sync links have not been changed.')
+          : context.inbox ? 'Opened the surviving Zotero reference. Use Check Inbox to refresh this entry.'
+            : 'Opened the surviving item after a Zotero merge. Recheck this review; its sync links have not been changed.')
         : 'Opened in Zotero. Your review decision is still pending.');
+      if (context.inbox && result.replacements?.length) this.zoteroInboxDirty = true;
+      await context.onOpened?.(result);
     }, false, target === 'pdf' ? 'book-open' : 'external-link');
     button.dataset.browse = 'true';
     return button;

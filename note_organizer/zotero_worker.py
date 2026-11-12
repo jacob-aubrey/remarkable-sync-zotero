@@ -28,6 +28,7 @@ from . import zotero_connections as connections
 
 REVIEW_GUIDANCE_VERSION = 2
 PAPER_REVIEW_KINDS = frozenset({'zotero', 'inbox', 'cloud'})
+MANAGED_INBOX_SOURCE = 'This attachment is managed by reMarkable Sync. Check its connection in Linked papers before trying to file it.'
 
 
 def review_guidance_ready(payload):
@@ -898,14 +899,19 @@ class Worker:
                 'naming_signature': self._naming_signature()}
 
     def _offer(self, kind, identity, path, *, metadata=None, **extra):
+        """Queue settled content, or signal a later check for a changing file."""
         from .inbox import _complete_document, file_signature
-        if not self.review.observe_ready(kind + ":" + identity, file_signature(path)) or not _complete_document(path):
+        if not self.review.observe_ready(kind + ":" + identity, file_signature(path)):
+            return 'settling'
+        if not _complete_document(path):
+            if kind == 'zotero':
+                raise PilotError('Open the attachment in Zotero to finish the download or check whether the file is readable.')
             return
         from .zotero_bulk import observed_digest
         digest = observed_digest(path, self.file_digests)
         if kind == 'inbox':
             self.review.supersede_inbox(path, identity)
-        old = next((r for r in self.review.rows(pending_only=False) if r["kind"] == kind and r["identity"] == identity), None)
+        old = self.review.row(fingerprint([kind, identity])[:24])
         signature = citation_signature(metadata)
         same_pending_source = (old and old['status'] == 'pending'
             and old['payload'].get('proposal_revision') == 2 and review_guidance_ready(old['payload'])
@@ -932,6 +938,7 @@ class Worker:
     def scan_inbox(self, *, catalog=False, discover=False):
         """Discover settled downloads without opening remote clients."""
         issues = []
+        native_files_settling = False
         inbox = self.config.get("inbox")
         if inbox:
             from .inbox import file_signature
@@ -955,6 +962,7 @@ class Worker:
             try:
                 self.catalog_issues = []
                 native = self._catalog_local(client, local=True)
+                native_files_settling = native['files_settling']
                 fresh = [row for row in self.review.rows() if row['kind'] in {'zotero', 'inbox'}
                          and row['status'] == 'pending' and not review_guidance_ready(row['payload'])]
                 if fresh:
@@ -964,13 +972,14 @@ class Worker:
                 client.close()
         if catalog:
             self.catalog_issues.extend(issues)
-        return {**self.status(), 'inbox_issues': issues}
+        return {**self.status(), 'inbox_issues': issues, 'native_files_settling': native_files_settling}
 
     def _native_pdf_matches(self, catalog):
         """Current, unmanaged originals only; cached review matches are not evidence."""
         from .zotero_bulk import observed_digest
         excluded = connections.exclusions(self.directory, self.config)
-        managed = {row.get('source_key') for row in self.state.read('documents', {}).values()} | excluded['sources']
+        managed = {row.get(field) for row in self.state.read('documents', {}).values()
+                   for field in ('source_key', 'view_key')} | excluded['sources']
         indexed = {}
         for attachment in catalog['attachments']:
             if self.stop.is_set():
@@ -1013,40 +1022,61 @@ class Worker:
                 break
             old_collections.update(more)
         active = descendants(collections, self.config['zotero_root'], lambda r: r['key'], lambda r: r.get('parentCollection'))
-        active = connections.filtered_scope(active, excluded['zotero'], lambda r: r['key'], lambda r: r.get('parentCollection'), self.config['zotero_root'])
-        managed_sources = {row.get("source_key") for row in documents.values()} | excluded['sources']
+        active = set(connections.filtered_scope(active, excluded['zotero'], lambda r: r['key'],
+                                                 lambda r: r.get('parentCollection'), self.config['zotero_root']))
+        managed_sources = {row.get(field) for row in documents.values()
+                           for field in ('source_key', 'view_key')} | excluded['sources']
+        files_settling = False
+        source_checks = {}
         for number, attachment in enumerate(native["attachments"], 1):
             if not local and self.stop.is_set():
                 raise InterruptedError('Sync stopped')
             record, path = attachment["data"], Path(attachment["path"])
             parent = native['parents'].get(record.get('parentItem'), {})
             homes = set(parent.get('collections', []))
-            if homes & old_collections and not homes & set(active):
+            if homes & old_collections and not homes & active:
                 continue
             if record["key"] in managed_sources or "Notable pilot:" in record.get("note", ""):
                 continue
             self.progress(f'Checking Zotero file {number} of {len(native["attachments"])}: {path.name}')
             try:
-                self._offer("zotero", record["key"], path, metadata=native["parents"].get(record.get("parentItem")), attachment=record["key"])
+                result = self._offer("zotero", record["key"], path, metadata=parent, attachment=record["key"])
+                if result == 'settling':
+                    files_settling = True
+                    source_checks[record['key']] = ('settling', 'The Zotero file is changing. Inbox will check it again shortly.')
             except (OSError, ValueError, PilotError) as error:
+                source_checks[record['key']] = ('unreadable', str(error))
                 self.catalog_issues.append({'cloud': '', 'attachment': record['key'], 'title': path.name,
                                             'reason': f'Could not check this local paper: {error}'})
-        # References shared from a phone remain actionable before a PDF exists.
-        available_parents = {a['data'].get('parentItem') for a in native['attachments']
-                             if Path(a['path']).suffix.lower() == '.pdf'}
-        reference_keys = set()
-        missing_parents = set(native.get('missing_pdf_parents', []))
+        self._reconcile_zotero_sources(client, native, managed_sources,
+                                       self._owned_zotero_sources(documents, excluded), source_checks, local=local)
+
+        # These references already have a supported file, a pending file
+        # review, or a tablet connection. A second Inbox entry would suggest
+        # adding another copy while the first file still owns its workflow.
+        file_parents = {entry['data'].get('parentItem') for entry in native['attachments']
+                        if not entry['data'].get('deleted')
+                        and Path(entry['path']).suffix.lower() in {'.pdf', '.docx', '.pptx'}}
+        file_parents.update(row['payload'].get('parent') for row in self.review.rows()
+                            if row['kind'] == 'zotero')
+        linked_parents = {row.get('parent') for row in documents.values()} | excluded['parents']
+        inventory = native.get('pdf_inventory')
+        missing_parents = set(native.get('missing_pdf_parents', [])) if inventory is None else set()
+        references = {}
         for key, parent in native['parents'].items():
             homes = set(parent.get('collections', []))
-            if key in available_parents or (homes & old_collections and not homes & set(active)):
+            pdfs = (inventory or {}).get(key, {})
+            if (parent.get('deleted') or key in file_parents or key in linked_parents
+                    or pdfs.get('available') or pdfs.get('managed')
+                    or (homes & old_collections and not homes & active)):
                 continue
-            reference_keys.add(key)
-            self.review.offer('reference', key, fingerprint(['reference', key]),
-                              {'title': parent.get('title') or 'Untitled reference', 'parent': key,
+            legacy_state = 'unavailable' if key in missing_parents else 'none'
+            pdf_state = next((state for state in ('unsupported', 'unknown', 'unavailable') if pdfs.get(state)), legacy_state)
+            references[key] = {'title': parent.get('title') or 'Untitled reference', 'parent': key,
                                'url': parent.get('url') or ('https://doi.org/' + parent['DOI'] if parent.get('DOI') else ''),
-                               'missing_file': key in missing_parents, 'routine': False})
-        self.review.retire_missing_references(reference_keys)
-        return native
+                               'pdf_state': pdf_state, 'missing_file': pdf_state == 'unavailable', 'routine': False}
+        self.review.reconcile_references(references)
+        return {**native, 'files_settling': files_settling}
 
     def _catalog(self, client, cloud):
         self.catalog_issues = []
@@ -1202,6 +1232,7 @@ class Worker:
                 guidance = [*guidance, {'code': 'local_review_unavailable', 'domain': 'file',
                     'severity': 'repair', 'summary': ('The saved attachment is in Zotero Trash' if row['payload'].get('source_availability') == 'trashed'
                         else 'A saved attachment is no longer available' if row['payload'].get('source_availability') == 'missing'
+                        else 'This attachment belongs to reMarkable Sync' if row['payload'].get('source_availability') == 'managed'
                         else 'Recheck could not verify this source'),
                     'explanation': local_error,
                     'next_step': 'Inspect the source in Zotero. Restore or locate the file, then recheck; use Sync now when a current tablet comparison is needed.',
@@ -1211,7 +1242,7 @@ class Worker:
             # an absent source needing the local migration until recheck has
             # classified it; otherwise Sync could suppress the UI's upgrade.
             classified = (row['kind'] != 'zotero' or row['identity'] in native_keys
-                          or row['payload'].get('source_availability') in {'missing', 'trashed'})
+                          or row['payload'].get('source_availability') in {'missing', 'trashed', 'unknown', 'unsupported'})
             guidance_version = REVIEW_GUIDANCE_VERSION if classified else REVIEW_GUIDANCE_VERSION - 1
             payload = {**row["payload"], "issues": issues, "findings": guidance,
                        "routine": not issues, 'guidance_version': guidance_version,
@@ -1264,6 +1295,111 @@ class Worker:
             if result.rowcount != 1:
                 raise PilotError('This review changed while its removed source was checked. Recheck it again.')
 
+    @staticmethod
+    def _unchecked_pdf_states(catalog):
+        return {key: state for inventory in (catalog.get('pdf_inventory') or {}).values()
+                for state in ('unavailable', 'unknown', 'unsupported') for key in inventory.get(state, [])}
+
+    @staticmethod
+    def _trashed_zotero_source(client, key):
+        record = client.get('item', key)
+        return bool(record and record.get('key') == key and record.get('itemType') == 'attachment'
+                    and record.get('deleted') is True)
+
+    def _missing_zotero_source(self, client, key, pdf_state):
+        """Return repair evidence, or None for a Trash entry safe to recheck for retirement."""
+        if pdf_state == 'unknown':
+            return {'source_removed': False, 'source_availability': 'unknown',
+                    'local_recheck_error': 'Zotero could not check whether the saved PDF is available. Recheck Zotero before continuing.'}
+        if pdf_state == 'unavailable':
+            return {'source_removed': False, 'source_availability': 'missing',
+                    'local_recheck_error': 'Zotero lists this PDF, but the file is unavailable on this computer. Open it in Zotero to download or locate it, then recheck.'}
+        if pdf_state == 'unsupported':
+            return {'source_removed': False, 'source_availability': 'unsupported',
+                    'local_recheck_error': 'This PDF’s filename needs to end in .pdf before Inbox can file it. Open its attachment in Zotero to check its filename.'}
+        if self._trashed_zotero_source(client, key):
+            if not self._source_has_recorded_link(key):
+                return None
+            return {'source_removed': True, 'source_availability': 'trashed',
+                    'local_recheck_error': 'The saved attachment is in Zotero Trash and still owns a tablet connection. Restore that exact attachment before resuming its connection.'}
+        return {'source_removed': True, 'source_availability': 'missing',
+                'local_recheck_error': 'The saved Zotero attachment is no longer available. It may have been merged or removed; inspect its reference or Trash in Zotero before continuing.'}
+
+    def _resolve_trashed_source_review(self, client, row):
+        # A concurrent sync must not acquire the source between verification and retirement.
+        with self.state.lock():
+            key = row['identity']
+            if not self._trashed_zotero_source(client, key) or self._source_has_recorded_link(key):
+                raise PilotError('The removed attachment or its connection changed. Recheck this case again.')
+            self._resolve_source_review(row)
+
+    @staticmethod
+    def _owned_zotero_sources(documents, excluded):
+        return {(link[field], link['parent']) for link in documents.values() if link.get('parent') and not link.get('unavailable')
+                for field in ('source_key', 'view_key') if link.get(field)} | excluded['source_parents']
+
+    def _resolve_owned_source_review(self, client, row, parent):
+        with self.state.lock():
+            key = row['identity']
+            record = client.get('item', key)
+            owned = self._owned_zotero_sources(self.state.read('documents', {}),
+                                               connections.exclusions(self.directory, self.config))
+            if (not record or record.get('key') != key or record.get('itemType') != 'attachment'
+                    or record.get('deleted') or record.get('parentItem') != parent or (key, parent) not in owned):
+                raise PilotError('This attachment’s reMarkable connection changed. Recheck Zotero before continuing.')
+            self._resolve_source_review(row)
+
+    def _reconcile_zotero_sources(self, client, catalog, managed, owned, source_checks, *, local):
+        records = {entry['data']['key']: entry['data'] for entry in catalog['attachments'] if not entry['data'].get('deleted')}
+        pdf_states = self._unchecked_pdf_states(catalog)
+        changed = []
+        for row in self.review.rows():
+            if row['kind'] != 'zotero' or row['status'] != 'pending':
+                continue
+            if not local and self.stop.is_set():
+                raise InterruptedError('Sync stopped')
+            key = row['identity']
+            record = records.get(key)
+            if record:
+                parent = record.get('parentItem')
+                if (key, parent) in owned and parent in catalog['parents']:
+                    try:
+                        self._resolve_owned_source_review(client, row, parent)
+                    except (AuthorizationRequired, TransportInterrupted):
+                        raise
+                    except (OSError, PilotError) as error:
+                        self.catalog_issues.append({'cloud': '', 'attachment': key,
+                            'title': row['payload'].get('title', 'Saved Zotero attachment'), 'reason': str(error)})
+                    continue
+                if key in managed or 'Notable pilot:' in record.get('note', ''):
+                    source_checks[key] = ('managed', MANAGED_INBOX_SOURCE)
+                if key in source_checks:
+                    availability, error = source_checks[key]
+                    evidence = {'source_removed': False, 'source_availability': availability, 'local_recheck_error': error}
+                    if any(row['payload'].get(field) != value for field, value in evidence.items()):
+                        changed.append({**row, 'payload': {**row['payload'], **evidence}})
+                continue
+            try:
+                evidence = self._missing_zotero_source(client, key, pdf_states.get(key))
+            except (AuthorizationRequired, TransportInterrupted):
+                raise
+            except (OSError, ValueError, PilotError):
+                evidence = self._missing_zotero_source(client, row['identity'], 'unknown')
+            if evidence is None:
+                try:
+                    self._resolve_trashed_source_review(client, row)
+                except (AuthorizationRequired, TransportInterrupted):
+                    raise
+                except (OSError, PilotError) as error:
+                    # Keep the saved row when ownership or native evidence changed mid-check.
+                    self.catalog_issues.append({'cloud': '', 'attachment': row['identity'],
+                        'title': row['payload'].get('title', 'Saved Zotero attachment'), 'reason': str(error)})
+                continue
+            if any(row['payload'].get(field) != value for field, value in evidence.items()):
+                changed.append({**row, 'payload': {**row['payload'], **evidence}})
+        if changed:
+            self.refresh_review_policy(client, catalog, rows=changed, cancelled=(lambda: False) if local else None)
+
     def recheck_review(self, identity='', identities=None):
         """Recheck saved reviews against local Zotero/files, without a sync.
 
@@ -1308,6 +1444,7 @@ class Worker:
             catalog = client.review_action('catalog')
             collections = client.collections()
             attachments = {entry['data']['key']: entry for entry in catalog['attachments']}
+            pdf_states = self._unchecked_pdf_states(catalog)
             from .inbox import _complete_document
             from .zotero_bulk import observed_digest
             retire_candidates = []
@@ -1325,18 +1462,16 @@ class Worker:
                     if row['kind'] == 'zotero':
                         native = attachments.get(row['identity'])
                         if not native or native['data'].get('deleted') or native['data'].get('itemType') != 'attachment':
-                            payload['source_removed'] = True
-                            record = client.get('item', row['identity'])
-                            deleted = bool(record and record.get('key') == row['identity']
-                                           and record.get('itemType') == 'attachment' and record.get('deleted') is True)
-                            payload['source_availability'] = 'trashed' if deleted else 'missing'
-                            if deleted and not self._source_has_recorded_link(row['identity']):
+                            evidence = self._missing_zotero_source(client, row['identity'], pdf_states.get(row['identity']))
+                            if evidence is None:
                                 retire_candidates.append(row)
                                 continue
-                            if deleted:
-                                raise PilotError('The saved attachment is in Zotero Trash and still owns a tablet connection. Restore that exact attachment before resuming its connection.')
-                            raise PilotError('The saved Zotero attachment is no longer available. It may have been merged or removed; inspect its reference or Trash in Zotero before continuing.')
+                            payload.update(evidence)
+                            raise PilotError(evidence['local_recheck_error'])
                         data = native['data']
+                        if 'Notable pilot:' in data.get('note', '') or self._source_has_recorded_link(row['identity']):
+                            payload.update(source_removed=False, source_availability='managed')
+                            raise PilotError(MANAGED_INBOX_SOURCE)
                         parent_key = data.get('parentItem', '')
                         if parent_key and parent_key not in catalog['parents']:
                             raise PilotError('The attachment’s parent reference is unavailable. Inspect its current reference or Trash in Zotero before continuing.')
@@ -1385,14 +1520,7 @@ class Worker:
                     payload['local_recheck_error'] = str(error)
                 row['payload'] = payload
             for row in retire_candidates:
-                # Share the bridge's process lock so a concurrent sync cannot
-                # acquire this source between ownership verification and commit.
-                with self.state.lock():
-                    record = client.get('item', row['identity'])
-                    if (not record or record.get('key') != row['identity'] or record.get('itemType') != 'attachment'
-                            or record.get('deleted') is not True or self._source_has_recorded_link(row['identity'])):
-                        raise PilotError('The removed attachment or its connection changed. Recheck this case again.')
-                    self._resolve_source_review(row)
+                self._resolve_trashed_source_review(client, row)
                 summary['resolved_ids'].append(row['id'])
             active = [row for row in pending if row['id'] not in summary['resolved_ids']]
             if active:
@@ -1649,6 +1777,8 @@ class Worker:
                         or source_record.get('itemType') != 'attachment'
                         or source_record.get('parentItem', '') != expected_parent):
                     raise PilotError('The source attachment or its reference changed. Recheck Zotero before filing.')
+                if 'Notable pilot:' in source_record.get('note', '') or self._source_has_recorded_link(row['identity']):
+                    raise PilotError(MANAGED_INBOX_SOURCE)
                 if expected_parent:
                     current_parent = client.get('item', expected_parent)
                     if (not current_parent or current_parent.get('deleted')

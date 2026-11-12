@@ -96,6 +96,7 @@ button:disabled { opacity: .55; cursor: wait; }
 /* Size containment preserves layout; vertical input can chain at list boundaries. */
 .review-layout > aside { contain: size; align-self: stretch; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; overscroll-behavior-y: auto; padding-right: 5px; }
 .review-layout > aside > button { flex: 0 0 auto; }
+.inbox-row-status { display: block; font-size: 0.85em; font-weight: normal; opacity: 0.8; }
 .review-comparison { width: 100%; table-layout: fixed; border-collapse: collapse; margin: 16px 0; }
 .review-comparison caption { text-align: left; font-weight: 600; margin-bottom: 8px; }
 .review-comparison th, .review-comparison td { text-align: left; vertical-align: top; overflow-wrap: anywhere; padding: 8px; border-bottom: 1px solid GrayText; }

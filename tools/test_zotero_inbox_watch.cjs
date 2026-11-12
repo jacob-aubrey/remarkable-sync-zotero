@@ -32,6 +32,17 @@ async function main() {
   await ui.checkInbox();
   now += 300000; await ui.checkInbox();
   assert.deepEqual(discovery, [true, false, true, true], 'Discover at startup, after Zotero edits, and on the slower fallback');
+  const settlingChecks = [];
+  ui.rpc = async (method, params) => {
+    assert.equal(method, 'scan_inbox'); settlingChecks.push(params.discover);
+    return {...ui.latest, native_files_settling: settlingChecks.length === 1};
+  };
+  ui.zoteroInboxDirty = true;
+  await ui.checkInbox();
+  now += 3000; await ui.checkInbox();
+  now += 3000; await ui.checkInbox();
+  assert.deepEqual(settlingChecks, [true, true], 'Unsettled native files trigger another discovery on the next idle poll');
+  assert.equal(ui.zoteroInboxDirty, false, 'A settled follow-up ends fast discovery');
   const panel = {}, message = {}, attrs = {}, label = {}, syncStatus = {}, syncDetails = {}, syncStep = {};
   ui.view.document = {getElementById: id => ({activity: panel, message,
     'notable-sync-status': syncStatus, 'notable-sync-details': syncDetails, 'notable-sync-step': syncStep,

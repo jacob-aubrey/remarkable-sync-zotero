@@ -33,7 +33,7 @@ async function main() {
     };
     await ui.action('check_inbox', {}, false);
     assert.deepEqual(calls, ['recheck_review', 'scan_inbox']);
-    assert.deepEqual(messages.splice(0), [['1 new paper in Inbox', false]], 'A PDF arriving for a known citation is not counted as a new paper');
+    assert.deepEqual(messages.splice(0), [['1 added to Inbox', false]], 'A PDF arriving for a known citation is not counted as a new entry');
     assert.equal(ui.reviewFreshnessMessage('inbox'), '', 'Inbox does not repeat a saved-review tally');
     await ui.action('check_inbox', {}, false);
     assert.deepEqual(messages.splice(0), [['Inbox is up to date', false]]);

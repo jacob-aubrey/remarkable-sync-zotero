@@ -1,5 +1,11 @@
 # Project instructions
 
+## Current Zotero plugin repository
+
+`jacob-aubrey/remarkable-sync-zotero` is the repository for this plugin and
+its automatic updates. Verify the checkout's `origin` before building a
+release. Publish release assets only to this repository.
+
 ## Look for existing open-source work first
 
 Before implementing a new capability or substantially replacing an existing subsystem, research existing open-source projects, the libraries already used here, and relevant upstream APIs. Prefer a suitable existing component, supported integration, or small adaptation over recreating it.
