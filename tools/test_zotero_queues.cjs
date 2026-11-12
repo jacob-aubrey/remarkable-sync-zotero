@@ -151,11 +151,12 @@ async function clearActionScopeChecks() {
   f.ui.latest.local_deletions = [{id: 'local-trash', payload: {title: 'Kept tablet paper'}}];
   f.ui.latest.deletions = [{id: 'tablet-trash', payload: {title: 'Trashed tablet paper', parent: 'PARENT23',
     inventory: [{key: 'PDF12345', title: 'Annotated PDF'}, {key: 'NOTE2345', title: 'Research note'}]}}];
-  f.ui.action = async (...args) => calls.push(args);
+  f.ui.confirmSyncDecision = async job => calls.push([job.method, job.params]);
   const view = f.node(); f.ui.renderReview(view, 'sync-review');
   assert.equal(f.buttons.has('Recheck Zotero'), false, 'A local-only check must not look like a tablet-conflict refresh');
   assert.doesNotMatch(nodeText(view), /Delete everything|Delete PDF only/);
-  for (const label of ['Restore on reMarkable', 'Trash linked PDFs in Zotero', 'Trash reference in Zotero', 'Keep reMarkable copy', 'Move reMarkable copy to Trash']) {
+  for (const label of ['Restore on reMarkable', 'Trash linked PDFs in Zotero', 'Trash reference everywhere in Zotero',
+    'Keep reMarkable copy', 'Move reMarkable copy to Trash', 'Remove from selected collections']) {
     assert.ok(f.buttons.has(label), 'Each decision names its target: ' + label);
     await f.buttons.get(label)[0].click();
   }
@@ -164,10 +165,11 @@ async function clearActionScopeChecks() {
     ['delete_decision', {identity: 'tablet-trash', choice: 'pdf_only', destination: ''}],
     ['delete_decision', {identity: 'tablet-trash', choice: 'everything', destination: ''}],
     ['local_delete_decision', {identity: 'local-trash', choice: 'keep_tablet'}],
-    ['local_delete_decision', {identity: 'local-trash', choice: 'trash_tablet'}]
+    ['local_delete_decision', {identity: 'local-trash', choice: 'trash_tablet'}],
+    ['delete_decision', {identity: 'tablet-trash', choice: 'remove_collections', destination: ''}]
   ]);
   assert.match(f.ui.buttonHelp('Trash linked PDFs in Zotero'), /notes PDF and any recorded source PDF.*Zotero Trash/);
-  assert.match(f.ui.buttonHelp('Trash reference in Zotero'), /reference, all its attachments, and all its notes/);
+  assert.match(f.ui.buttonHelp('Trash reference everywhere in Zotero'), /reference, all its attachments, and all its notes/);
   assert.equal(f.ui.filingQueue.length, 0, 'Sync decisions do not become queued filing approvals');
   for (const kind of ['cloud', 'zotero']) {
     const incoming = viewFixture(), row = paper('matched', kind);

@@ -201,7 +201,7 @@ async function main() {
     ui.latest.mappings = {Z: {cloud: 'T', root: true}};
     ui.latest.deletions = [{id: 'deletion', payload: {title: 'Paper', inventory: [], restore_parent: 'removed-folder'}}];
     ui.renderReview(node()); fields.get('Restore to reMarkable folder').value = 'T';
-    let payload; ui.action = async (_method, params) => { payload = params; };
+    let payload; ui.confirmSyncDecision = async job => { payload = job.params; };
     await buttons.get('Restore on reMarkable')[0].click(); assert.equal(payload.destination, 'T');
   }
   {
@@ -275,6 +275,29 @@ async function main() {
     await ui.drainAfterSync();
     await Promise.all([error, inbox]);
     assert.deepEqual(calls, ['check_inbox']);
+  }
+  {
+    const {ui} = fixture();
+    ui.latest.deletions = [{id: 'tablet', payload: {title: 'Tablet paper'}}];
+    ui.latest.local_deletions = [{id: 'zotero', payload: {title: 'Zotero paper'}}];
+    const jobs = [['delete_decision', 'tablet', 'keep_zotero'], ['local_delete_decision', 'zotero', 'trash_tablet']]
+      .map(([method, identity, choice]) => {
+        const params = {identity, choice};
+        return {key: identity, method, params, connection: ui.filingConnection(),
+          evidence: JSON.stringify(ui.syncDecisionEvidence(method, params))};
+      });
+    ui.busy = true;
+    await ui.changeSyncDecisions(() => jobs);
+    await ui.drainSyncDecisions();
+    assert.equal(ui.syncDecisions.length, 2, 'Both choices wait during the transfer');
+    const restarted = fixture().ui;
+    restarted.latest = ui.latest; restarted.syncDecisions = ui.syncDecisions;
+    const calls = [];
+    restarted.action = async (method, params) => { calls.push([method, params.identity]); return {}; };
+    restarted.latest.deletions[0].payload.title = 'Changed since review';
+    await restarted.drainSyncDecisions();
+    assert.deepEqual(calls, [['local_delete_decision', 'zotero']], 'A changed first case must not block the second');
+    assert.match(restarted.syncDecisions[0].error, /changed while/);
   }
   {
     const {ui} = fixture();

@@ -173,6 +173,15 @@ class ReviewDecisionTests(unittest.TestCase):
                 self.store.resolve_deletion(key, action, cloud=self.cloud, zotero=self.zot, scope=self.root.id)
                 self.assertEqual(self.zot.review_action.call_count, calls)
 
+    def test_remove_collections_forwards_only_the_confirmed_locations(self):
+        key, _ = self.deleted()
+        plan = {'token': 'reviewed-native-snapshot', 'remove': ['COLL2345']}
+        self.store.resolve_deletion(key, 'remove_collections', cloud=self.cloud, zotero=self.zot,
+                                    scope=self.root.id, zotero_plan=plan)
+        operation, payload = self.zot.review_action.call_args.args
+        self.assertEqual((operation, payload['choice'], payload['zotero_plan']), ('trash', 'remove_collections', plan))
+        self.assertIn(self.paper.id, self.store.suspended_documents())
+
     def test_new_tablet_revision_invalidates_deletion_decision(self):
         key, removed = self.deleted()
         self.cloud.update_item(removed.id, expected_hash=removed.hash, parent=self.root.id, scope_id=self.root.id, restore=True)

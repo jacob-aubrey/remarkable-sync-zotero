@@ -501,6 +501,8 @@ class Bridge:
                                         if not existing and linked.get('baseline') == baseline and not linked.get('unavailable')), None)
                     if counterpart:
                         reviews.append({'attachment': source_key, 'cloud': counterpart,
+                                        'title': attachment.get('title') or source_path.name,
+                                        'parent': attachment.get('parentItem'),
                                         'reason': 'This exact PDF already has a connected tablet copy. Reconcile its Zotero references before sending another copy.'})
                         continue
                     # A reference can have several PDFs, each with its own tablet

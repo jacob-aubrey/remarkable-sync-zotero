@@ -22,30 +22,97 @@ function notableReviewItemInTrash(item) {
   return item.deleted || (typeof item.isInTrash === 'function' && item.isInTrash());
 }
 
-async function notableTrashLinkedCollection({root, key, inventory}) {
+function notableCollectionLocations(collections, ids, inside = new Set()) {
+  const byID = new Map(collections.map(row => [row.id, row]));
+  const byKey = new Map(collections.map(row => [row.key, row]));
+  return ids.filter(id => byID.has(id)).map(id => {
+    const collection = byID.get(id);
+    const names = [], visited = new Set();
+    for (let row = collection; row && !visited.has(row.key); row = byKey.get(row.parentKey)) {
+      visited.add(row.key); names.unshift(row.name);
+    }
+    return {key: collection.key, path: names.join(' → '), inside: inside.has(collection.key)};
+  }).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+}
+
+async function notableCollectionDecision(root, key) {
   const itemKey = /^[23456789ABCDEFGHIJKLMNPQRSTUVWXYZ]{8}$/;
   const library = Zotero.Libraries.userLibraryID;
-  if (!itemKey.test(root || '') || !itemKey.test(key || '') || key === root
-      || !Array.isArray(inventory) || !Zotero.Libraries.hasTrash(library)) throw Error('Invalid folder decision');
+  if (!itemKey.test(root || '') || !itemKey.test(key || '') || key === root || !Zotero.Libraries.hasTrash(library)) {
+    throw Error('Choose a linked Zotero subcollection that can be moved to Trash.');
+  }
+  const collections = Zotero.Collections.getByLibrary(library, true).filter(row => !row.deleted);
+  const byKey = new Map(collections.map(row => [row.key, row]));
+  const target = byKey.get(key);
+  let ancestor = target;
+  const seen = new Set();
+  while (ancestor && ancestor.key !== root && !seen.has(ancestor.key)) {
+    seen.add(ancestor.key);
+    ancestor = byKey.get(ancestor.parentKey);
+  }
+  if (!target || ancestor?.key !== root) throw Error('The Zotero collection is no longer inside the connected folder.');
+  const branch = [target, ...target.getDescendents(false, 'collection', false)
+    .map(child => Zotero.Collections.get(child.id)).filter(row => row && byKey.has(row.key))];
+  const inside = new Set(branch.map(row => row.key));
+  const inventory = branch.map(row => [row.key, row.parentKey || '', row.name, row.version || 0])
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+  const items = [];
+  for (const row of branch) await row.loadAllData();
+  for (const id of new Set(branch.flatMap(row => row.getChildItems(true)))) {
+    const item = await Zotero.Items.getAsync(id);
+    if (!item || item.parentID || item.deleted) continue;
+    await item.loadAllData();
+    const records = await notableInventory(item, {hashFiles: false});
+    items.push({key: item.key, title: item.getDisplayTitle(), itemType: item.itemType,
+      locations: notableCollectionLocations(collections, item.getCollections(), inside),
+      children: records.filter(row => row.key !== item.key && !row.deleted),
+      evidence: records.map(row => [row.key, row.signature, row.fileStamp || ''])});
+  }
+  items.sort((a, b) => a.key.localeCompare(b.key));
+  const snapshot = {inventory, items};
+  return {...snapshot, token: Zotero.Utilities.Internal.md5(JSON.stringify(snapshot))};
+}
+
+async function notableTrashLinkedCollection({root, key, inventory, plan}) {
   return Zotero.DB.executeTransaction(async () => {
-    const collections = Zotero.Collections.getByLibrary(library, true);
-    const byKey = new Map(collections.map(row => [row.key, row]));
-    const target = byKey.get(key);
-    let ancestor = target;
-    const seen = new Set();
-    while (ancestor && ancestor.key !== root && !seen.has(ancestor.key)) {
-      seen.add(ancestor.key);
-      ancestor = byKey.get(ancestor.parentKey);
+    const current = await notableCollectionDecision(root, key);
+    if (plan) {
+      if (current.token !== plan.token) throw Error('The Zotero collection, its contents, or their locations changed. Review the updated list.');
+      if (!Array.isArray(plan.items) || plan.items.length !== current.items.length
+          || new Set(plan.items.map(row => row.key)).size !== current.items.length) throw Error('Review each Zotero item before moving the collection to Trash.');
+      const targets = new Map(current.items.map(row => [row.key, row]));
+      const trash = [];
+      for (const {key: itemKey, trash: removeItem, remove} of plan.items) {
+        const evidence = targets.get(itemKey);
+        if (!evidence || typeof removeItem !== 'boolean' || !Array.isArray(remove) || (removeItem && remove.length)
+            || remove.some(location => !evidence.locations.some(row => !row.inside && row.key === location))) {
+          throw Error('The selected Zotero locations changed. Review the updated list.');
+        }
+        const item = await notableItem(itemKey);
+        if (removeItem) trash.push(item.id);
+        else if (remove.length) {
+          for (const location of new Set(remove)) item.removeFromCollection(location);
+          await item.save({skipDateModifiedUpdate: true});
+        }
+      }
+      if (trash.length) await Zotero.Items.trash(trash);
+    } else if (JSON.stringify(current.inventory) !== JSON.stringify(inventory)) {
+      throw Error('The Zotero collection or its subcollections changed. Review the folder again.');
     }
-    if (!target || ancestor?.key !== root) throw Error('The connected collection changed');
-    const children = target.getDescendents(false, 'collection', false).map(child => Zotero.Collections.get(child.id));
-    const current = [target, ...children].map(row => [row.key, row.parentKey || '', row.name, row.version || 0])
-      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
-    if (JSON.stringify(current) !== JSON.stringify(inventory)) throw Error('The collection or its subcollections changed');
+    const target = await Zotero.Collections.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, key);
     target.deleted = true;
     await target.save({deleteItems: false});
     return {trashed: true};
   });
+}
+
+async function notablePaperDecision(key) {
+  const parent = await notableItem(key);
+  if (!parent?.isRegularItem() || parent.deleted) throw Error('The Zotero reference is unavailable. Refresh Sync Conflicts.');
+  const collections = Zotero.Collections.getByLibrary(Zotero.Libraries.userLibraryID, true).filter(row => !row.deleted);
+  const snapshot = {inventory: await notableInventory(parent),
+    locations: notableCollectionLocations(collections, parent.getCollections())};
+  return {...snapshot, token: Zotero.Utilities.Internal.md5(JSON.stringify(snapshot))};
 }
 
 async function notableRestoreLinkedCollection({root, key, parent, version}) {
@@ -288,9 +355,10 @@ async function notableNavigateReview(data) {
     ...(replacements.length ? {requestedKeys: keys, replacements} : {})};
 }
 
-async function notableInventory(parent) {
+async function notableInventory(parent, {hashFiles = true} = {}) {
   const items = [parent];
-  for (const id of [...parent.getAttachments(true), ...parent.getNotes(true)]) {
+  if (parent.isPDFAttachment()) items.push(...parent.getAnnotations());
+  for (const id of parent.isRegularItem() ? [...parent.getAttachments(true), ...parent.getNotes(true)] : []) {
     const item = await Zotero.Items.getAsync(id);
     await item.loadAllData();
     items.push(item);
@@ -304,7 +372,11 @@ async function notableInventory(parent) {
       signature: Zotero.Utilities.Internal.md5(JSON.stringify(item.toJSON()))};
     if (item.isFileAttachment()) {
       const path = await item.getFilePathAsync();
-      row.fileMD5 = path ? await Zotero.Utilities.Internal.md5Async(path) : '';
+      if (hashFiles) row.fileMD5 = path ? await Zotero.Utilities.Internal.md5Async(path) : '';
+      else {
+        const stat = path ? await IOUtils.stat(path) : null;
+        row.fileStamp = stat ? `${stat.size}:${stat.lastModified}` : '';
+      }
     }
     inventory.push(row);
   }
@@ -498,7 +570,7 @@ function notableRegisterLibraryEndpoint(Base) {
       }
       if (data.action === 'trash_linked_collection') {
         try { return reply(200, await notableTrashLinkedCollection(data)); }
-        catch (_) { return reply(409, {error: 'The matching collection changed or could not be moved to Trash.'}); }
+        catch (_) { return reply(409, {error: 'Zotero could not verify the collection, its contents, or their locations. Open the folder decision again.'}); }
       }
       if (data.action === 'restore_linked_collection' || data.action === 'restore_linked_item') {
         try { return reply(200, await (data.action === 'restore_linked_collection' ? notableRestoreLinkedCollection(data) : notableRestoreLinkedItem(data))); }
@@ -716,7 +788,7 @@ function notableRegisterLibraryEndpoint(Base) {
         const parent = await notableItem(data.parent), view = await notableItem(data.attachment);
         if (!parent || !view || !parent.isRegularItem() || view.parentKey !== parent.key
             || !view.getNote().includes('Notable pilot:')) return reply(409, {error: 'Link changed'});
-        if (!['pdf_only', 'everything'].includes(data.choice)) return reply(400, {error: 'Choose a deletion scope'});
+        if (!['pdf_only', 'everything', 'remove_collections'].includes(data.choice)) return reply(400, {error: 'Choose a deletion scope'});
         const targets = data.choice === 'everything' ? [parent] : [view];
         if (data.choice === 'pdf_only' && data.source_attachment) {
             const source = await notableItem(data.source_attachment);
@@ -724,11 +796,22 @@ function notableRegisterLibraryEndpoint(Base) {
               || !view.getNote().includes('Notable source attachment: ' + source.key)) return reply(409, {error: 'Source link changed'});
           targets.push(source);
         }
-        if (targets.every(item => item.deleted)) return reply(200, {status: 'trashed', keys: targets.map(i => i.key)});
+        if (data.choice !== 'remove_collections' && targets.every(item => item.deleted)) return reply(200, {status: 'trashed', keys: targets.map(i => i.key)});
         let stale = false;
         await Zotero.DB.executeTransaction(async () => {
-          if (JSON.stringify(await notableInventory(parent)) !== JSON.stringify(data.inventory)) { stale = true; return; }
-          await Zotero.Items.trash(targets.map(item => item.id));
+          const plan = data.zotero_plan;
+          const current = plan ? await notablePaperDecision(parent.key) : null;
+          if (plan ? current.token !== plan.token : JSON.stringify(await notableInventory(parent)) !== JSON.stringify(data.inventory)) {
+            stale = true; return;
+          }
+          if (data.choice === 'remove_collections') {
+            if (!Array.isArray(plan?.remove) || !plan.remove.length
+                || plan.remove.some(key => !current.locations.some(location => location.key === key))) {
+              stale = true; return;
+            }
+            for (const key of new Set(plan.remove)) parent.removeFromCollection(key);
+            await parent.save({skipDateModifiedUpdate: true});
+          } else await Zotero.Items.trash(targets.map(item => item.id));
         });
         return reply(stale ? 409 : 200, stale ? {error: 'Reference or notes changed'} : {status: 'trashed', keys: targets.map(i => i.key)});
       }

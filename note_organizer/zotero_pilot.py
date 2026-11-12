@@ -399,6 +399,12 @@ class LocalZotero:
                 if response.status_code == 409:
                     if action == 'create_collection':
                         raise PilotError('The collection could not be created. Refresh folders and retry.')
+                    if action == 'trash_linked_collection':
+                        raise ReviewChanged('Zotero could not verify the collection, its contents, or their locations. Open the folder decision again.')
+                    if action == 'restore_linked_collection':
+                        raise ReviewChanged('Zotero could not verify the collection or its original location. Open the folder decision again.')
+                    if action == 'trash' and (payload or {}).get('zotero_plan'):
+                        raise ReviewChanged('Zotero could not verify the reference, its files and notes, or its collection locations. Review the updated list.')
                     raise ReviewChanged('The selected paper or its notes changed. Refresh the review before proceeding.')
                 if response.status_code >= 500 or response.status_code == 429:
                     raise ValueError('Temporary local API interruption')

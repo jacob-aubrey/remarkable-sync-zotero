@@ -380,8 +380,8 @@ class ReviewStore(Ledger):
             rows = db.execute("SELECT * FROM deletion_decisions" + (" WHERE status!='resolved'" if pending_only else "") + " ORDER BY rowid").fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"]), "result": json.loads(row["result"])} for row in rows]
 
-    def resolve_deletion(self, identity, action, *, cloud, zotero, scope, destination=''):
-        if action not in {'restore', 'pdf_only', 'everything', 'keep_zotero'}:
+    def resolve_deletion(self, identity, action, *, cloud, zotero, scope, destination='', zotero_plan=None):
+        if action not in {'restore', 'pdf_only', 'everything', 'keep_zotero', 'remove_collections'}:
             raise PilotError('Choose how to handle the reMarkable deletion.')
         with self.lock():
             row = next((row for row in self.deletions(pending_only=False) if row["id"] == identity), None)
@@ -422,7 +422,8 @@ class ReviewStore(Ledger):
                 # attachment/note inventory again inside its transaction. It
                 # uses Zotero Trash and never permanently erases records.
                 try:
-                    zotero.review_action("trash", {"choice": action, **data})
+                    zotero.review_action("trash", {"choice": action, **data,
+                                                   **({'zotero_plan': zotero_plan} if zotero_plan is not None else {})})
                 except ReviewChanged:
                     with self.connect() as db:
                         db.execute("UPDATE deletion_decisions SET status='pending',action='' WHERE id=?", (identity,))

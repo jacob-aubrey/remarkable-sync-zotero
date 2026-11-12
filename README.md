@@ -23,7 +23,11 @@ Inbox lets you edit citation details and add paper tags before approval. Changin
 
 ### Confirm a linked folder deletion
 
-If a linked subfolder is deleted or moved out of the connection, its folder pair pauses while the other folders continue syncing. Open **Sync Conflicts** to review the folder by name. You can keep the deletion on one device, also trash the matching folder, or restore the original folder when it is still in Trash and its previous parent is available. Trashing a Zotero collection keeps its papers in My Library. Trashing a reMarkable folder also removes its contents from the active library. [Zotero collection deletion](https://www.zotero.org/support/collections_and_tags#deleting_collections)
+If a linked subfolder is deleted or moved out of the connection, its folder pair pauses while the other folders continue syncing. Open **Sync Conflicts** to review the folder by name. You can keep the deletion on one device, also trash the matching folder, or restore the original folder when it is still in Trash and its previous parent is available.
+
+Before trashing a Zotero collection, review its contents and each item’s collection locations. Items with other locations start unchecked for Trash. Trashing a reference everywhere also takes its attachments and notes out of the active library. Removing a reference from checked collections leaves it and its attachments in My Library. For an individual paper, you can also trash just the linked PDFs. Trashing a reMarkable folder moves its contents out of the active library. [Zotero collections and Trash](https://www.zotero.org/support/collections_and_tags)
+
+Confirmed choices show on their cards and are saved while sync runs. Cancel a choice before it starts, or make decisions on other cards while it waits. If the reviewed items or locations change, the affected decision asks for another review.
 
 ## Build from source
 
@@ -36,7 +40,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.15.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.16.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

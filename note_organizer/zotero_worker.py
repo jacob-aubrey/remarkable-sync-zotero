@@ -1705,7 +1705,7 @@ class Worker:
         self.review.dismiss(identity, digest)
         return self.status()
 
-    def confirm_folder_change(self, issue, choice='keep'):
+    def confirm_folder_change(self, issue, choice='keep', zotero_plan=None):
         """Resolve the exact live folder pair the user reviewed."""
         if not self.config.get('tablet_root') or not isinstance(issue, dict) or choice not in {'keep', 'mirror', 'restore'}:
             raise PilotError('Choose a current folder issue in Sync Conflicts.')
@@ -1741,7 +1741,8 @@ class Worker:
                     mirror = issue.get('mirror', {})
                     if mirror.get('side') == 'zotero':
                         result = client.review_action('trash_linked_collection', {'root': self.config['zotero_root'],
-                            'key': issue['zotero'], 'inventory': zotero_folder_inventory(collections, issue['zotero'])})
+                            'key': issue['zotero'], 'inventory': zotero_folder_inventory(collections, issue['zotero']),
+                            **({'plan': zotero_plan} if zotero_plan is not None else {})})
                         if not result.get('trashed'):
                             raise PilotError('Zotero could not verify the matching collection. Sync to review it again.')
                     elif mirror.get('side') == 'tablet':
@@ -2309,10 +2310,11 @@ class Worker:
                 # and its recorded cleanup can be retried on a later cycle.
                 continue
 
-    def delete_decision(self, identity, choice, destination=''):
+    def delete_decision(self, identity, choice, destination='', zotero_plan=None):
         client = self.zotero()
         try:
-            result = self.review.resolve_deletion(identity, choice, cloud=self.cloud(), zotero=client, scope=self.config["tablet_root"], destination=destination)
+            result = self.review.resolve_deletion(identity, choice, cloud=self.cloud(), zotero=client,
+                                                  scope=self.config["tablet_root"], destination=destination, zotero_plan=zotero_plan)
             return {"decision": result, **self.status()}
         finally:
             client.close()

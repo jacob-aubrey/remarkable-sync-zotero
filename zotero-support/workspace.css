@@ -196,6 +196,13 @@ nav button.sync-conflicts-attention[aria-pressed="true"] .button-icon { color: #
 .queued-filing > .actions { margin: 2px 0; }
 .review-dismiss { max-inline-size: min(420px, calc(100% - 24px)); max-block-size: calc(100vh - 24px); overflow: auto; padding: 16px; border: 1px solid GrayText; border-radius: 7px; }
 .review-dismiss > .actions { margin: 12px 0 0; justify-content: end; }
+.sync-decision-dialog { inline-size: min(640px, calc(100% - 56px)); max-inline-size: none; }
+.sync-decision-preview { max-block-size: min(48vh, 430px); overflow: auto; overflow-wrap: anywhere; scrollbar-gutter: stable; }
+.sync-decision-item { border-block-start: 1px solid GrayText; padding: 10px 0; margin-block-start: 8px; }
+.sync-decision-item > h3 { margin: 0 0 8px; }
+.decision-locations { min-inline-size: 0; margin: 8px 0; border: 1px solid GrayText; border-radius: 5px; }
+.decision-locations label { display: flex; align-items: baseline; gap: 7px; margin: 5px 0; }
+.decision-locations input { flex: none; }
 #notable-sync-details { flex: 1 0 100%; min-width: 0; }
 #notable-sync-step { margin: 4px 0 0; max-block-size: 4.5em; overflow: auto; overflow-wrap: anywhere; }
 .workspace-status #message { flex: 1 1 220px; margin: 0; min-width: 0; block-size: 1.6em; max-width: 100%; }

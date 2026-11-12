@@ -344,6 +344,17 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(records[other.id].deleted)
         self.assertFalse(self.worker.sync()['folder_issues'])
 
+    def test_mirror_deleted_tablet_folder_forwards_the_confirmed_zotero_items(self):
+        folder = self.cloud.create_folder('Matching folder', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        self.worker.sync()
+        self.cloud.update_item(folder.id, expected_hash=folder.hash, parent='trash', scope_id=self.croot.id)
+        issue = self.worker.sync()['folder_issues'][0]
+        plan = {'token': 'reviewed-native-snapshot', 'items': [{'key': 'PARENT23', 'trash': False, 'remove': []}]}
+        with patch.object(self.zot, 'review_action', return_value={'trashed': True}) as action:
+            self.assertEqual(self.worker.confirm_folder_change(issue, 'mirror', zotero_plan=plan)['folder_choice'], 'mirror')
+        operation, payload = action.call_args.args
+        self.assertEqual((operation, payload['key'], payload['plan']), ('trash_linked_collection', issue['zotero'], plan))
+
     def test_restore_tablet_folder_keeps_same_connection_and_nested_folder(self):
         folder = self.cloud.create_folder('Moved to Trash', self.croot.id, str(uuid.uuid4()), self.croot.id)
         nested = self.cloud.create_folder('Nested', folder.id, str(uuid.uuid4()), self.croot.id)

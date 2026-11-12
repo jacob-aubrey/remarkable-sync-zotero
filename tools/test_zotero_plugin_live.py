@@ -1922,7 +1922,7 @@ def main():
             if snapshot:
                 rendered = command(root, 'render', snapshot=snapshot, tab='sync-review')
                 assert all(label in rendered['buttons'] for label in
-                           ['Restore on reMarkable', 'Trash linked PDFs in Zotero', 'Trash reference in Zotero']), rendered['buttons']
+                           ['Restore on reMarkable', 'Trash linked PDFs in Zotero', 'Trash reference everywhere in Zotero']), rendered['buttons']
                 assert 'No sync conflicts' not in rendered['headings'], 'Pending deletion decisions must not show an empty-queue heading'
                 checked('actual_sync_conflicts_window_renders_all_three_deletion_choices_without_an_empty_state')
             command(root, 'snapshot')

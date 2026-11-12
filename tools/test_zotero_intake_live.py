@@ -450,8 +450,10 @@ BRANCH = r"""
           }
           else if (command.action === 'folder_deletion_layout') {
             const ensure = (value, message) => {if (!value) throw Error(message);};
-            const saved = {rpc: ui.rpc, latest: ui.latest, syncFailure: ui.syncFailure, tab: ui.tab};
-            const issue = {zotero: 'FOLDER23', tablet: '11111111-1111-4111-8111-111111111112',
+            const saved = {rpc: ui.rpc, latest: ui.latest, syncFailure: ui.syncFailure, tab: ui.tab, busy: ui.busy, operation: ui.operation};
+            const root = new Zotero.Collection(); root.name = 'Temporary decision root'; await root.saveTx();
+            const folder = new Zotero.Collection(); folder.name = 'Test'; folder.parentID = root.id; await folder.saveTx();
+            const issue = {zotero: folder.key, tablet: '11111111-1111-4111-8111-111111111112',
               zotero_name: 'Test', tablet_name: 'Test', zotero_state: '', tablet_state: 'trash',
               mirror: {side: 'zotero', evidence: 'fixture', children: 0}};
             const doc = ui.view.document;
@@ -461,7 +463,7 @@ BRANCH = r"""
             await Zotero.Promise.delay(180);
             try {
               ui.latest = {...command.snapshot, reviews: [], deletions: [], local_deletions: [], folder_issues: [issue],
-                status: {}, config: {...command.snapshot.config, automatic: false, sync_paused: command.paused}};
+                status: {}, config: {...command.snapshot.config, zotero_root: root.key, automatic: false, sync_paused: command.paused}};
               const failure = 'A linked collection/folder was deleted or moved outside the selected roots. Review it before retrying.';
               ui.tab = 'inbox'; ui.syncFailure = failure; ui.render();
               ui.message(ui.statusMessage());
@@ -489,13 +491,29 @@ BRANCH = r"""
                 ensure(method === 'sync', 'Unexpected RPC: ' + method);
                 return {...ui.latest, folder_change: undefined};
               };
-              button(command.paused ? 'Also trash Zotero collection' : 'Keep deletion on this device').click();
-              const expected = command.paused ? 'confirm_folder_change' : 'confirm_folder_change,sync';
-              for (let i = 0; i < 40 && (calls.join(',') !== expected || ui.busy); i++) await Zotero.Promise.delay(25);
-              ensure(calls.join(',') === expected && !ui.busy, 'Confirmation resumed sync at the wrong time: ' + calls.join(','));
+              const choice = command.paused ? 'Also trash Zotero collection' : 'Keep deletion on this device';
+              ui.busy = true;
+              ui.operation = {method: 'sync', started: Date.now(), updated: Date.now(), detail: 'Synthetic sync'};
+              ui.disable(true);
+              button(choice).click();
+              const dialog = () => doc.querySelector('.sync-decision-dialog[open]');
+              const confirmation = () => dialog()?.querySelector('button[value="confirm"]:enabled');
+              for (let i = 0; i < 80 && !confirmation(); i++) await Zotero.Promise.delay(25);
+              ensure(!calls.length, 'The decision ran before confirmation');
+              ensure(confirmation(), 'Confirmation was unavailable for ' + choice + ' · '
+                + (dialog()?.textContent || doc.getElementById('message')?.textContent || 'No dialog opened'));
+              ensure(dialog().scrollWidth <= dialog().clientWidth + 1, 'The confirmation overflowed the window');
+              confirmation().click();
+              for (let i = 0; i < 80 && !button('Cancel queued decision'); i++) await Zotero.Promise.delay(25);
+              ensure(button('Cancel queued decision') && !button(choice) && !calls.length,
+                'The card did not visibly queue and lock its choices during sync');
+              ui.busy = false; ui.operation = null;
+              await ui.drainSyncDecisions();
+              ensure(calls.join(',') === 'confirm_folder_change' && !ui.busy, 'Unexpected queued decision requests: ' + calls.join(','));
               ensure(button('Sync Conflicts (0)'), 'Confirmation did not clear the resolved folder decision');
             } finally {
               ui.rpc = saved.rpc; ui.latest = saved.latest; ui.syncFailure = saved.syncFailure; ui.tab = saved.tab;
+              ui.busy = saved.busy; ui.operation = saved.operation;
               clearTimeout(ui.timer); ui.render();
             }
           }
@@ -530,7 +548,33 @@ BRANCH = r"""
             const restoredPaper = await native.notableRestoreLinkedItem({key: paper.key, parent: '', version: paper.version});
             ensure(restoredPaper.restored && !paper.deleted && paper.getCollections().includes(other.id),
               'The original Zotero reference was not restored');
-            await native.notableTrashLinkedCollection({root: root.key, key: folder.key, inventory});
+            const sole = new Zotero.Item('book'); sole.setField('title', 'Only in the deleted branch');
+            sole.setCollections([child.id]); await sole.saveTx();
+            const link = await Zotero.Attachments.linkFromURL({url: 'https://example.invalid/fixture', parentItemID: sole.id, title: 'Saved link'});
+            const snapshot = await native.notableCollectionDecision(root.key, folder.key);
+            const shared = snapshot.items.find(item => item.key === paper.key);
+            ensure(shared.locations.some(row => row.inside && row.path.includes('Matching collection → Subcollection'))
+              && shared.locations.some(row => !row.inside && row.key === other.key), 'The shared paper locations were incomplete');
+            ensure(snapshot.items.find(row => row.key === sole.key).children.some(row => row.key === link.key), 'Saved links were missing from the preview');
+            const plan = {token: snapshot.token, items: snapshot.items.map(item => ({key: item.key, trash: item.key === sole.key, remove: []}))};
+            paper.setField('title', 'Changed after confirmation'); await paper.saveTx();
+            staleRejected = false;
+            try { await native.notableTrashLinkedCollection({root: root.key, key: folder.key, plan}); }
+            catch (_) { staleRejected = !folder.deleted && !sole.deleted; }
+            ensure(staleRejected && !folder.deleted && !sole.deleted, 'A stale item preview allowed a trash operation');
+            plan.token = (await native.notableCollectionDecision(root.key, folder.key)).token;
+            await native.notableTrashLinkedCollection({root: root.key, key: folder.key, plan});
+            ensure(folder.deleted && child.deleted && sole.deleted && !paper.deleted && paper.getCollections().includes(other.id),
+              'The planned folder deletion did not preserve the shared paper and trash the selected item');
+            const kept = await make('Another location', root);
+            paper.addToCollection(kept.id); await paper.saveTx();
+            const view = await Zotero.Attachments.linkFromURL({url: 'https://example.invalid/linked', parentItemID: paper.id, title: 'Linked copy'});
+            view.setNote('Notable pilot: test attachment'); await view.saveTx();
+            const paperPreview = await native.notablePaperDecision(paper.key);
+            response.paperDecision = {parent: paper.key, attachment: view.key, choice: 'remove_collections',
+              zotero_plan: {token: paperPreview.token, remove: [other.key]}};
+            response.removedLocation = other.key;
+            response.keptLocation = kept.key;
             response.trashedCollection = folder.key;
           }
 """
@@ -570,10 +614,16 @@ def checks(client, root, checked):
     checked('native_Inbox_alerts_wrap_without_clipping_at_wide_and_narrow_widths')
     for width, paused in [(1040, False), (640, True)]:
         live.command(root, 'folder_deletion_layout', snapshot=result['alertFixture'], width=width, paused=paused)
-    checked('native_folder_deletion_decision_wraps_saved_alerts_and_respects_sync_pause')
-    trashed = live.command(root, 'trash_matched_collection')['trashedCollection']
-    assert client.get('collection', trashed)['deleted'], 'The worker could not read a saved collection in Zotero Trash'
-    checked('native_mirror_deletion_uses_collection_trash_and_keeps_papers_in_the_library')
+    checked('native_folder_deletion_confirms_and_visibly_queues_during_sync_at_both_widths')
+    trashed = live.command(root, 'trash_matched_collection')
+    assert client.get('collection', trashed['trashedCollection'])['deleted'], 'The worker could not read a saved collection in Zotero Trash'
+    checked('native_mirror_deletion_checks_contents_and_trashes_selected_items_while_preserving_shared_papers')
+    request = trashed['paperDecision']
+    client.review_action('trash', request)
+    remaining = client.get('item', request['parent'])
+    assert not remaining.get('deleted') and trashed['keptLocation'] in remaining['collections']
+    assert trashed['removedLocation'] not in remaining['collections'] and not client.get('item', request['attachment']).get('deleted')
+    checked('native_removing_a_selected_location_keeps_the_other_location_and_its_attachment')
     intake = root / 'ToSort'
     intake.mkdir()
     matched_pdf = intake / 'Synthetic ToSort match.pdf'
