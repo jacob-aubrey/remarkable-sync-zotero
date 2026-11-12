@@ -213,6 +213,11 @@ class ReviewStore(Ledger):
         with self.connect() as db:
             return self._offer(db, kind, identity, digest, payload)
 
+    def retire_conflict(self, identity):
+        with self.connect() as db:
+            db.execute("UPDATE review_queue SET status='superseded' WHERE kind='conflict' AND identity=? AND status='pending'",
+                       (identity,))
+
     @staticmethod
     def _offer(db, kind, identity, digest, payload):
         key = fingerprint([kind, identity])[:24]

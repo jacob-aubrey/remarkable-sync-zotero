@@ -286,7 +286,7 @@ def parse_index(data):
     lines = data.decode("utf-8").splitlines()
     if not lines or lines[0] not in {"3", "4"}:
         raise CloudError("Unsupported reMarkable cloud index format; saved files are retained.")
-    entries = []
+    entries, seen = [], set()
     for line in lines[1:]:
         if not line:
             continue
@@ -298,8 +298,9 @@ def parse_index(data):
         if (len(fields) != 5 or not re.fullmatch(r"[a-f0-9]{64}", fields[0])
                 or not fields[3].isdigit() or not fields[4].isdigit()):
             raise CloudError("Invalid reMarkable cloud index; saved files are retained.")
-        if any(entry["id"] == fields[2] for entry in entries):
+        if fields[2] in seen:
             raise CloudError("Duplicate item in cloud index")
+        seen.add(fields[2])
         entries.append({"hash": fields[0], "id": fields[2], "type": fields[1],
                         "subfiles": int(fields[3]), "size": int(fields[4])})
     return entries
@@ -523,12 +524,13 @@ class CloudClient:
         """List metadata for scope discovery; PDF contents are fetched separately."""
         self._progress('Reading reMarkable’s file list…')
         root = json.loads(self.get(SYNC + "/v4/root"))
+        previous = getattr(self, '_catalog_items', {})
         if getattr(self, '_catalog_hash', None) == root['hash']:
             self.check_stop()
             self._progress('reMarkable’s file list is up to date.')
-            return copy.deepcopy(self._catalog_items)
+            return copy.deepcopy(list(previous.values()))
         entries = parse_index(self.blob(root["hash"], "root.docSchema"))
-        items = []
+        items = {}
         reported = 0.0
         for number, entry in enumerate(entries, 1):
             self.check_stop()
@@ -536,18 +538,24 @@ class CloudClient:
             if number == 1 or number == len(entries) or now - reported >= 1:
                 self._progress(f'Reading reMarkable’s file list: {number} of {len(entries)}')
                 reported = now
-            uuid.UUID(entry["id"])
+            identity = entry['id']
+            uuid.UUID(identity)
+            cached = previous.get(identity)
+            if cached and cached.hash == entry['hash']:
+                items[identity] = cached
+                continue
             files = parse_index(self.blob(entry["hash"], entry["id"] + ".docSchema"))
             meta = next((f for f in files if f["id"] == entry["id"] + ".metadata"), None)
             if meta is None:
                 raise CloudError("Cloud item has no metadata; library listing is incomplete.")
             metadata = json.loads(self.blob(meta["hash"], meta["id"]))
-            items.append(CloudItem(entry["id"], entry["hash"], metadata.get("visibleName", entry["id"]),
-                                   metadata.get("parent", ""), metadata["type"],
-                                   bool(metadata.get("deleted", False)), files))
-        self._catalog_hash, self._catalog_items = root['hash'], copy.deepcopy(items)
+            items[identity] = CloudItem(identity, entry['hash'], metadata.get('visibleName', identity),
+                                       metadata.get('parent', ''), metadata['type'],
+                                       bool(metadata.get('deleted', False)), files)
+        self.check_stop()
+        self._catalog_hash, self._catalog_items = root['hash'], items
         self._progress(f'Finished reading reMarkable’s file list: {len(items)} files.')
-        return items
+        return copy.deepcopy(list(items.values()))
 
     def pdf_bundle(self, item):
         """Retain all raw document files, including the PDF and stroke layers."""

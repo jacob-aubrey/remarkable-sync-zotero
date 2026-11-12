@@ -261,6 +261,7 @@ class Worker:
             pause_marker.unlink()
         self._open_connection()
         self.zotero_factory, self.cloud_factory = zotero_factory, cloud_factory
+        self.cloud_client = None
         self.last = {'state': 'setup_required' if not self.config.get('tablet_root') else 'paused' if self.config.get('sync_paused') else 'ready',
                      'message': 'Sync paused. Click Sync now when ready.' if self.config.get('sync_paused') else ''}
         self.collections = []
@@ -325,7 +326,10 @@ class Worker:
         token = TokenVault(self.directory / "tablet-token.dpapi").load()
         if not token:
             raise PilotError("Pair reMarkable from Setup first.")
-        return CloudClient(token, cache_dir=self.directory / "blobs", stop=self.stop, progress=self.progress, trace=self.trace.event)
+        if self.cloud_client is None or self.cloud_client.device_token != token:
+            self.cloud_client = CloudClient(token, cache_dir=self.directory / "blobs", stop=self.stop,
+                                            progress=self.progress, trace=self.trace.event)
+        return self.cloud_client
 
     def runtime_health(self, optional=False):
         """Read-only packaged-runtime check; never connects or starts OCR."""

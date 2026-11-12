@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import uuid
 
 from note_organizer.remarkable_cloud import CloudConflict, CloudError
@@ -19,6 +19,25 @@ class ReviewedCloudChanges(unittest.TestCase):
         self.root = self.cloud.create_folder("Literature", "", str(uuid.uuid4()))
         self.folder = self.cloud.create_folder("Topic", self.root.id, str(uuid.uuid4()), self.root.id)
         self.paper = self.cloud.upload_pdf(pdf_bytes(), "Paper", self.folder.id, str(uuid.uuid4()), self.root.id)
+
+    def test_catalog_fetches_only_changed_entries_and_drops_removed_ids(self):
+        first = self.cloud.library()
+        next(item for item in first if item.id == self.root.id).name = 'Caller edit'
+        updated = self.cloud.update_item(self.paper.id, expected_hash=self.paper.hash, name='Tablet edit', scope_id=self.root.id)
+        with patch.object(self.cloud, 'blob', wraps=self.cloud.blob) as blob:
+            current = {item.id: item for item in self.cloud.library()}
+            self.assertEqual([call.args[1] for call in blob.call_args_list],
+                             ['root.docSchema', updated.id + '.docSchema', updated.id + '.metadata'])
+            self.assertEqual(current[self.root.id].name, self.root.name)
+            self.assertEqual(current[updated.id].name, updated.name)
+        from note_organizer.remarkable_cloud import parse_index, serialize_index
+        entries = parse_index(self.cloud.files[self.cloud.root_hash])
+        body = serialize_index([entry for entry in entries if entry['id'] != updated.id], root=True)
+        self.cloud.root_hash = hashlib.sha256(body).hexdigest()
+        self.cloud.files[self.cloud.root_hash] = body
+        with patch.object(self.cloud, 'blob', wraps=self.cloud.blob) as blob:
+            self.assertNotIn(updated.id, {item.id for item in self.cloud.library()})
+            self.assertEqual([call.args[1] for call in blob.call_args_list], ['root.docSchema'])
 
     def test_rename_move_retains_every_original_source_file(self):
         before = self.cloud.pdf_bundle(self.paper)

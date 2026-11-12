@@ -19,6 +19,13 @@ assert.doesNotMatch(ui.paperStatusMessage(), /need review|ready to file|cases to
 assert.equal(ui.queueRows('library').length, 1, 'Exact participant sets form one case');
 assert.deepEqual(Array.from(ui.queueRows('library')[0].caseRows), ['one', 'two']);
 assert.equal(ui.queueRows('sync-review')[0].id, 'conflict');
+assert.equal(ui.syncStatusMessage(), 'Sync needs review');
+const folderAttention = viewFixture().ui;
+folderAttention.latest.folder_issues = [{zotero: 'COLL2345'}];
+assert.ok(folderAttention.syncReviewAvailable(), 'A folder-only decision is reachable from the Zotero toolbar');
+folderAttention.latest.folder_issues = [];
+folderAttention.latest.status = {result: {review: [{collection: 'COLL2345', reason: 'Could not update the folder'}]}};
+assert.equal(folderAttention.syncStatusMessage(), 'Sync needs review');
 ui.selected = 'one'; ui.renderReview(node(), 'library');
 assert.ok(buttons.has('Check my changes'));
 assert.equal(fields.has('Proposed filename'), false, 'Library Issues never renders filing controls');

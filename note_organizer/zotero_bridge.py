@@ -75,7 +75,7 @@ def sync_collections(client, mappings, collections=None):
     return collections
 
 
-def sync_folder_scope(collections, catalog, zroot, croot, mappings, exclusions, confirmed=None):
+def sync_folder_scope(collections, catalog, zroot, croot, mappings, exclusions, confirmed=None, conflicts=()):
     from .zotero_connections import filtered_scope
     from .zotero_review import fingerprint
 
@@ -122,7 +122,7 @@ def sync_folder_scope(collections, catalog, zroot, croot, mappings, exclusions, 
 
     confirmed = confirmed or {}
     retired, _, _, _ = exclude_branches({key for key, ck in confirmed.items() if key != zroot and reverse.get(ck) == key})
-    blocked, tablet_blocked, desktop, tablet = exclude_branches(unavailable | retired)
+    blocked, tablet_blocked, desktop, tablet = exclude_branches(unavailable | retired | set(conflicts))
     issues = []
     for key, link in mappings.items():
         ck = link['cloud']
@@ -263,6 +263,66 @@ class Bridge:
         documents = self.state.read("documents", {})
         reports, reviews = [], []
 
+        pending_conflicts, applying_conflicts = set(), set()
+        if self.follow_changes and self.review_policy:
+            for row in self.review_policy.rows():
+                if row['kind'] == 'conflict':
+                    (applying_conflicts if row['status'] == 'applying' else pending_conflicts).add(row['identity'])
+        folder_conflicts = set()
+
+        def scan_folder_conflicts():
+            if not self.follow_changes:
+                return
+            from .zotero_review import fingerprint
+            reverse = {link['cloud']: key for key, link in maps.items()}
+            for key, link in maps.items():
+                item = cby.get(link['cloud'])
+                if link.get('root') or key not in zby or not item or key in folder_conflicts:
+                    continue
+                row = zby[key]
+                desktop = [row['name'], row.get('parentCollection')]
+                tablet = [item.name, reverse.get(item.parent)]
+                if tablet[1] is None or desktop[1] not in maps:
+                    continue  # Compare paths once discovery pairs the new parents.
+                name_conflict = (desktop[0] != link.get('desktop_name', link['name'])
+                                 and item.name != link.get('tablet_name', link['name']) and desktop[0] != item.name)
+                home_conflict = desktop[1] != link['zparent'] and item.parent != link['cparent'] and desktop[1] != tablet[1]
+                if key in applying_conflicts or name_conflict or home_conflict:
+                    folder_conflicts.add(key)
+                    if apply and self.review_policy and key not in applying_conflicts:
+                        conflict = {'type': 'folder', 'zotero': key, 'cloud': item.id, 'desktop': desktop, 'tablet': tablet,
+                                    'cloud_hash': item.hash, 'version': row.get('version', 0), 'routine': False}
+                        self.review_policy.offer('conflict', key, fingerprint(conflict), conflict)
+                    if not (apply and self.review_policy):
+                        reviews.append({'collection': key, 'title': row['name'],
+                                        'reason': 'This folder changed on both devices. Open Sync Conflicts to review it.'})
+
+        def hold_conflicted_folders():
+            nonlocal zscope, cscope, blocked, zby, cby
+            if not folder_conflicts:
+                return
+            saved_maps.update(maps)
+            collections_by_key = {row['key']: row for row in collections}
+            collections_by_key.update(zby)
+            tablet_by_id = {item.id: item for item in catalog if item.kind == 'CollectionType'}
+            tablet_by_id.update(cby)
+            zscope, cscope, blocked = sync_folder_scope(list(collections_by_key.values()), list(tablet_by_id.values()),
+                                                         self.zroot, self.croot, saved_maps, self.exclusions, confirmed,
+                                                         conflicts=folder_conflicts)
+            blocked = {'issues': initial_blocks['issues'], 'confirmed': confirmed,
+                       'zotero': sorted(set(initial_blocks['zotero']) | set(blocked['zotero'])),
+                       'tablet': sorted(set(initial_blocks['tablet']) | set(blocked['tablet']))}
+            for key in blocked['zotero']:
+                maps.pop(key, None)
+            zby = {key: row for key, (row, _) in zscope.items()}
+            cby = {key: row for key, (row, _) in cscope.items()}
+            if apply:
+                self.state.write('folder_blocks', blocked)
+
+        initial_blocks = blocked
+        scan_folder_conflicts()
+        hold_conflicted_folders()
+
         def save():
             if apply:
                 self.state.write("folders", {**saved_maps, **maps})
@@ -315,7 +375,7 @@ class Bridge:
                 zcounts = Counter(zby[k]["name"] for k in zs)
                 ccounts = Counter(cby[k].name for k in cs)
                 if any(n > 1 for n in zcounts.values()) or any(n > 1 for n in ccounts.values()):
-                    raise PilotError("Duplicate sibling folder names need an explicit mapping before sync.")
+                    raise PilotError(f'Duplicate sibling folder names under {zby[zp]["name"]} / {cby[cp].name}. Give the unlinked folders distinct names, then sync again.')
                 for zk in zs:
                     name = zby[zk]["name"]
                     match = next((k for k in cs if cby[k].name == name), None)
@@ -356,6 +416,10 @@ class Bridge:
             if not progressed:
                 raise PilotError("Some folders cannot be mapped inside the selected roots.")
 
+        previous_conflicts = set(folder_conflicts)
+        scan_folder_conflicts()
+        if folder_conflicts != previous_conflicts:
+            hold_conflicted_folders()
         reverse = {v["cloud"]: k for k, v in maps.items()}
         if len(reverse) != len(maps):
             raise PilotError("More than one collection maps to the same tablet folder.")
@@ -368,18 +432,12 @@ class Bridge:
                 before_tablet = [link.get("tablet_name", link["name"]), link["zparent"]]
                 desktop = [zby[zk]["name"], zby[zk].get("parentCollection")]
                 remote = [tablet.name, reverse.get(tablet.parent)]
+                if tablet.parent in blocked['tablet'] or desktop[1] in blocked['zotero']:
+                    continue
                 if not remote[1] or desktop[1] not in maps:
                     raise PilotError("A mapped folder moved outside the selected tree. Review its scope before syncing.")
                 zname, cname = desktop[0] != before_desktop[0], remote[0] != before_tablet[0]
                 zhome, chome = desktop[1] != before_desktop[1], remote[1] != before_tablet[1]
-                if ((zname and cname and desktop[0] != remote[0]) or (zhome and chome and desktop[1] != remote[1])):
-                    conflict = {"type": "folder", "zotero": zk, "cloud": tablet.id, "desktop": desktop, "tablet": remote,
-                                "cloud_hash": tablet.hash, "version": zby[zk].get("version", 0)}
-                    if self.review_policy:
-                        from .zotero_review import fingerprint
-                        self.review_policy.offer("conflict", zk, fingerprint(conflict), conflict)
-                    reviews.append({"collection": zk, "reason": "This folder changed on both devices. Choose a version in Notable review."})
-                    return {"mode": "apply" if apply else "plan", "actions": reports, "review": reviews, "folders": len(maps), "documents": len(documents)}
                 chosen_name = desktop[0] if zname else remote[0] if cname else None
                 chosen_parent = desktop[1] if zhome else remote[1] if chome else before_desktop[1]
                 desired_desktop = [chosen_name if chosen_name is not None else desktop[0], chosen_parent]
@@ -394,6 +452,8 @@ class Bridge:
                     link.update(name=desired_desktop[0], desktop_name=desired_desktop[0], tablet_name=desired_tablet[0],
                                 zparent=chosen_parent, cparent=maps[chosen_parent]["cloud"])
                     save()
+                    if zk in pending_conflicts:
+                        self.review_policy.retire_conflict(zk)
                 continue
             if (zby[zk].get("parentCollection") != link["zparent"] or cby[link["cloud"]].parent != link["cparent"]
                     or zby[zk]["name"] != link.get("desktop_name", link["name"]) or cby[link["cloud"]].name != link.get("tablet_name", link["name"])):
@@ -403,7 +463,8 @@ class Bridge:
         # own immutable original. Returned marked attachments never re-enter this
         # upload path. Multiple collections need an explicit primary location.
         references = {}
-        suspended = (self.review_policy.suspended_documents() if self.review_policy else set()) | self.exclusions['documents']
+        suspended = ((self.review_policy.suspended_documents() if self.review_policy else set())
+                     | self.exclusions['documents'] | (applying_conflicts & set(documents)))
         suspended.update(folder_blocked_papers(documents, catalog, blocked))
         if self.follow_changes:
             from pathlib import Path
@@ -416,6 +477,14 @@ class Bridge:
                     item = by_id.get(identity)
                     parent = self.zot.get("item", row["parent"])
                     if not item or item.deleted or item.parent not in reverse or not parent or parent.get("deleted"):
+                        continue
+                    if row.get('desktop_move'):
+                        if not apply:
+                            suspended.add(identity)
+                            continue
+                        changed = self._resume_desktop_move(row, parent, item, reverse, save)
+                        catalog[catalog.index(item)] = changed
+                        reports.append({'action': 'paper_location_updated', 'cloud': identity})
                         continue
                     homes = [k for k in parent.get("collections", []) if k in maps]
                     home = row["collection"] if row["collection"] in homes else homes[0] if len(homes) == 1 else None
@@ -455,24 +524,41 @@ class Bridge:
                     remote = [item.name, reverse[item.parent]]
                     old_desktop = [row["desktop_name"], row["collection"]]
                     old_remote = [row["name"], row["collection"]]
-                    zdiff, cdiff = desktop != old_desktop, remote != old_remote
-                    if zdiff and cdiff and desktop != remote:
+                    zname, cname = desktop[0] != old_desktop[0], remote[0] != old_remote[0]
+                    zhome, chome = desktop[1] != old_desktop[1], remote[1] != old_remote[1]
+                    if ((zname and cname and desktop[0] != remote[0]) or (zhome and chome and desktop[1] != remote[1])):
                         conflict = {"type": "paper", "cloud": identity, "zotero": parent["key"], "desktop": desktop, "tablet": remote,
                                     "cloud_hash": item.hash, "version": parent.get("version", 0), "file_md5": hashlib.md5(path.read_bytes()).hexdigest()}
-                        self.review_policy.offer("conflict", identity, fingerprint(conflict), conflict)
+                        if apply and self.review_policy:
+                            self.review_policy.offer('conflict', identity, fingerprint(conflict), conflict)
                         suspended.add(identity)
                         reviews.append({"cloud": identity, "reason": "This paper was renamed or moved on both devices. Choose a version in review."})
                         continue
-                    if (zdiff or cdiff) and apply:
-                        chosen = desktop if zdiff else remote
-                        if zdiff and desktop != remote:
-                            changed = self.cloud.update_item(identity, expected_hash=item.hash, name=chosen[0], parent=maps[chosen[1]]["cloud"], scope_id=self.croot)
+                    if (zname or cname or zhome or chome) and apply:
+                        chosen_home = home if zhome else remote[1]
+                        desktop_name = remote[0] if cname else desktop[0]
+                        tablet_name = desktop[0] if zname else remote[0]
+                        tablet_parent = maps[chosen_home]['cloud']
+                        if [desktop_name, chosen_home] != desktop:
+                            plan = self.desktop_document_plan(row, desktop_name if desktop_name != desktop[0] else None,
+                                                              chosen_home, expected_parent=parent)
+                            row['desktop_move'] = {'name': desktop_name, 'home': chosen_home, 'plan': plan,
+                                                   'before_tablet': [item.name, item.parent],
+                                                   'after_tablet': [tablet_name, tablet_parent]}
+                            save()
+                            changed = self._resume_desktop_move(row, parent, item, reverse, save)
                             catalog[catalog.index(item)] = changed
-                        elif cdiff and desktop != remote:
-                            self.set_desktop_document(row, chosen[0], chosen[1], maps)
-                        row.update(name=chosen[0], desktop_name=chosen[0], collection=chosen[1], tablet_parent=maps[chosen[1]]["cloud"])
+                        else:
+                            if [tablet_name, tablet_parent] != [item.name, item.parent]:
+                                changed = self.cloud.update_item(identity, expected_hash=item.hash,
+                                                                 name=tablet_name if tablet_name != item.name else None,
+                                                                 parent=tablet_parent, scope_id=self.croot)
+                                catalog[catalog.index(item)] = changed
+                            row.update(name=tablet_name, desktop_name=desktop_name, collection=chosen_home, tablet_parent=tablet_parent)
                         reports.append({"action": "paper_location_updated", "cloud": identity})
                     save()
+                    if apply and identity in pending_conflicts:
+                        self.review_policy.retire_conflict(identity)
         self.progress('Checking Zotero papers in connected folders…')
         for zk in zby:
             if not apply and zk not in zscope:
@@ -588,6 +674,10 @@ class Bridge:
                     continue
                 if ck not in cloud_pdfs and apply:
                     self.progress(f'Sending approved paper {number} of {len(documents)} to reMarkable…')
+                    source_path = self.zot.file_path(row['source_key'])
+                    with source_path.open('rb') as stream:
+                        if hashlib.file_digest(stream, 'sha256').hexdigest() != row['baseline']:
+                            raise PilotError('The Zotero PDF changed after approval. The saved original was retained and was not sent.')
                     original = self.state.directory / "originals" / (row["baseline"] + ".pdf")
                     data = original.read_bytes()
                     if _sha(data) != row["baseline"]:
@@ -793,19 +883,23 @@ class Bridge:
         save()
         return item
 
-    def desktop_document_plan(self, row, name, home):
+    def desktop_document_plan(self, row, name, home, *, expected_parent=None):
         """Validate every filename and source before changing a membership."""
         from .sorting.core_logic import validate_document_filename
         parent = self.zot.get("item", row["parent"])
         if not parent or parent.get("deleted"):
             raise PilotError("The Zotero reference was trashed. Its tablet copy was retained.")
+        if expected_parent is not None and parent != expected_parent:
+            raise PilotError('The Zotero reference changed during sync. Sync again to check its current location.')
         siblings = self.state.read("documents", {}).values()
         keep_previous = any(other != row and other.get("parent") == row["parent"]
                             and other.get("collection") == row["collection"] for other in siblings)
         removed = set() if keep_previous else {row["collection"]}
-        parent["collections"] = sorted((set(parent.get("collections", [])) - removed) | {home})
+        before_collections = parent.get('collections', [])
+        parent['collections'] = sorted((set(before_collections) - removed) | {home})
         files = []
-        for key in sorted({row.get('source_key'), row.get('view_key')} - {None, ''}):
+        keys = {row.get('source_key'), row.get('view_key')} - {None, ''} if name is not None else set()
+        for key in sorted(keys):
             path = self.zot.file_path(key)
             filename = validate_document_filename(name + path.suffix, path.suffix)
             attachment = self.zot.get('item', key)
@@ -814,13 +908,49 @@ class Bridge:
             files.append({'key': key, 'filename': filename,
                           'before_filename': attachment.get('filename') or path.name,
                           'md5': hashlib.md5(path.read_bytes()).hexdigest()})
-        return {'parent': parent, 'files': files}
+        return {'parent': parent, 'before_collections': before_collections, 'files': files}
 
-    def set_desktop_document(self, row, name, home, maps, *, plan=None):
+    def _resume_desktop_move(self, row, parent, item, reverse, save):
+        change = row['desktop_move']
+        plan = change['plan']
+        collections = set(parent.get('collections', []))
+        target = set(plan['parent']['collections'])
+        position = [item.name, item.parent]
+        tablet_name, tablet_parent = change['after_tablet']
+        if (position not in (change['before_tablet'], change['after_tablet'])
+                or reverse.get(tablet_parent) != change['home']):
+            raise PilotError('The reMarkable name or folder changed during a sync update. Restore the name and folder from that update, then sync again.')
+        if collections not in (set(plan['before_collections']), target):
+            raise PilotError('Zotero collection memberships changed during a sync update. Restore the previous memberships to resume.')
+        for entry in plan['files']:
+            attachment = self.zot.get('item', entry['key'])
+            path = self.zot.file_path(entry['key'])
+            if (not attachment or attachment.get('deleted') or attachment.get('parentItem') != row['parent']
+                    or (attachment.get('filename') or path.name) not in {entry['before_filename'], entry['filename']}):
+                raise PilotError('A Zotero attachment changed during a sync update. Restore its previous filename to resume.')
+            with path.open('rb') as stream:
+                if hashlib.file_digest(stream, 'md5').hexdigest() != entry['md5']:
+                    raise PilotError('A Zotero PDF changed during a sync update. Restore the previous PDF to resume.')
+        if self._cancelled():
+            raise InterruptedError('Sync stopped')
+        if position != change['after_tablet']:
+            item = self.cloud.update_item(item.id, expected_hash=item.hash, name=tablet_name if tablet_name != item.name else None,
+                                          parent=tablet_parent,
+                                          scope_id=self.croot)
+        self.set_desktop_document(row, change['name'], change['home'], None,
+                                  plan={**plan, 'parent': {**parent, 'collections': plan['parent']['collections']}},
+                                  update_parent=collections != target)
+        row.update(name=tablet_name, desktop_name=change['name'], collection=change['home'], tablet_parent=tablet_parent)
+        row.pop('desktop_move')
+        save()
+        return item
+
+    def set_desktop_document(self, row, name, home, maps, *, plan=None, update_parent=True):
         """Move only the tablet-home membership; keep all research categories."""
         plan = self.desktop_document_plan(row, name, home) if plan is None else plan
         self.zot.authorize()
-        self.zot.update(plan['parent'])
+        if update_parent:
+            self.zot.update(plan['parent'])
         for entry in plan['files']:
             attachment = self.zot.get('item', entry['key'])
             path = self.zot.file_path(entry['key'])
@@ -835,7 +965,8 @@ class Bridge:
                     continue  # A prior interrupted step already renamed this file.
                 # Finish updating a filename-like display label after a lost
                 # rename response, without replacing a custom attachment title.
-            self.zot.review_action('rename', {key: entry[key] for key in ('key', 'filename', 'md5')})
+            self.zot.review_action('rename', {**{key: entry[key] for key in ('key', 'filename', 'md5', 'before_filename')},
+                                              'expected_parent': row['parent']})
 
     def _tags(self, parent_key, bundle, cloud_id, row, save):
         from .zotero_tags import reconcile

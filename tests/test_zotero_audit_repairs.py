@@ -15,6 +15,7 @@ from unittest.mock import patch
 import uuid
 
 from note_organizer.zotero_pilot import PilotError
+from note_organizer.zotero_bridge import Bridge
 from note_organizer.zotero_worker import OperationTrace, Worker, _periodic_stack_diagnostics, main
 from note_organizer.zotero_review import fingerprint
 from tests import test_zotero_worker as worker_fixtures
@@ -111,6 +112,70 @@ class ConflictRecoveryTests(unittest.TestCase):
             self.worker.resolve_conflict(identity, fingerprint(payload), 'tablet')
         self.assertEqual(renamed, ['SOURCE23', 'VIEWKEY2'])
         self.assertEqual(self.worker.review.row(identity)['status'], 'approved')
+
+
+class AutomaticPaperMoveTests(unittest.TestCase):
+    setUp = worker_fixtures.WorkerTests.setUp
+    add_pdf = worker_fixtures.WorkerTests.add_pdf
+
+    def linked_paper(self):
+        source = self.add_pdf()
+        self.zot.items['VIEWKEY2'] = {**self.zot.items['SOURCE23'], 'key': 'VIEWKEY2', 'note': 'Notable pilot: synthetic'}
+        self.zot.file_path('VIEWKEY2').write_bytes(source.read_bytes())
+        other = self.cloud.create_folder('Destination', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        item = self.cloud.upload_pdf(source.read_bytes(), 'Tablet original', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        self.zot.collection_records['CHILD234'] = {'key': 'CHILD234', 'name': other.name, 'parentCollection': 'ROOT2345'}
+        self.worker.state.write('folders', {'ROOT2345': {'cloud': self.croot.id, 'root': True},
+            'CHILD234': {'cloud': other.id, 'name': other.name, 'zparent': 'ROOT2345', 'cparent': self.croot.id}})
+        self.worker.state.write('documents', {item.id: {'parent': 'PARENT23', 'collection': 'ROOT2345',
+            'source_key': 'SOURCE23', 'view_key': 'VIEWKEY2', 'name': item.name, 'desktop_name': 'VIEWKEY2',
+            'origin': 'zotero', 'uploaded': True, 'baseline': hashlib.sha256(source.read_bytes()).hexdigest()}})
+        bridge = Bridge(self.zot, self.cloud, self.worker.state, 'ROOT2345', self.croot.id, follow_changes=True)
+        return bridge, item, other
+
+    def test_interrupted_tablet_rename_and_move_resumes_without_a_false_conflict(self):
+        bridge, item, other = self.linked_paper()
+        self.cloud.update_item(item.id, expected_hash=item.hash, name='Tablet edit', parent=other.id, scope_id=self.croot.id)
+        rename = self.zot.review_action
+        renamed = []
+
+        def commit_source_first(action, data):
+            result = rename(action, data)
+            if action == 'rename':
+                renamed.append(data['key'])
+                if data['key'] == 'SOURCE23':
+                    raise OSError('Synthetic interrupted Zotero rename')
+            return result
+
+        # Stop each run before the unrelated PDF rendering path so the fixture
+        # can model an already-linked original and view with independent names.
+        with patch.object(self.zot, 'review_action', side_effect=commit_source_first):
+            interrupted = bridge.run(apply=True)
+        self.assertTrue(any('Synthetic interrupted Zotero rename' in row['reason'] for row in interrupted['review']))
+        link = self.worker.state.read('documents')[item.id]
+        self.assertIn('desktop_move', link)
+        self.assertEqual(self.zot.items['PARENT23']['collections'], ['CHILD234'])
+        with patch.object(self.cloud, 'pdf_bundle', side_effect=InterruptedError), patch.object(self.zot, 'update', side_effect=AssertionError('Membership already moved')):
+            with self.assertRaises(InterruptedError):
+                bridge.run(apply=True)
+        link = self.worker.state.read('documents')[item.id]
+        self.assertNotIn('desktop_move', link)
+        self.assertEqual(link['collection'], 'CHILD234')
+        self.assertEqual(self.zot.items['VIEWKEY2']['filename'], 'Tablet edit.pdf')
+        self.assertEqual(renamed, ['SOURCE23'])
+
+    def test_tablet_rename_and_zotero_move_merge_independent_fields(self):
+        bridge, item, other = self.linked_paper()
+        self.zot.items['PARENT23']['collections'] = ['CHILD234']
+        self.cloud.update_item(item.id, expected_hash=item.hash, name='Tablet edit', scope_id=self.croot.id)
+        with patch.object(self.cloud, 'pdf_bundle', side_effect=InterruptedError):
+            with self.assertRaises(InterruptedError):
+                bridge.run(apply=True)
+        current = next(row for row in self.cloud.library() if row.id == item.id)
+        self.assertEqual((current.name, current.parent), ('Tablet edit', other.id))
+        self.assertEqual(self.zot.items['SOURCE23']['filename'], 'Tablet edit.pdf')
+        self.assertEqual(self.zot.items['VIEWKEY2']['filename'], 'Tablet edit.pdf')
+        self.assertEqual(self.worker.state.read('documents')[item.id]['collection'], 'CHILD234')
 
 
 class FilingRecoveryTests(unittest.TestCase):

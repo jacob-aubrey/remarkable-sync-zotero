@@ -178,8 +178,7 @@ var NotableUI = {
     button.style.cssText = 'margin-inline: 8px; padding-inline: 8px; list-style-image: url("chrome://notable/content/icons/tablet.svg");';
     button.setAttribute('tooltiptext', 'Open reMarkable Sync — folders, review, and settings');
     button.addEventListener('command', () => {
-      if ((!this.view || this.view.closed) && (this.queueRows('sync-review').length
-        || this.latest?.deletions?.length || this.latest?.local_deletions?.length)) this.requestedTab = 'sync-review';
+      if ((!this.view || this.view.closed) && this.syncReviewAvailable()) this.requestedTab = 'sync-review';
       this.open();
     });
     toolbar.appendChild(button); this.windows.add(window);
@@ -586,9 +585,10 @@ var NotableUI = {
       : config.sync_paused ? 'Sync paused'
       : this.syncFailure && config.automatic ? 'Sync waiting to retry'
       : this.syncFailure || this.latest?.status?.state === 'needs_attention' ? 'Sync needs attention'
+      : this.syncReviewAvailable() ? 'Sync needs review'
       : config.automatic ? 'Automatic sync on' : 'Manual sync';
     const last = this.latest?.last_sync_at;
-    return last ? `${mode} · Last successful sync ${new Date(last * 1000).toLocaleString()}` : mode;
+    return last ? `${mode} · Last sync check ${new Date(last * 1000).toLocaleString()}` : mode;
   },
   statusMessage() {
     if (!this.latest?.config?.tablet_root && this.latest?.status?.state === 'setup_required') {
@@ -604,11 +604,10 @@ var NotableUI = {
     return this.latest?.status?.message || 'Ready';
   },
   badge() {
-    const count = (this.latest?.reviews || []).filter(row => !row.payload.routine).length
+    const count = (this.latest?.reviews || []).filter(row => row.kind === 'conflict' || !row.payload.routine).length
       + (this.latest?.bulk?.rows || []).filter(row => row.issues.length && row.status !== 'dismissed').length
-      + (this.latest?.deletions?.length || 0) + (this.latest?.local_deletions?.length || 0);
-    const attention = this.syncFailure || this.latest?.status?.state === 'needs_attention' || this.latest?.folder_issues?.length
-      || (this.latest?.status?.result?.review || []).some(issue => !this.isQueueMessage(issue));
+      + (this.latest ? this.syncDecisionCount() : 0);
+    const attention = this.syncFailure || this.latest?.status?.state === 'needs_attention' || this.syncWarnings().length;
     for (const window of this.windows) {
       const button = window.document.getElementById('notable-open');
       const suffix = count ? ` (${count})` : attention ? ' (!)' : '';
@@ -2837,6 +2836,16 @@ var NotableUI = {
     return (this.latest.deletions || []).length + (this.latest.local_deletions || []).length + (this.latest.folder_issues || []).length
       + this.syncDecisions.filter(job => job.connection !== this.filingConnection() || !this.syncDecisionEvidence(job.method, job.params)).length;
   },
+  syncReviewAvailable() {
+    return this.latest && (this.queueRows('sync-review').length || this.syncDecisionCount() || this.syncWarnings().length);
+  },
+  syncWarnings() {
+    const queued = new Set((this.latest?.reviews || []).map(row => row.identity));
+    const pendingTrash = new Set((this.latest?.deletions || []).map(row => row.payload.cloud));
+    return (this.latest?.status?.result?.review || []).filter(issue => !this.isQueueMessage(issue)
+      && !queued.has(issue.attachment) && !queued.has(issue.cloud) && !queued.has(issue.collection)
+      && !pendingTrash.has(issue.cloud));
+  },
   decisionLocations(parent, locations, {folder = false} = {}) {
     const boxes = [];
     const list = this.el('fieldset', '', parent, {class: 'decision-locations'});
@@ -3374,7 +3383,6 @@ var NotableUI = {
       browse.dataset.browse = 'true';
     }
     if (!queue || queue === 'sync-review') {
-    const queued = new Set((this.latest.reviews || []).map(r => r.identity));
     const shown = new Set();
     if (this.syncDecisionReadError) this.el('p', this.syncDecisionReadError, content, {role: 'alert', class: 'message error'});
     this.renderFolderIssues(content, shown);
@@ -3425,9 +3433,7 @@ var NotableUI = {
       this.el('h2', job.title, card);
       this.renderQueuedSyncDecision(card, job);
     }
-    const pendingTrash = new Set((this.latest.deletions || []).map(r => r.payload.cloud));
-    const warnings = (this.latest.status?.result?.review || []).filter(issue =>
-      !this.isQueueMessage(issue) && !queued.has(issue.attachment) && !queued.has(issue.cloud) && !pendingTrash.has(issue.cloud));
+    const warnings = this.syncWarnings();
     if (warnings.length) {
       const group = this.el('details', '', content, {class: 'card decision sync-warnings'});
       group.open = this.syncWarningsOpen !== false;
@@ -3439,6 +3445,7 @@ var NotableUI = {
         this.el('h3', issue.title || link?.name || (issue.attachment ? 'Zotero attachment ' + issue.attachment : 'Sync warning'), card);
         this.el('p', issue.reason, card);
         if (issue.attachment) this.reviewNavigationButton('Show affected attachment in Zotero', card, 'attachment', [issue.attachment]);
+        if (issue.collection) this.reviewNavigationButton('Show Zotero collection', card, 'collection', [issue.collection]);
         if (issue.parent) this.reviewNavigationButton('Open affected reference in Zotero', card, 'references', [issue.parent]);
         if (link?.parent && link.parent !== issue.parent) {
           this.el('p', 'Already linked to reMarkable · ' + (link.name || link.parent), card, {class: 'hint'});

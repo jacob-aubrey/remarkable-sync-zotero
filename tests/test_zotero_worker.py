@@ -373,16 +373,45 @@ class WorkerTests(unittest.TestCase):
 
     def test_concurrent_folder_edits_require_explicit_choice(self):
         child = self.cloud.create_folder('Topic', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        nested = self.cloud.create_folder('Nested', child.id, str(uuid.uuid4()), self.croot.id)
+        other = self.cloud.create_folder('Other', self.croot.id, str(uuid.uuid4()), self.croot.id)
         self.worker.sync()
-        key = next(k for k, r in self.worker.state.read('folders').items() if r['cloud'] == child.id)
+        keys = {r['cloud']: k for k, r in self.worker.state.read('folders').items()}
+        key = keys[child.id]
         self.zot.collection_records[key]['name'] = 'Desktop choice'
         self.cloud.update_item(child.id, expected_hash=child.hash, name='Tablet choice', scope_id=self.croot.id)
-        self.worker.sync()
+        self.cloud.update_item(other.id, expected_hash=other.hash, name='Unrelated change', scope_id=self.croot.id)
+        new_child = self.cloud.create_folder('Added in conflict', child.id, str(uuid.uuid4()), self.croot.id)
+        status = self.worker.sync()
+        self.assertEqual(status['blocked_collections'], sorted((key, keys[nested.id])))
+        self.assertEqual(self.zot.collection_records[keys[other.id]]['name'], 'Unrelated change')
+        self.assertNotIn(new_child.id, {link['cloud'] for link in status['mappings'].values()})
         review = next(r for r in self.worker.review.rows() if r['kind'] == 'conflict')
         self.assertEqual(next(i for i in self.cloud.library() if i.id == child.id).name, 'Tablet choice')
         self.worker.resolve_conflict(review['id'], review['digest'], 'tablet')
-        self.worker.sync()
+        status = self.worker.sync()
         self.assertEqual(self.zot.collection_records[key]['name'], 'Tablet choice')
+        self.assertFalse(status['blocked_collections'])
+        self.assertIn(new_child.id, {link['cloud'] for link in status['mappings'].values()})
+
+    def test_folder_conflict_can_be_resolved_by_matching_names_in_both_apps(self):
+        child = self.cloud.create_folder('Topic', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        self.worker.sync()
+        key = next(k for k, link in self.worker.state.read('folders').items() if link['cloud'] == child.id)
+        self.zot.collection_records[key]['name'] = 'Zotero name'
+        self.cloud.update_item(child.id, expected_hash=child.hash, name='Tablet name', scope_id=self.croot.id)
+        self.assertTrue(self.worker.sync()['blocked_collections'])
+        self.zot.collection_records[key]['name'] = 'Tablet name'
+        status = self.worker.sync()
+        self.assertFalse(status['blocked_collections'])
+        self.assertFalse(status['reviews'])
+
+    def test_worker_keeps_cloud_catalog_until_pairing_changes(self):
+        self.worker.cloud_factory = None
+        with patch('note_organizer.zotero_worker.TokenVault.load', side_effect=['first', 'first', 'second']):
+            first = self.worker.cloud()
+            self.assertIs(self.worker.cloud(), first)
+            self.assertIsNot(self.worker.cloud(), first)
 
     def test_templates_are_validated_before_saving(self):
         with self.assertRaises(ValueError):

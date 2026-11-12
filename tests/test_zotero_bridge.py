@@ -243,6 +243,25 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(result["review"])
         self.assertEqual(self.cloud.uploads, 1)
 
+    def test_changed_desktop_original_blocks_an_interrupted_upload_that_did_not_commit(self):
+        self.add_desktop()
+        upload = self.cloud.upload_pdf
+        with patch.object(self.cloud, 'upload_pdf', side_effect=OSError('Disconnected before commit')):
+            self.assertTrue(self.engine.run(apply=True)['review'])
+        identity, link = next(iter(self.state.read('documents').items()))
+        original = self.zot.file_path('SOURCE23')
+        before = original.read_bytes()
+        original.write_bytes(b'new local revision')
+        with patch.object(self.cloud, 'upload_pdf', wraps=upload) as retry:
+            result = self.engine.run(apply=True)
+            retry.assert_not_called()
+        self.assertTrue(any('changed after approval' in row['reason'] for row in result['review']))
+        self.assertEqual((self.state.directory / 'originals' / (link['baseline'] + '.pdf')).read_bytes(), before)
+        original.write_bytes(before)
+        self.engine.run(apply=True)
+        self.assertIn(identity, self.cloud.records)
+        self.assertEqual(self.cloud.uploads, 1)
+
     def test_different_tablet_edition_cannot_replace_current_annotated_pdf(self):
         item, bundle = self.tablet()
         self.engine.run(apply=True)
