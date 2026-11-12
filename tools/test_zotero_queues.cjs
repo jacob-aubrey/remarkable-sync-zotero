@@ -131,7 +131,7 @@ const reference = (id, payload = {}) => ({...paper(id, 'reference'), payload: {t
   f.ui.selected = one.id; f.ui.render = () => {};
   f.ui.reviewDrafts.set(one.id, {digest: one.digest, review_token: one.payload.review_token, filename: 'Retained before waiting.pdf'});
   const blockedView = f.node(); f.ui.renderReview(blockedView, 'inbox');
-  assert.match(nodeText(blockedView), /0 ready to file · 2 waiting on Library Issues/);
+  assert.match(nodeText(blockedView), /Ready to file \(0\).*Waiting on Library Issues \(2\)/);
   assert.match(nodeText(blockedView), /No papers ready to file/);
   assert.equal(f.fields.size, 0, 'An all-blocked Inbox must not render a filing form');
   assert.equal([...f.buttons.keys()].some(label => /Approve|Add to Zotero|Resume saved filing/.test(label)), false);
@@ -140,7 +140,7 @@ const reference = (id, payload = {}) => ({...paper(id, 'reference'), payload: {t
   assert.equal(f.ui.tab, 'library'); assert.equal(f.ui.selected, one.id);
   f.ui.latest.reviews[0].payload.findings = [];
   f.ui.tab = 'inbox'; const readyView = f.node(); f.ui.renderReview(readyView, 'inbox');
-  assert.match(nodeText(readyView), /1 ready to file · 1 waiting on Library Issues/);
+  assert.match(nodeText(readyView), /Ready to file \(1\).*Waiting on Library Issues \(1\)/);
   assert.equal(f.fields.get('Proposed filename').value, 'Retained before waiting.pdf', 'A resolved paper returns to ready with its earlier draft');
 }
 

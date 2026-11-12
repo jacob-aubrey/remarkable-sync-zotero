@@ -220,9 +220,17 @@ class ReviewStore(Ledger):
                    (key, kind, identity, digest, encoded))
         return key
 
-    def rows(self, *, pending_only=True):
+    def rows(self, *, pending_only=True, inbox_order=False):
+        columns = 'r.*'
+        source = 'review_queue AS r'
+        if inbox_order:
+            # Keep the paper's arrival order when its reference gains a PDF.
+            columns += ', MIN(r.rowid, COALESCE(ref.rowid, r.rowid)) AS inbox_order'
+            source += (" LEFT JOIN review_queue AS ref ON r.kind='zotero' AND ref.kind='reference'"
+                       " AND ref.identity=json_extract(r.payload, '$.parent')")
+        pending = " WHERE r.status IN ('pending','applying')" if pending_only else ''
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM review_queue" + (" WHERE status IN ('pending','applying')" if pending_only else "") + " ORDER BY rowid").fetchall()
+            rows = db.execute(f'SELECT {columns} FROM {source}{pending} ORDER BY r.rowid').fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"]), "approval": json.loads(row["approval"])} for row in rows]
 
     def reopen(self, identity, expected_digest, payload, *, applying=False):

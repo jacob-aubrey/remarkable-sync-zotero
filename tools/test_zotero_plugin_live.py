@@ -446,7 +446,8 @@ async function startup({rootURI}) {
               ensure(ui.queueRows('inbox').length === 1 && ui.queueRows('inbox-waiting').length === 35, 'Ready and waiting Inbox papers are mixed');
               ensure(doc.querySelectorAll('.review-layout > aside > button').length === 1, 'Waiting papers appear in the ready list');
               ensure(doc.querySelector('.inbox-waiting')?.open === false, 'Waiting papers should start collapsed');
-              ensure(doc.querySelector('[data-queue-summary]').textContent === '1 ready to file · 35 waiting on Library Issues', 'Inbox counts are not scoped');
+              ensure(doc.querySelector('[data-inbox-filter="ready"]').textContent === 'Ready to file (1)'
+                && doc.querySelector('[data-inbox-filter="waiting"]').textContent === 'Waiting on Library Issues (35)', 'Inbox counts are not scoped');
               ensure(!doc.getElementById('notable-paper-status').textContent.includes('need review'), 'Global review counter still appears');
               const filename = [...doc.querySelectorAll('label')].find(label => label.firstElementChild?.textContent === 'Proposed filename').querySelector('input');
               filename.value = 'My retained filename.pdf'; filename.dispatchEvent(new ui.view.Event('input'));
@@ -585,6 +586,7 @@ async function startup({rootURI}) {
               root: doc.documentElement.localName,
               linkBadges: [...doc.querySelectorAll('.review-link-badge')].filter(node => node.getClientRects().length).map(node => node.textContent),
               queueSummary: doc.querySelector('[data-queue-summary]')?.textContent,
+              inboxFilters: [...doc.querySelectorAll('[data-inbox-filter]')].map(node => node.textContent),
               waitingOpen: doc.querySelector('.inbox-waiting')?.open || false,
               waitingCount: doc.querySelectorAll('.waiting-papers > li').length,
               readyListCount: doc.querySelectorAll('.review-layout > aside > button').length,
@@ -1692,7 +1694,7 @@ def review_guidance_checks(root, checked):
                 assert 'Proposed filename' in layout['fieldLabels'] and 'Destination folders' in layout['fieldLabels'], layout
                 assert 'Suggest filename' in buttons and 'Update filename preview' not in buttons, layout
             elif kind == 'waiting':
-                assert layout['queueSummary'] == '0 ready to file · 1 waiting on Library Issues', layout
+                assert 'Ready to file (0)' in layout['inboxFilters'] and 'Waiting on Library Issues (1)' in layout['inboxFilters'], layout
                 assert layout['waitingOpen'] is False and layout['waitingCount'] == 1 and layout['readyListCount'] == 0, layout
                 assert 'Open Library Issues' in buttons and not any('Approve' in label for label in buttons), layout
                 assert 'need review' not in layout['paperStatus'], layout

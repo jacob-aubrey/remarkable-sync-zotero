@@ -33,6 +33,29 @@ class LocalIntakeTests(unittest.TestCase):
             self.worker.scan_inbox(discover=True)
             offer.assert_called_once()
 
+    def test_pdf_keeps_reference_inbox_order_through_preparation(self):
+        self.zot.items['PARENT23'] = {'key': 'PARENT23', 'itemType': 'journalArticle',
+            'title': 'Shared on phone', 'collections': []}
+        original = self.worker.scan_inbox(discover=True)['reviews'][0]
+        self.zot.items['OTHER234'] = {'key': 'OTHER234', 'itemType': 'journalArticle',
+            'title': 'Arrived later', 'collections': []}
+        self.worker.scan_inbox(discover=True)
+        self.add_pdf()
+        proposal = {'title': 'Downloaded paper', 'details': {}, 'parent': 'PARENT23'}
+        with patch.object(self.worker, '_proposal', return_value=proposal):
+            preparing = self.worker.scan_inbox(discover=True)
+            self.assertTrue(preparing['native_files_settling'])
+            row = next(row for row in preparing['reviews'] if row['id'] == original['id'])
+            self.assertEqual(row['payload']['pdf_state'], 'preparing')
+            self.assertEqual(row['payload']['preparing_attachment'], 'SOURCE23')
+            with patch('note_organizer.zotero_review.time.time', return_value=9999999999):
+                settled = self.worker.scan_inbox(discover=True)['reviews']
+        self.assertNotIn(original['id'], {row['id'] for row in settled})
+        filing = next(row for row in settled if row['identity'] == 'SOURCE23')
+        other = next(row for row in settled if row['identity'] == 'OTHER234')
+        self.assertEqual(filing['inbox_order'], original['inbox_order'])
+        self.assertLess(filing['inbox_order'], other['inbox_order'])
+
     def test_deleted_reference_is_retired_and_restore_returns_it(self):
         parent = {'key': 'PARENT23', 'itemType': 'webpage', 'title': 'Saved link', 'collections': []}
         self.zot.items['PARENT23'] = parent
@@ -131,7 +154,8 @@ class LocalIntakeTests(unittest.TestCase):
         self.assertEqual(review['payload']['guidance_state'], 'repair')
         self.worker.state.write('documents', {'tablet': {'parent': 'PARENT23', 'view_key': 'SOURCE23'}})
         self.assertEqual(self.worker.scan_inbox(discover=True)['reviews'], [])
-        self.assertEqual(self.worker.review.row(identity), {**review, 'status': 'resolved'})
+        resolved = {key: value for key, value in review.items() if key != 'inbox_order'}
+        self.assertEqual(self.worker.review.row(identity), {**resolved, 'status': 'resolved'})
         self.assertEqual(worker_tests.file_sha(path), digest)
 
     def test_archived_link_parent_without_a_local_pdf_needs_no_reference_placeholder(self):

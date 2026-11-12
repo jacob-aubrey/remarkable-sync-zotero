@@ -284,7 +284,7 @@ class Worker:
     def status(self):
         from .sorting.core_logic import DOCUMENT_TYPE_LABELS
         config = {k: v for k, v in self.config.items() if k != "server_id"}
-        pending_reviews = self.review.rows()
+        pending_reviews = self.review.rows(inbox_order=True)
         paper_reviews = [row for row in pending_reviews if row['status'] == 'pending' and row['kind'] in PAPER_REVIEW_KINDS]
         review_guidance = {'version': REVIEW_GUIDANCE_VERSION,
             'needs_upgrade': [row['id'] for row in paper_reviews if not review_guidance_ready(row['payload'])],
@@ -1028,6 +1028,7 @@ class Worker:
                            for field in ('source_key', 'view_key')} | excluded['sources']
         files_settling = False
         source_checks = {}
+        preparing = {}
         for number, attachment in enumerate(native["attachments"], 1):
             if not local and self.stop.is_set():
                 raise InterruptedError('Sync stopped')
@@ -1044,6 +1045,8 @@ class Worker:
                 if result == 'settling':
                     files_settling = True
                     source_checks[record['key']] = ('settling', 'The Zotero file is changing. Inbox will check it again shortly.')
+                    if path.suffix.lower() == '.pdf':
+                        preparing.setdefault(record.get('parentItem'), []).append(record['key'])
             except (OSError, ValueError, PilotError) as error:
                 source_checks[record['key']] = ('unreadable', str(error))
                 self.catalog_issues.append({'cloud': '', 'attachment': record['key'], 'title': path.name,
@@ -1057,8 +1060,9 @@ class Worker:
         file_parents = {entry['data'].get('parentItem') for entry in native['attachments']
                         if not entry['data'].get('deleted')
                         and Path(entry['path']).suffix.lower() in {'.pdf', '.docx', '.pptx'}}
-        file_parents.update(row['payload'].get('parent') for row in self.review.rows()
-                            if row['kind'] == 'zotero')
+        pending = self.review.rows()
+        filing_parents = {row['payload'].get('parent') for row in pending if row['kind'] == 'zotero'}
+        pending_references = {row['identity'] for row in pending if row['kind'] == 'reference'}
         linked_parents = {row.get('parent') for row in documents.values()} | excluded['parents']
         inventory = native.get('pdf_inventory')
         missing_parents = set(native.get('missing_pdf_parents', [])) if inventory is None else set()
@@ -1066,15 +1070,22 @@ class Worker:
         for key, parent in native['parents'].items():
             homes = set(parent.get('collections', []))
             pdfs = (inventory or {}).get(key, {})
-            if (parent.get('deleted') or key in file_parents or key in linked_parents
-                    or pdfs.get('available') or pdfs.get('managed')
+            if (parent.get('deleted') or key in filing_parents or key in linked_parents or pdfs.get('managed')
                     or (homes & old_collections and not homes & active)):
                 continue
-            legacy_state = 'unavailable' if key in missing_parents else 'none'
-            pdf_state = next((state for state in ('unsupported', 'unknown', 'unavailable') if pdfs.get(state)), legacy_state)
+            pdf_keys = preparing.get(key, [])
+            if key in pending_references and pdf_keys:
+                pdf_state = 'preparing'
+            elif key in file_parents or pdfs.get('available'):
+                continue
+            else:
+                legacy_state = 'unavailable' if key in missing_parents else 'none'
+                pdf_state = next((state for state in ('unsupported', 'unknown', 'unavailable') if pdfs.get(state)), legacy_state)
             references[key] = {'title': parent.get('title') or 'Untitled reference', 'parent': key,
                                'url': parent.get('url') or ('https://doi.org/' + parent['DOI'] if parent.get('DOI') else ''),
                                'pdf_state': pdf_state, 'missing_file': pdf_state == 'unavailable', 'routine': False}
+            if pdf_state == 'preparing' and len(pdf_keys) == 1:
+                references[key]['preparing_attachment'] = pdf_keys[0]
         self.review.reconcile_references(references)
         return {**native, 'files_settling': files_settling}
 

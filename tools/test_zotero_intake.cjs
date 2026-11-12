@@ -106,14 +106,15 @@ async function referenceViewChecks() {
     const page = f.node();
     f.ui.renderReview(page, 'inbox');
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(descendants(page).find(node => node['data-queue-summary'] === 'inbox').textContent,
-      '0 ready to file · 1 needs a PDF · 0 waiting on Library Issues');
+    const needs = descendants(page).find(node => node.dataset.inboxFilter === 'needs-pdf');
+    assert.equal(needs.textContent, 'Needs a PDF (1)');
     result = {state: 'managed', attachment, replacement: true};
     await f.buttons.get('Show reference in Zotero')[0].click();
     assert.equal(descendants(page).some(node => node.class === 'reference-pdf-actions'), false);
     assert.match(descendants(page).find(node => node['data-reference-pdf-state'] === 'replaced').textContent, /surviving Zotero reference already has a reMarkable notes PDF/);
+    assert.equal(needs.textContent, 'Needs a PDF (0)');
     assert.equal(descendants(page).find(node => node['data-queue-summary'] === 'inbox').textContent,
-      '0 ready to file · 1 to check in Zotero · 0 waiting on Library Issues');
+      '1 to check in Zotero');
     assert.equal(f.ui.zoteroInboxDirty, true);
   }
   for (const outcome of ['existing', 'added', 'other']) {
@@ -134,6 +135,39 @@ async function referenceViewChecks() {
     assert.equal(checked, 1);
     assert.match(messages[0], outcome === 'existing' ? /already attached/ : outcome === 'added' ? /PDF attached/ : /another file type/);
     assert.equal(descendants(detail).some(node => node.class === 'reference-pdf-actions'), outcome === 'other');
+  }
+  {
+    const f = fixture(async () => ({state: 'available', attachment}));
+    const prepared = {...row, inbox_order: 2, payload: {...row.payload, pdf_state: 'preparing', preparing_attachment: attachment}};
+    const ready = (id, parent, title, order, identity = id) => ({id, identity, kind: 'zotero', status: 'pending', inbox_order: order,
+      payload: {parent, title, path: 'C:/example.pdf', guidance_version: 1, guidance_state: 'ready', findings: []}});
+    const first = ready('first', 'OTHER234', 'A different paper', 1);
+    const target = ready('target', key, 'B attached paper', 2, attachment);
+    const spare = ready('spare', key, 'C other attachment', 5);
+    const blocked = ready('blocked', 'BLOCKED1', 'D blocked', 3);
+    f.ui.libraryFindings = item => item.id === blocked.id ? [{}] : [];
+    f.ui.latest.reviews = [first, prepared, blocked];
+    f.ui.selected = row.id;
+    f.ui.inboxReferenceSelection = {id: row.id, parent: key};
+    f.ui.inboxFilter = 'needs-pdf';
+    assert.deepEqual(Array.from(f.ui.inboxDisplayRows(), item => item.id), ['first', row.id]);
+    assert.equal(f.ui.inboxFilter, 'all');
+    const detail = Object.assign(f.node(), {classList: {add() {}}});
+    await f.ui.renderReferenceIntake(prepared, detail);
+    assert.equal(descendants(detail).find(node => node['data-reference-pdf-state'] === 'preparing').textContent,
+      'PDF attached. Preparing the filename for filing…');
+    f.ui.latest.reviews = [first, blocked, spare, target];
+    assert.deepEqual(Array.from(f.ui.inboxDisplayRows(), item => item.id), ['first', 'target', 'spare']);
+    assert.equal(f.ui.selected, 'target', 'Keep the exact PDF selected even with another attachment on the same reference');
+    assert.equal(f.ui.revealReviewSelection, true);
+    f.ui.inboxSort = 'added-desc';
+    assert.deepEqual(Array.from(f.ui.inboxDisplayRows(), item => item.id), ['spare', 'target', 'first']);
+    f.ui.inboxSort = 'title-desc';
+    assert.deepEqual(Array.from(f.ui.inboxDisplayRows(), item => item.id), ['spare', 'target', 'first']);
+    f.ui.inboxFilter = 'waiting';
+    assert.deepEqual(Array.from(f.ui.inboxDisplayRows(), item => item.id), ['blocked']);
+    f.ui.inboxFilter = 'ready';
+    assert.deepEqual(Array.from(f.ui.inboxDisplayRows(), item => item.id), ['spare', 'target', 'first']);
   }
 }
 

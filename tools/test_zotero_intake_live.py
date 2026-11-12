@@ -36,7 +36,8 @@ BRANCH = r"""
               'Inbox did not show where to save the download');
             ensure([...doc.querySelectorAll('.reference-pdf-actions button')].every(button => button.getClientRects().length && !button.disabled),
               'PDF actions should be visible and usable without expanding a section');
-            ensure(doc.querySelector('[data-queue-summary]').textContent.includes('1 needs a PDF'), 'Wrong Inbox summary');
+            ensure(doc.querySelector('[data-inbox-filter="needs-pdf"]').textContent === 'Needs a PDF (1)', 'Wrong Inbox count');
+            ensure(!doc.querySelector('.review-layout > aside button[data-button-help]'), 'Inbox rows still have hover help');
             const referenceActions = [...doc.querySelectorAll('button')].filter(button =>
               ['Attach downloaded PDF', 'Find and attach PDF online', 'Dismiss this reference'].includes(button.textContent));
             const originalRPC = ui.rpc;
@@ -158,15 +159,40 @@ BRANCH = r"""
             ensure(existing.attachment.key === pdf.key && existing.outcome === 'existing' && article.getAttachments().length === 1,
               'A late PDF caused the stale Add action to import a second copy');
             const available = await discover();
-            ensure(!referenceRow(available, article), 'Reference still needed a PDF after attachment');
+            const preparing = requireReference(available, article);
+            ensure(preparing.payload.pdf_state === 'preparing' && preparing.payload.preparing_attachment === pdf.key,
+              'The original Inbox row did not stay visible while the PDF settled');
+            ui.inboxFilter = 'needs-pdf';
+            ui.latest = available; ui.render();
+            await waitFor(() => doc.querySelector('[data-reference-pdf-state="preparing"]'), 'Preparing filename status missing');
+            ensure(ui.selected === articleRow.id && ui.inboxFilter === 'all', 'Preparing PDF lost the selected reference');
             await Zotero.Promise.delay(2200);
             const settled = await discover();
             const filingRow = settled.reviews.find(row => row.kind === 'zotero' && row.identity === pdf.key && row.payload.parent === article.key);
             ensure(filingRow,
               'Settled ordinary Zotero PDF did not enter its own filing review');
-            showRow(filingRow, settled);
-            ensure(doc.querySelector('.inbox-row-status')?.textContent === 'Zotero · PDF filing'
+            ui.latest = settled; ui.render();
+            ensure(ui.selected === filingRow.id && ui.renderedReviewId === filingRow.id, 'Filing pane jumped to a different item');
+            ensure(filingRow.inbox_order === articleRow.inbox_order, 'PDF arrival changed the original Inbox date order');
+            const chosen = () => doc.querySelector('.review-layout > aside [aria-pressed="true"]');
+            ensure(chosen()?.querySelector('.inbox-row-status').textContent === 'Zotero · PDF filing'
               && !doc.querySelector('.reference-pdf-actions'), 'Filing review displayed reference intake controls');
+            const filler = Array.from({length: 28}, (_, index) => ({...articleRow, id: `filler-${index}`,
+              inbox_order: articleRow.inbox_order + index + 100, payload: {...articleRow.payload, title: `Z test paper ${index}`}}));
+            ui.latest = {...settled, reviews: [...settled.reviews, ...filler]}; ui.render();
+            const sort = doc.querySelector('select[aria-label="Sort Inbox"]');
+            sort.value = 'title-desc'; sort.dispatchEvent(new ui.view.Event('change'));
+            ensure(ui.selected === filingRow.id && chosen()?.textContent.includes(filingRow.payload.title), 'Sorting lost the selection');
+            const list = doc.querySelector('.review-layout > aside');
+            const itemBox = chosen().getBoundingClientRect(), listBox = list.getBoundingClientRect();
+            ensure(list.scrollTop > 0 && itemBox.bottom <= listBox.bottom + 1 && itemBox.top >= listBox.top - 1,
+              'Sorting moved the selected paper out of view');
+            ensure(Zotero.Prefs.get('notable.inboxSort', true) === 'title-desc', 'Sort direction was not saved');
+            ui.latest = settled;
+            doc.querySelector('[data-inbox-filter="ready"]').click();
+            ensure(ui.selected === filingRow.id && doc.querySelectorAll('.review-layout > aside button').length === 1,
+              'Ready to file showed references without PDFs');
+            doc.querySelector('[data-inbox-filter="all"]').click();
 
             const missingPDF = await importPDF(missing);
             const missingPath = await missingPDF.getFilePathAsync();
@@ -183,7 +209,8 @@ BRANCH = r"""
               await IOUtils.move(movedPath, missingPath);
             }
             await expectState(missing.key, 'available', missing.key, missingPDF.key);
-            ensure(!referenceRow(await discover(), missing), 'Restored PDF left a stale reference row');
+            const restored = await discover();
+            ensure(requireReference(restored, missing).payload.pdf_state === 'preparing', 'Restored PDF still appeared unavailable');
 
             const word = await Zotero.Attachments.importFromFile({file: command.office, parentItemID: office.id,
               contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'});
@@ -225,6 +252,7 @@ BRANCH = r"""
             ensure(ui.latest.config.sync_paused, 'Check Inbox resumed tablet sync');
             response.layoutFixture = {...ui.latest, reviews: [duplicateRow]};
             response.checks = ['native_PDF_arrival_creates_filing_review', 'native_unavailable_PDF_hides_add_and_recovers',
+              'native_PDF_preparation_preserves_selection_and_Inbox_order', 'native_Inbox_sort_persists_and_ready_filter_preserves_selection',
               'native_managed_patent_and_merge_survivor_hide_add', 'native_stale_trashed_reference_hides_add',
               'explicit_inbox_check_preserves_pause_and_sends_local_requests', 'native_office_arrival_hides_add'];
           }

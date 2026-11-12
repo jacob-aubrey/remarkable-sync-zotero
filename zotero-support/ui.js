@@ -6,9 +6,15 @@ var NotableUI = {
   id: 'notable-companion@local.invalid', process: null, pending: new Map(), serial: 0,
   view: null, latest: null, busy: false, timer: null, windows: new Set(),
   filingQueue: [], reviewDrafts: new Map(), tagDrafts: new Map(), linkDrafts: new Map(),
+  inboxSortOptions: [['added-asc', 'Date added · Oldest first'], ['added-desc', 'Date added · Newest first'],
+    ['title-asc', 'Title · A–Z'], ['title-desc', 'Title · Z–A']],
+  inboxTitleOrder: new Intl.Collator(undefined, {numeric: true, sensitivity: 'base'}),
+  inboxSort: 'added-asc', inboxFilter: 'all',
   async start(rootURI) {
     this.stopped = false;
     this.rootURI = rootURI;
+    const inboxSort = Zotero.Prefs.get('notable.inboxSort', true);
+    if (this.inboxSortOptions.some(([value]) => value === inboxSort)) this.inboxSort = inboxSort;
     this.scheduleInbox();
     Zotero.Notable = this;
     await this.registerReaderTagButton(rootURI);
@@ -767,6 +773,8 @@ var NotableUI = {
       } else if (method === 'sync' && reviewChangeSerial === (this.reviewChangeSerial || 0)) this.reviewStale = false;
       if (connection !== this.filingConnection()) {
         this.reviewDrafts.clear(); this.tagDrafts.clear(); this.linkDrafts.clear(); this.batchCollection = null; this.selected = null;
+        this.inboxReferenceSelection = null;
+        this.inboxHandoffWaiting = null;
         this.paperSearch = null; this.tagSearch = null; this.syncDue = null; this.failures = 0; this.syncFailure = '';
       }
       this.badge();
@@ -1216,8 +1224,7 @@ var NotableUI = {
     });
     for (const event of ['pointerup', 'pointercancel', 'pointerleave']) node.addEventListener(event, () => clearTimeout(timer));
   },
-  button(text, parent, click, primary = false, icon = null) {
-    const help = this.buttonHelp(text, parent.matches('aside'));
+  button(text, parent, click, primary = false, icon = null, {help = true} = {}) {
 
     // Every action row gets the same wrapping and spacing. Navigation, review
     // lists and tag chips already own their layouts.
@@ -1230,7 +1237,7 @@ var NotableUI = {
     if (icon) this.el('span', '', node, {class: 'button-icon icon-' + icon, 'aria-hidden': 'true'});
     this.el('span', text, node, {class: 'button-label'});
     if (icon === 'trash-2') node.classList.add('danger');
-    this.attachButtonHelp(node, help);
+    if (help) this.attachButtonHelp(node, this.buttonHelp(text, parent.matches('aside')));
     node.addEventListener('click', () => { if (node.dataset.helpPress === 'true') { delete node.dataset.helpPress; return; } this.hideButtonHelp(); Promise.resolve().then(click).catch(error => this.message(error.message, true)); }); return node;
   },
   field(label, parent, value = '', type = 'input', settings = {}) {
@@ -1658,8 +1665,10 @@ var NotableUI = {
       if (item.top < box.top) list.scrollTop -= box.top - item.top;
       else if (item.bottom > box.bottom) list.scrollTop += item.bottom - box.bottom;
     };
-    let followSelection = !!this.reviewFocus;
-    if (followSelection) { list.querySelector('[aria-pressed="true"]')?.focus({preventScroll: true}); this.reviewFocus = false; keepVisible(); }
+    let followSelection = !!(this.reviewFocus || this.revealReviewSelection);
+    if (this.reviewFocus) list.querySelector('[aria-pressed="true"]')?.focus({preventScroll: true});
+    this.reviewFocus = this.revealReviewSelection = false;
+    if (followSelection) keepVisible();
     this.reviewObserver = new this.view.ResizeObserver(() => { if (followSelection) keepVisible(); });
     this.reviewObserver.observe(list.nextElementSibling);
     list.addEventListener('scroll', () => { this.reviewScrollTop = list.scrollTop; followSelection = false; });
@@ -2225,26 +2234,122 @@ var NotableUI = {
   referencePDFState(row) {
     return row.payload.pdf_state || (row.payload.missing_file ? 'unavailable' : 'none');
   },
-  queueSummary(queue, liveReference = null) {
-    const rows = this.queueRows(queue), count = rows.length;
-    if (queue === 'inbox') {
-      const references = rows.filter(row => row.kind === 'reference');
-      const states = references.map(row => row.id === liveReference?.id ? liveReference.state : this.referencePDFState(row));
-      const needsPDF = states.filter(state => state === 'none').length;
-      const unavailable = states.filter(state => state === 'unavailable').length;
-      const check = references.length - needsPDF - unavailable;
-      const interrupted = rows.filter(row => row.kind !== 'reference' && row.status === 'applying').length;
-      const update = rows.filter(row => row.status !== 'applying' && this.reviewNeedsUpgrade(row)).length;
-      return [
-        `${count - references.length - interrupted - update} ready to file`,
-        needsPDF && `${needsPDF} ${needsPDF === 1 ? 'needs' : 'need'} a PDF`,
+  inboxReadyToFile(row) {
+    return row.kind !== 'reference' && row.status !== 'applying' && !this.reviewNeedsUpgrade(row);
+  },
+  sortInboxRows(rows) {
+    const direction = this.inboxSort.endsWith('-desc') ? -1 : 1;
+    const title = row => row.payload.title || row.payload.filename || '';
+    return rows.map((row, index) => ({row, order: row.inbox_order ?? index})).sort((a, b) => {
+      const added = a.order - b.order;
+      return this.inboxSort.startsWith('title-')
+        ? direction * this.inboxTitleOrder.compare(title(a.row), title(b.row)) || added
+        : direction * added;
+    }).map(entry => entry.row);
+  },
+  renderInboxControls(parent) {
+    const controls = this.el('div', '', parent, {class: 'inbox-controls'});
+    const filters = this.el('div', '', controls, {class: 'inbox-filters', role: 'group', 'aria-label': 'Show Inbox entries'});
+    const labels = [['all', 'All'], ['ready', 'Ready to file'], ['needs-pdf', 'Needs a PDF'], ['waiting', 'Waiting on Library Issues']];
+    const buttons = labels.map(([value, label]) => {
+      const button = this.el('button', label, filters, {type: 'button', 'aria-pressed': String(this.inboxFilter === value)});
+      button.dataset.browse = 'true';
+      button.dataset.inboxFilter = value;
+      button.dataset.notableField = `Inbox filter ${value}`;
+      button.addEventListener('click', () => {
+        if (this.inboxFilter === value) return;
+        this.inboxFilter = value;
+        this.revealReviewSelection = true;
+        this.render();
+      });
+      return button;
+    });
+    const label = this.el('label', 'Sort by', controls, {class: 'inbox-sort'});
+    const sort = this.el('select', '', label, {'aria-label': 'Sort Inbox', 'data-notable-field': 'Inbox sort'});
+    sort.dataset.browse = 'true';
+    for (const [value, name] of this.inboxSortOptions) this.el('option', name, sort, {value});
+    sort.value = this.inboxSort;
+    sort.addEventListener('change', () => {
+      this.inboxSort = sort.value;
+      Zotero.Prefs.set('notable.inboxSort', sort.value, true);
+      this.revealReviewSelection = true;
+      this.render();
+    });
+    const status = this.el('p', '', controls, {class: 'queue-summary', role: 'status', 'data-queue-summary': 'inbox'});
+    const update = liveReference => {
+      const parts = this.inboxSummary(liveReference);
+      const counts = [null, parts.ready, parts.needsPDF, parts.waiting];
+      for (const [index, button] of buttons.entries()) {
+        const name = labels[index][1];
+        button.textContent = counts[index] === null ? name : `${name} (${counts[index]})`;
+      }
+      status.textContent = parts.other.join(' · ');
+      status.hidden = !parts.other.length;
+    };
+    update();
+    return update;
+  },
+  inboxSummary(liveReference = null) {
+    const rows = this.queueRows('inbox');
+    const states = rows.filter(row => row.kind === 'reference')
+      .map(row => row.id === liveReference?.id ? liveReference.state : this.referencePDFState(row));
+    const needsPDF = states.filter(state => state === 'none').length;
+    const unavailable = states.filter(state => state === 'unavailable').length;
+    const preparing = states.filter(state => state === 'preparing').length;
+    const check = states.length - needsPDF - unavailable - preparing;
+    const interrupted = rows.filter(row => row.kind !== 'reference' && row.status === 'applying').length;
+    const update = rows.filter(row => this.reviewNeedsUpgrade(row)).length;
+    return {ready: rows.filter(row => this.inboxReadyToFile(row)).length, needsPDF,
+      waiting: this.queueRows('inbox-waiting').length, other: [
         unavailable && `${unavailable} PDF${unavailable === 1 ? '' : 's'} unavailable here`,
+        preparing && `${preparing} preparing filename${preparing === 1 ? '' : 's'}`,
         check && `${check} to check in Zotero`,
         interrupted && `${interrupted} filing${interrupted === 1 ? '' : 's'} to resume`,
         update && `${update} awaiting review update`,
-        `${this.queueRows('inbox-waiting').length} waiting on Library Issues`
+      ].filter(Boolean)};
+  },
+  inboxDisplayRows() {
+    const active = this.queueRows('inbox');
+    const waiting = this.queueRows('inbox-waiting');
+    const selection = this.inboxReferenceSelection;
+    if (selection && selection.id === this.selected) {
+      const reference = active.find(row => row.id === selection.id);
+      if (reference) {
+        selection.attachment ||= reference.payload.preparing_attachment;
+        if (this.inboxFilter === 'needs-pdf' && this.referencePDFState(reference) === 'preparing') {
+          this.inboxFilter = 'all';
+        }
+      } else {
+        const matches = [...active, ...waiting].filter(row => row.kind === 'zotero'
+          && row.payload.parent === selection.parent && /\.pdf$/i.test(row.payload.path || '')
+          && (!selection.attachment || row.identity === selection.attachment));
+        if (matches.length === 1) {
+          this.selected = matches[0].id;
+          this.inboxHandoffWaiting = waiting.some(row => row.id === this.selected) ? this.selected : null;
+          this.revealReviewSelection = true;
+          if (this.inboxFilter === 'needs-pdf') this.inboxFilter = 'all';
+        }
+        this.inboxReferenceSelection = null;
+      }
+    }
+    if (this.inboxFilter === 'waiting') return this.sortInboxRows(waiting);
+    if (this.inboxFilter === 'ready') return this.sortInboxRows(active.filter(row => this.inboxReadyToFile(row)));
+    if (this.inboxFilter === 'needs-pdf') return this.sortInboxRows(active.filter(row => row.kind === 'reference'
+      && this.referencePDFState(row) === 'none'));
+    // Keep a paper visible if its new PDF has a library issue to resolve.
+    return this.sortInboxRows([...active, ...waiting.filter(row => row.id === this.inboxHandoffWaiting && row.id === this.selected)]);
+  },
+  queueSummary(queue, liveReference = null) {
+    if (queue === 'inbox') {
+      const {ready, needsPDF, waiting, other} = this.inboxSummary(liveReference);
+      return [
+        `${ready} ready to file`,
+        needsPDF && `${needsPDF} ${needsPDF === 1 ? 'needs' : 'need'} a PDF`,
+        ...other,
+        `${waiting} waiting on Library Issues`
       ].filter(Boolean).join(' · ');
     }
+    const count = this.queueRows(queue).length;
     if (queue === 'library') return `${count} ${count === 1 ? 'case' : 'cases'} to inspect`;
     const decisions = count + (this.latest.deletions || []).length + (this.latest.local_deletions || []).length;
     return `${decisions} sync ${decisions === 1 ? 'decision' : 'decisions'}`;
@@ -2257,7 +2362,8 @@ var NotableUI = {
     this.tab = 'library'; this.selected = target.id; this.reviewScrollTop = 0; this.render();
   },
   renderInboxWaiting(parent) {
-    const waiting = this.queueRows('inbox-waiting');
+    const waiting = this.sortInboxRows(this.queueRows('inbox-waiting')
+      .filter(row => row.id !== this.inboxHandoffWaiting || row.id !== this.selected));
     if (!waiting.length) return;
     const section = this.el('details', '', parent, {class: 'card inbox-waiting', 'data-inbox-waiting': 'true'});
     section.open = !!this.inboxWaitingOpen;
@@ -2283,10 +2389,12 @@ var NotableUI = {
   inboxRowCaption(row, state = this.referencePDFState(row)) {
     if (row.kind === 'reference') {
       return state === 'none' ? 'Zotero · Needs a PDF'
+        : state === 'preparing' ? 'Zotero · Preparing filename'
         : state === 'unavailable' ? 'Zotero · PDF unavailable here' : 'Zotero · Needs a check';
     }
     const source = row.kind === 'cloud' ? 'reMarkable' : row.kind === 'inbox' ? 'ToSort' : 'Zotero';
     if (row.status === 'applying') return source + ' · Resume filing';
+    if (this.libraryFindings(row).length) return source + ' · Waiting on Library Issues';
     if (this.reviewNeedsUpgrade(row)) return source + ' · Awaiting review update';
     return source + (this.isInboxOfficeFile(row) ? ' · Office file' : ' · PDF filing');
   },
@@ -2353,11 +2461,15 @@ var NotableUI = {
       catch (_) { result = {state: 'unknown'}; }
       if (request !== serial || !status.isConnected) return;
       const hasConnection = result.state === 'none' && (this.latest.links || []).some(link => link.parent === row.identity);
-      const state = result.replacement ? 'replaced' : hasConnection ? 'linked' : result.state;
+      const selection = this.inboxReferenceSelection;
+      const preparing = result.state === 'available' && (this.referencePDFState(row) === 'preparing'
+        || (selection?.id === row.id && selection.attachment === result.attachment && !!result.attachment));
+      const state = result.replacement ? 'replaced' : hasConnection ? 'linked' : preparing ? 'preparing' : result.state;
       status.setAttribute('data-reference-pdf-state', state);
       onStatus(state);
       const text = {
         none: 'This Zotero reference needs a PDF before it can be filed.',
+        preparing: 'PDF attached. Preparing the filename for filing…',
         unavailable: 'Zotero lists a PDF for this reference. Open it in Zotero to download or locate the file, then use Check Inbox.',
         available: 'This Zotero reference already has a PDF. Use Check Inbox to refresh its filing status.',
         managed: 'This reference already has a reMarkable notes PDF. Use Check Inbox to refresh its filing status.',
@@ -2402,6 +2514,10 @@ var NotableUI = {
         if (chooseFile && !file) return;
         attempted = true;
         acquired = await notableAcquirePDF(row.identity, file, {describe: true});
+        if (this.inboxReferenceSelection?.id === row.id && this.selected === row.id
+            && notableIsPDFFile(acquired.attachment)) {
+          this.inboxReferenceSelection.attachment = acquired.attachment.key;
+        }
         this.zoteroInboxDirty = true;
       } finally {
         this.acquiringPDF = false; this.disable(this.busy);
@@ -2426,10 +2542,12 @@ var NotableUI = {
 
     this.renderedReviewId = null;
     const heading = this.el('div', '', content, {class: 'review-heading'});
-    let summary;
+    const inboxRows = queue === 'inbox' ? this.inboxDisplayRows() : null;
+    let updateInboxControls;
     if (queue) {
       this.el('h2', queue === 'inbox' ? 'Inbox' : queue === 'library' ? 'Library Issues' : 'Sync Conflicts', heading);
-      summary = this.el('p', this.queueSummary(queue), heading, {class: 'queue-summary', role: 'status', 'data-queue-summary': queue});
+      if (inboxRows) updateInboxControls = this.renderInboxControls(heading);
+      else this.el('p', this.queueSummary(queue), heading, {class: 'queue-summary', role: 'status', 'data-queue-summary': queue});
     }
     let recheck;
     if (queue !== 'sync-review') {
@@ -2497,15 +2615,17 @@ var NotableUI = {
       }
     }
     }
-    if (queue === 'inbox') this.renderInboxWaiting(content);
-    const rows = queue ? this.queueRows(queue) : (this.latest.reviews || []).filter(row => !queuedIds.has(row.id) && (this.showAllReviews || !row.payload.routine || this.reviewNeedsUpgrade(row) || row.status === 'applying' || row.id === this.selected));
+    if (inboxRows && this.inboxFilter === 'all') this.renderInboxWaiting(content);
+    const rows = inboxRows ?? (queue ? this.queueRows(queue) : (this.latest.reviews || []).filter(row => !queuedIds.has(row.id) && (this.showAllReviews || !row.payload.routine || this.reviewNeedsUpgrade(row) || row.status === 'applying' || row.id === this.selected)));
     if (!rows.length && queue === 'sync-review' && content.querySelector?.('.decision')) return;
     if (!rows.length && queue) {
       const blocked = queue === 'inbox' && this.queueRows('inbox-waiting').length;
       const empty = this.el('section', '', content, {class: 'review-empty'});
-      this.el('h3', queue === 'inbox' ? (blocked ? 'No papers ready to file' : 'Inbox is empty')
+      const inboxEmpty = {all: blocked ? 'No papers ready to file' : 'Inbox is empty', ready: 'No papers ready to file',
+        'needs-pdf': 'No papers need a PDF', waiting: 'No papers waiting on Library Issues'};
+      this.el('h3', queue === 'inbox' ? inboxEmpty[this.inboxFilter]
         : queue === 'library' ? 'No library issues' : 'No sync conflicts', empty);
-      if (blocked) {
+      if (blocked && this.inboxFilter === 'all') {
         const jump = this.button('Open Library Issues', empty, () => this.openLibraryCase(this.queueRows('inbox-waiting')[0]?.id), true, 'file-search');
         jump.dataset.browse = 'true';
       }
@@ -2517,7 +2637,7 @@ var NotableUI = {
     const layout = this.el('div', '', content, {class: 'review-layout'}), list = this.el('aside', '', layout, {'aria-label': queue === 'inbox' ? 'Inbox entries' : 'Documents awaiting review'});
     let selectedCaption;
     for (const row of rows) {
-      const button = this.button(row.payload.title || row.payload.desktop?.[0] || 'Folder conflict', list, () => { this.selected = row.id; this.reviewFocus = true; this.render(); }, false, 'file-text');
+      const button = this.button(row.payload.title || row.payload.desktop?.[0] || 'Folder conflict', list, () => { this.selected = row.id; this.reviewFocus = true; this.render(); }, false, 'file-text', {help: queue !== 'inbox'});
       if (queue === 'inbox') {
         const caption = this.el('span', this.inboxRowCaption(row), button.querySelector?.('.button-label') || button, {class: 'inbox-row-status'});
         if (row.id === this.selected) selectedCaption = caption;
@@ -2534,6 +2654,9 @@ var NotableUI = {
     }
     const row = rows.find(r => r.id === this.selected) || rows[0], detail = this.el('section', '', layout, {class: 'card review-form'});
     this.renderedReviewId = row.id;
+    if (inboxRows && this.inboxReferenceSelection?.id !== row.id) {
+      this.inboxReferenceSelection = row.kind === 'reference' ? {id: row.id, parent: row.identity} : null;
+    }
     if (row.kind === 'conflict') {
       this.el('h2', row.payload.type === 'paper' ? 'Name or folder changed on both devices' : 'Folder changed on both devices', detail);
       this.el('p', row.payload.type === 'paper' ? 'Apply one side’s name and folder to both copies. PDF contents stay the same.' : 'Apply one side’s folder name and location. Papers and notes are kept.', detail);
@@ -2560,7 +2683,7 @@ var NotableUI = {
     if (row.kind === 'reference') {
       this.renderReferenceIntake(row, detail, state => {
         if (selectedCaption) selectedCaption.textContent = this.inboxRowCaption(row, state);
-        if (queue === 'inbox') summary.textContent = this.queueSummary(queue, {id: row.id, state});
+        updateInboxControls?.({id: row.id, state});
       });
       return;
     }

@@ -183,6 +183,13 @@ nav button.sync-conflicts-attention[aria-pressed="true"] .button-icon { color: #
 .review-heading > .queue-summary { grid-column: 1; margin: 0; }
 .review-heading > .review-recheck { grid-column: 2; grid-row: 1 / span 2; gap: 8px; }
 .review-heading > .review-recheck > p { flex: auto; max-inline-size: 40ch; font-size: 12px; }
+@media (min-width: 701px) { .review-heading:has(.inbox-controls) > .review-recheck { grid-row: 1; } }
+.inbox-controls { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.inbox-filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.inbox-filters button[aria-pressed="true"] { background: #2166a8; color: #fff; border-color: #2166a8; }
+.inbox-sort { display: flex; align-items: center; gap: 8px; }
+.inbox-sort select { width: auto; }
+.inbox-controls > .queue-summary { flex-basis: 100%; margin: 0; }
 .reference-intake > p { max-inline-size: 68ch; }
 .reference-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-block: 8px; }
 .reference-comparison > section { border: 1px solid GrayText; border-radius: 5px; padding: 12px; }
