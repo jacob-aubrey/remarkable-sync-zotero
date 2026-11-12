@@ -313,12 +313,16 @@ class BridgeTests(unittest.TestCase):
         self.engine.run(apply=True)
         self.assertFalse(self.zot.items)
 
-    def test_deleted_linked_folder_and_wrong_instance_fail_before_more_writes(self):
+    def test_deleted_linked_collection_holds_its_pair_and_preserves_instance_check(self):
         self.zot.collection_records["CHILD234"] = {"key": "CHILD234", "name": "Child", "parentCollection": "ROOT2345"}
         self.engine.run(apply=True)
+        original = self.state.read('folders')['CHILD234']
         self.zot.collection_records.pop("CHILD234")
-        with self.assertRaises(PilotError):
-            self.engine.run(apply=True)
+        result = self.engine.run(apply=True)
+        self.assertEqual(result['folder_issues'][0]['zotero_state'], 'missing')
+        self.assertEqual(result['folder_issues'][0]['tablet'], original['cloud'])
+        self.assertEqual(self.state.read('folders')['CHILD234'], original)
+        self.assertNotIn('CHILD234', self.zot.collection_records)
         self.assertEqual(self.cloud.folder_writes, 1)
         self.zot.server_id = "different-instance"
         with self.assertRaises(PilotError):

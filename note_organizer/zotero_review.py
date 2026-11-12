@@ -163,8 +163,8 @@ class ReviewStore(Ledger):
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
     def resolve_local_deletion(self, identity, choice, *, cloud, zotero, scope):
-        if choice not in {"trash_tablet", "keep_tablet"}:
-            raise PilotError("Choose whether to keep the tablet copy or send it to Trash.")
+        if choice not in {'trash_tablet', 'keep_tablet', 'restore_zotero'}:
+            raise PilotError('Choose how to handle the Zotero deletion.')
         row = next((r for r in self.local_deletions() if r["id"] == identity), None)
         if not row:
             raise PilotError("This deletion decision is no longer pending.")
@@ -175,9 +175,16 @@ class ReviewStore(Ledger):
             raise PilotError("The linked item changed. Sync again before deciding.")
         if not item.deleted and item.hash != data["cloud_hash"]:
             raise PilotError("The tablet copy changed after this notification. Sync before deciding.")
-        if choice == "trash_tablet" and not item.deleted:
+        if choice == 'restore_zotero':
+            if item.deleted or item.parent == 'trash':
+                raise PilotError('The reMarkable copy is also in Trash. Sync again before restoring the connection.')
+            result = zotero.review_action('restore_linked_item', {'key': data['key'], 'version': record.get('version', 0),
+                                                                 'parent': record.get('parentItem') or ''})
+            if not result.get('restored'):
+                raise PilotError('The Zotero item could not be verified after restoring it.')
+        elif choice == "trash_tablet" and not item.deleted:
             cloud.update_item(item.id, expected_hash=item.hash, parent="trash", scope_id=scope)
-        self.link_control(item.id, paused=True, event={"action": choice})
+        self.link_control(item.id, paused=choice != 'restore_zotero', event={'action': choice})
         with self.connect() as db:
             db.execute("UPDATE local_deletions SET status='resolved',action=? WHERE id=?", (choice, identity))
 
@@ -374,8 +381,8 @@ class ReviewStore(Ledger):
         return [{**dict(row), "payload": json.loads(row["payload"]), "result": json.loads(row["result"])} for row in rows]
 
     def resolve_deletion(self, identity, action, *, cloud, zotero, scope, destination=''):
-        if action not in {"restore", "pdf_only", "everything"}:
-            raise PilotError("Choose Restore, Delete PDF only, or Delete everything.")
+        if action not in {'restore', 'pdf_only', 'everything', 'keep_zotero'}:
+            raise PilotError('Choose how to handle the reMarkable deletion.')
         with self.lock():
             row = next((row for row in self.deletions(pending_only=False) if row["id"] == identity), None)
             if not row:
@@ -410,7 +417,7 @@ class ReviewStore(Ledger):
             if action == "restore":
                 if not restored:
                     cloud.update_item(item.id, expected_hash=item.hash, parent=data["restore_parent"], scope_id=scope, restore=True)
-            else:
+            elif action != 'keep_zotero':
                 # The native Zotero endpoint validates the whole displayed
                 # attachment/note inventory again inside its transaction. It
                 # uses Zotero Trash and never permanently erases records.

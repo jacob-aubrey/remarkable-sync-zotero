@@ -64,6 +64,125 @@ def descendants(records, root, key, parent, unavailable=()):
     return result
 
 
+def sync_collections(client, mappings, collections=None):
+    collections = list(client.collections() if collections is None else collections)
+    active = {row['key'] for row in collections}
+    for key in set(mappings) - active:
+        if not mappings[key].get('pending'):
+            row = client.get('collection', key)
+            if row and row.get('deleted'):
+                collections.append(row)
+    return collections
+
+
+def sync_folder_scope(collections, catalog, zroot, croot, mappings, exclusions, confirmed=None):
+    from .zotero_connections import filtered_scope
+    from .zotero_review import fingerprint
+
+    folders = [item for item in catalog if item.kind == 'CollectionType']
+    zkey, zparent = lambda row: row['key'], lambda row: row.get('parentCollection')
+    ckey, cparent = lambda row: row.id, lambda row: row.parent
+    deleted_z = {zkey(row) for row in collections if row.get('deleted')}
+    deleted_c = {ckey(row) for row in folders if row.deleted or row.parent == 'trash'}
+    zscope = filtered_scope(descendants(collections, zroot, zkey, zparent, deleted_z), exclusions['zotero'], zkey, zparent, zroot)
+    cscope = filtered_scope(descendants(folders, croot, ckey, cparent, deleted_c), exclusions['tablet'], ckey, cparent, croot)
+    if mappings.get(zroot, {}).get('cloud', croot) != croot:
+        raise PilotError('The saved root folder mapping does not match Setup. Check the connected folders.')
+    reverse = {link['cloud']: key for key, link in mappings.items()}
+    if len(reverse) != len(mappings):
+        raise PilotError('More than one collection maps to the same tablet folder.')
+    unavailable = {key for key, link in mappings.items() if key != zroot and (
+        (key not in zscope and link.get('pending') != 'zotero')
+        or (link['cloud'] not in cscope and link.get('pending') != 'cloud'))}
+    names_z = {zkey(row): row['name'] for row in collections}
+    names_c = {ckey(row): row.name for row in folders}
+    deleted_collection = {zkey(row): row for row in collections if zkey(row) in deleted_z}
+    deleted_folder = {ckey(row): row for row in folders if ckey(row) in deleted_c}
+
+    def exclude_branches(blocked):
+        while True:
+            tablet_blocked = {mappings[key]['cloud'] for key in blocked}
+            reserved_z = {(mappings[key].get('zparent'), names_z.get(key, mappings[key].get('name'))) for key in blocked}
+            reserved_c = {(mappings[key].get('cparent'), names_c.get(mappings[key]['cloud'], mappings[key].get('name')))
+                          for key in blocked}
+            # A new folder with the same name is not the deleted folder. Keep
+            # it out of automatic pairing while the saved names are reserved.
+            exclude_z = blocked | {key for key, (row, _) in zscope.items() if key not in mappings
+                                   and (zparent(row), row['name']) in reserved_z}
+            exclude_c = tablet_blocked | {key for key, (row, _) in cscope.items() if key not in reverse
+                                          and (cparent(row), row.name) in reserved_c}
+            desktop = filtered_scope(zscope, exclude_z, zkey, zparent, zroot)
+            tablet = filtered_scope(cscope, exclude_c, ckey, cparent, croot)
+            more = {key for key, link in mappings.items() if key != zroot and (
+                link.get('zparent') in blocked or link.get('cparent') in tablet_blocked
+                or (key in zscope and key not in desktop) or (link['cloud'] in cscope and link['cloud'] not in tablet))}
+            if more <= blocked:
+                return blocked, tablet_blocked, desktop, tablet
+            blocked.update(more)
+
+    confirmed = confirmed or {}
+    retired, _, _, _ = exclude_branches({key for key, ck in confirmed.items() if key != zroot and reverse.get(ck) == key})
+    blocked, tablet_blocked, desktop, tablet = exclude_branches(unavailable | retired)
+    issues = []
+    for key, link in mappings.items():
+        ck = link['cloud']
+        if key not in unavailable or key in retired or link.get('zparent') in blocked or link.get('cparent') in tablet_blocked:
+            continue
+        issue = {'zotero': key, 'tablet': ck,
+            'zotero_name': names_z.get(key, link.get('desktop_name', link.get('name', 'Zotero collection'))),
+            'tablet_name': names_c.get(ck, link.get('tablet_name', link.get('name', 'reMarkable folder'))),
+            'zotero_state': ('trash' if key in deleted_z else 'outside' if key in names_z else 'missing') if key not in zscope else '',
+            'tablet_state': ('trash' if ck in deleted_c else 'outside' if ck in names_c else 'missing') if ck not in cscope else ''}
+        if issue['tablet_state'] in {'trash', 'missing'} and not issue['zotero_state']:
+            inventory = zotero_folder_inventory(collections, key)
+            if not any(row[0] in exclusions['zotero'] for row in inventory):
+                issue['mirror'] = {'side': 'zotero', 'evidence': fingerprint(inventory), 'children': len(inventory) - 1}
+        if issue['zotero_state'] in {'trash', 'missing'} and not issue['tablet_state']:
+            inventory = tablet_folder_inventory(catalog, ck)
+            if not any(row[0] in exclusions['tablet'] or row[0] in exclusions['documents'] for row in inventory):
+                issue['mirror'] = {'side': 'tablet', 'evidence': fingerprint(inventory), 'children': len(inventory) - 1}
+        if issue['tablet_state'] == 'trash' and not issue['zotero_state'] and link.get('cparent') in tablet:
+            issue['undo'] = {'side': 'tablet', 'parent': link['cparent'], 'version': deleted_folder[ck].hash}
+        if issue['zotero_state'] == 'trash' and not issue['tablet_state']:
+            row = deleted_collection[key]
+            if row.get('parentCollection') in desktop:
+                issue['undo'] = {'side': 'zotero', 'parent': row['parentCollection'], 'version': row.get('version', 0)}
+        issues.append(issue)
+    return desktop, tablet, {'issues': issues, 'confirmed': confirmed, 'zotero': sorted(blocked | (set(zscope) - set(desktop))),
+                             'tablet': sorted(tablet_blocked | (set(cscope) - set(tablet)))}
+
+
+def folder_blocked_papers(documents, catalog, blocked):
+    zotero, tablet = set(blocked['zotero']), set(blocked['tablet'])
+    return ({key for key, row in documents.items() if row.get('collection') in zotero or row.get('tablet_parent') in tablet}
+            | {item.id for item in catalog if item.id in documents and item.parent in tablet})
+
+
+def _folder_inventory(rows, root):
+    from collections import defaultdict
+    by_parent, by_key = defaultdict(list), {}
+    for row in rows:
+        by_key[row[0]] = row
+        by_parent[row[1]].append(row[0])
+    seen, pending = set(), [root] if root in by_key else []
+    while pending:
+        key = pending.pop()
+        if key not in seen:
+            seen.add(key)
+            pending.extend(by_parent[key])
+    return [by_key[key] for key in sorted(seen)]
+
+
+def zotero_folder_inventory(collections, root):
+    return _folder_inventory(([row['key'], row.get('parentCollection') or '', row['name'], row.get('version', 0)]
+                              for row in collections if not row.get('deleted')), root)
+
+
+def tablet_folder_inventory(catalog, root):
+    return _folder_inventory(([item.id, item.parent, item.name, item.hash]
+                              for item in catalog if not item.deleted and item.parent != 'trash'), root)
+
+
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -129,26 +248,24 @@ class Bridge:
 
     def _run(self, apply):
         self.progress('Checking connected folders…')
-        collections = self.zot.collections()
+        saved_maps = self.state.read('folders', {self.zroot: {'cloud': self.croot, 'root': True}})
+        collections = sync_collections(self.zot, saved_maps)
         self.progress('Checking reMarkable’s current file list…')
         catalog = self.cloud.library()
-        zscope = descendants(collections, self.zroot, lambda r: r["key"], lambda r: r.get("parentCollection"),
-                             {r['key'] for r in collections if r.get('deleted')})
-        cfolders = [r for r in catalog if r.kind == "CollectionType"]
-        cscope = descendants(cfolders, self.croot, lambda r: r.id, lambda r: r.parent,
-                             {r.id for r in cfolders if r.deleted})
-        from .zotero_connections import filtered_scope
-        zscope = filtered_scope(zscope, self.exclusions['zotero'], lambda r: r['key'], lambda r: r.get('parentCollection'), self.zroot)
-        cscope = filtered_scope(cscope, self.exclusions['tablet'], lambda r: r.id, lambda r: r.parent, self.croot)
+        confirmed = self.state.read('folder_blocks', {}).get('confirmed', {})
+        zscope, cscope, blocked = sync_folder_scope(collections, catalog, self.zroot, self.croot, saved_maps, self.exclusions, confirmed)
+        blocked_keys = set(blocked['zotero'])
+        maps = {key: link for key, link in saved_maps.items() if key not in blocked_keys}
+        if apply:
+            self.state.write('folder_blocks', blocked)
         zby = {key: row for key, (row, _) in zscope.items()}
         cby = {key: row for key, (row, _) in cscope.items()}
-        maps = self.state.read("folders", {self.zroot: {"cloud": self.croot, "root": True}})
         documents = self.state.read("documents", {})
         reports, reviews = [], []
 
         def save():
             if apply:
-                self.state.write("folders", maps)
+                self.state.write("folders", {**saved_maps, **maps})
                 self.state.write("documents", documents)
 
         def zwrite():
@@ -178,8 +295,6 @@ class Bridge:
                                                           "parentCollection": link["zparent"]})
                     link.pop("pending")
                     save()
-            elif zk not in zby or ck not in cby:
-                raise PilotError("A linked collection/folder was deleted or moved outside the selected roots. Review it before retrying.")
             if zk in zby and ck in cby and link.get("pending"):
                 link.pop("pending")
                 save()
@@ -289,6 +404,7 @@ class Bridge:
         # upload path. Multiple collections need an explicit primary location.
         references = {}
         suspended = (self.review_policy.suspended_documents() if self.review_policy else set()) | self.exclusions['documents']
+        suspended.update(folder_blocked_papers(documents, catalog, blocked))
         if self.follow_changes:
             from pathlib import Path
             from .zotero_review import fingerprint
@@ -623,7 +739,7 @@ class Bridge:
                 self._tags(row['parent'], bundle, ck, row, save)
                 self.progress(f'Received tablet PDF {number} of {len(cloud_pdfs)}…')
         return {"mode": "apply" if apply else "plan", "actions": reports, "review": reviews,
-                "folders": len(maps), "documents": len(documents)}
+                "folder_issues": blocked['issues'], "folders": len({**saved_maps, **maps}), "documents": len(documents)}
 
     def _apply_filename_cleanup(self, row, parent, item, home, catalog, save):
         from .zotero_filenames import citation_snapshot

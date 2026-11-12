@@ -28,7 +28,12 @@ async function main() {
   ui.drainingFilings = true; await ui.checkInbox(); assert.equal(calls, 2); ui.drainingFilings = false;
   ui.latest.config.tablet_root = 'tablet';
   const discovery = [];
-  ui.rpc = async (_, params) => {discovery.push(params.discover); return ui.latest;};
+  let fullChecks = 0;
+  ui.rpc = async (method, params) => {
+    if (method === 'recheck_review') fullChecks++;
+    else { assert.equal(method, 'scan_inbox'); discovery.push(params.discover); }
+    return ui.latest;
+  };
   await ui.checkInbox();
   ui.observeReviewChange('select', 'item');
   now += 15000; await ui.checkInbox();
@@ -36,6 +41,7 @@ async function main() {
   await ui.checkInbox();
   now += 300000; await ui.checkInbox();
   assert.deepEqual(discovery, [true, false, true, true], 'Discover at startup, after Zotero edits, and on the slower fallback');
+  assert.equal(fullChecks, 1, 'Five idle minutes trigger the same local recheck as Check Inbox');
   const settlingChecks = [];
   ui.rpc = async (method, params) => {
     assert.equal(method, 'scan_inbox'); settlingChecks.push(params.discover);

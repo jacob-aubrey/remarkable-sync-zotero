@@ -38,6 +38,25 @@ BRANCH = r"""
               'PDF actions should be visible and usable without expanding a section');
             ensure(doc.querySelector('[data-inbox-filter="needs-pdf"]').textContent === 'Needs a PDF (1)', 'Wrong Inbox count');
             ensure(!doc.querySelector('.review-layout > aside button[data-button-help]'), 'Inbox rows still have hover help');
+            const dismiss = [...doc.querySelectorAll('button')].find(button => button.textContent === 'Dismiss this reference');
+            const originalAction = ui.action, decisions = [];
+            const wait = async predicate => {
+              for (let i = 0; i < 80 && !predicate(); i++) await Zotero.Promise.delay(25);
+              ensure(predicate(), 'Dismiss confirmation did not reach the expected state');
+            };
+            ui.action = async (method, params) => decisions.push({method, params});
+            try {
+              dismiss.click(); await wait(() => doc.querySelector('.review-dismiss[open]'));
+              let dialog = doc.querySelector('.review-dismiss');
+              ensure(doc.activeElement.textContent === 'Cancel', 'Dismiss should default to Cancel');
+              dialog.querySelector('button[value="cancel"]').click();
+              await wait(() => !doc.querySelector('.review-dismiss'));
+              ensure(decisions.length === 0, 'Cancel dismissed a paper');
+              dismiss.click(); await wait(() => doc.querySelector('.review-dismiss[open]'));
+              doc.querySelector('.review-dismiss button[value="dismiss"]').click();
+              await wait(() => decisions.length === 1);
+              ensure(decisions[0].method === 'dismiss_review' && decisions[0].params.identity === row.id, 'Confirmed dismissal targeted the wrong review');
+            } finally { ui.action = originalAction; }
             const referenceActions = [...doc.querySelectorAll('button')].filter(button =>
               ['Attach downloaded PDF', 'Find and attach PDF online', 'Dismiss this reference'].includes(button.textContent));
             const originalRPC = ui.rpc;
@@ -316,7 +335,7 @@ BRANCH = r"""
           else if (command.action === 'tag_entry_layout') {
             const ensure = (value, message) => {if (!value) throw Error(message);};
             ui.tab = 'tags';
-            ui.tagEditor = {key: command.key, page: 0, page_id: 'tag-layout-page', token: 'fixture',
+            ui.tagEditor = {key: command.key, page: 0, page_id: `tag-layout-page-${command.width}`, token: 'fixture',
               title: 'Synthetic tag editor', paper_tags: ['Existing paper tag'], page_tags: [], vocabulary: []};
             ui.render();
             ui.view.resizeTo(command.width, 760);
@@ -329,10 +348,13 @@ BRANCH = r"""
               const box = input.getBoundingClientRect(), label = input.closest('label').firstElementChild.getBoundingClientRect();
               const button = entry.querySelector(`button[aria-label="Add ${kind} tag"]`);
               const add = button.getBoundingClientRect();
-              ensure(box.top - label.bottom >= 0 && box.top - label.bottom <= 10,
-                kind + ' tag label gap is ' + (box.top - label.bottom));
+              ensure(label.right <= box.left && label.bottom > box.top && label.top < box.bottom,
+                kind + ' tag label is not on the left of the field');
               ensure(add.left >= box.right && Math.abs(add.top - box.top) <= 2,
                 kind + ' Add tag offset is ' + (add.top - box.top));
+              if (kind === 'page') ensure(entry.parentElement.querySelector('.tag-chips').textContent.includes('No page tags yet'), 'Empty page tags lack a placeholder');
+              ensure([...entry.parentElement.querySelectorAll('.recent-tag-list button')].some(button => button.textContent === 'Reviewed in Inbox'),
+                'A recently filed tag is not available for quick reuse');
               input.value = `A new ${kind} tag`;
               input.dispatchEvent(new ui.view.KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true}));
               ensure(entry.closest('.tag-editor-scope').querySelector('.tag-chips').textContent.includes(`A new ${kind} tag`),
@@ -344,6 +366,62 @@ BRANCH = r"""
               'The two footer actions are not together');
             ensure(doc.documentElement.scrollWidth <= ui.view.innerWidth + 1, 'Tag editor overflowed its viewport');
             ui.tagEditor = null;
+          }
+          else if (command.action === 'inbox_filing_editor') {
+            const ensure = (value, message) => {if (!value) throw Error(message);};
+            const doc = ui.view.document;
+            await ui.refresh();
+            const wait = async (predicate, message) => {
+              for (let i = 0; i < 180; i++) {
+                if (predicate()) return;
+                await Zotero.Promise.delay(50);
+              }
+              throw Error(message + ' · ' + doc.getElementById('message').textContent);
+            };
+            const row = ui.latest.reviews.find(row => row.kind === 'zotero' && row.identity === command.key);
+            ensure(row, 'Expected a real Zotero review');
+            ui.tab = 'inbox'; ui.selected = row.id; ui.inboxFilter = 'all'; ui.render();
+            const button = label => [...doc.querySelectorAll('button')].find(node => node.textContent === label);
+            const field = label => [...doc.querySelectorAll('[data-notable-field]')].find(node => node.dataset.notableField === label);
+            const set = (label, value, event = 'input') => {
+              const input = field(label); ensure(input, 'Missing field ' + label); input.value = value;
+              input.dispatchEvent(new ui.view.Event(event, {bubbles: true}));
+            };
+            const filename = () => field('Proposed filename').value;
+            const previous = filename();
+            set('Document type', 'book', 'change');
+            await wait(() => filename() !== previous && /book/i.test(filename()), 'Type correction did not refresh the proposed filename');
+            doc.querySelector('[data-review-detail="citation"]').open = true;
+            set('Creators (one per line)', 'Reviewer, Jane');
+            set('Date or year', '2025-08-01');
+            set('Journal, publisher, or institution', 'Verified Journal');
+            set('DOI', '10.1000/reviewed');
+            button('Suggest filename').click();
+            await wait(() => !ui.busy && filename().includes('2025'), 'Citation edits did not inform the filename');
+            doc.querySelector('[data-review-detail="paper-tags"]').open = true;
+            set('Add paper tag', 'Reviewed in Inbox');
+            const control = doc.querySelector('[data-review-detail="paper-tags"] button[aria-label="Add paper tag"]');
+            control.click();
+            await wait(() => doc.querySelector('[data-review-detail="paper-tags"] .tag-chips').textContent.includes('Reviewed in Inbox'), 'Manual filing tag was not added');
+            button('Approve for reMarkable').click();
+            await wait(() => !ui.busy && !ui.filingQueue.length && !ui.latest.reviews.some(value => value.id === row.id), 'Citation and tag filing did not finish');
+            const parent = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, row.payload.parent);
+            ensure(parent.getField('DOI') === '10.1000/reviewed' && parent.getField('publicationTitle') === 'Verified Journal'
+              && parent.getField('date') === '2025-08-01' && parent.getCreators()[0].lastName === 'Reviewer', 'The exact Zotero citation was not updated');
+            ensure(parent.getTags().some(row => row.tag === 'Reviewed in Inbox'), 'The approved tag was not applied to Zotero');
+            ensure(JSON.parse(Zotero.Prefs.get('notable.recentTags', true))[0] === 'Reviewed in Inbox', 'The recent tag was not saved');
+            ensure(ui.latest.config.sync_paused, 'Approving the paper started tablet sync');
+            const saved = {queue: ui.filingQueue, busy: ui.busy, operation: ui.operation};
+            try {
+              ui.filingQueue = Array.from({length: 30}, (_, index) => ({id: `job-${index}`, title: 'A queued paper', method: 'approve', params: {identity: `pending-${index}`}}));
+              ui.busy = true; ui.operation = {method: 'approve', title: 'Filing this paper', detail: 'Long filename '.repeat(100), started: Date.now(), updated: Date.now()};
+              ui.render();
+              const queue = doc.querySelector('.filing-queue'), activity = doc.getElementById('activity');
+              ensure(!queue.open && queue.getBoundingClientRect().height < 48, 'The filing queue starts out taking over the Inbox');
+              ensure(activity.getBoundingClientRect().height < 76, 'The filing progress strip is too tall');
+              queue.open = true;
+              ensure(queue.querySelector('.filing-queue-jobs').clientHeight <= 190, 'The expanded filing queue does not scroll within its height');
+            } finally { ui.filingQueue = saved.queue; ui.busy = saved.busy; ui.operation = saved.operation; ui.filingQueueOpen = false; ui.render(); }
           }
           else if (command.action === 'inbox_alert_layout') {
             ui.latest = command.snapshot;
@@ -370,9 +448,96 @@ BRANCH = r"""
             ui.message(pdfError, true);
             response.alertWidth = ui.view.innerWidth;
           }
+          else if (command.action === 'folder_deletion_layout') {
+            const ensure = (value, message) => {if (!value) throw Error(message);};
+            const saved = {rpc: ui.rpc, latest: ui.latest, syncFailure: ui.syncFailure, tab: ui.tab};
+            const issue = {zotero: 'FOLDER23', tablet: '11111111-1111-4111-8111-111111111112',
+              zotero_name: 'Test', tablet_name: 'Test', zotero_state: '', tablet_state: 'trash',
+              mirror: {side: 'zotero', evidence: 'fixture', children: 0}};
+            const doc = ui.view.document;
+            const calls = [];
+            const button = label => [...doc.querySelectorAll('button')].find(node => node.textContent === label);
+            ui.view.resizeTo(command.width, 760);
+            await Zotero.Promise.delay(180);
+            try {
+              ui.latest = {...command.snapshot, reviews: [], deletions: [], local_deletions: [], folder_issues: [issue],
+                status: {}, config: {...command.snapshot.config, automatic: false, sync_paused: command.paused}};
+              const failure = 'A linked collection/folder was deleted or moved outside the selected roots. Review it before retrying.';
+              ui.tab = 'inbox'; ui.syncFailure = failure; ui.render();
+              ui.message(ui.statusMessage());
+              const message = doc.getElementById('message');
+              const range = doc.createRange(); range.selectNodeContents(message);
+              const lines = [...range.getClientRects()], bounds = message.getBoundingClientRect();
+              ensure(message.textContent === failure && message.getAttribute('role') === 'alert' && lines.length
+                && lines.every(line => line.right <= bounds.right + 1 && line.bottom <= bounds.bottom + 1),
+                'The saved sync failure was clipped after render');
+              ui.syncFailure = ''; ui.render();
+              const conflict = button('Sync Conflicts (1)');
+              ensure(conflict, 'Missing folder decision count');
+              conflict.click();
+              for (let i = 0; i < 40 && !button('Keep deletion on this device'); i++) await Zotero.Promise.delay(25);
+              ensure(doc.querySelector('.folder-sync-decision')?.textContent.includes('reMarkable folder “Test” is in Trash'),
+                'The folder decision did not identify the deleted folder and side');
+              ensure(!doc.querySelector('main').textContent.includes('No sync conflicts'), 'The empty message hid the folder decision');
+              ui.rpc = async (method, params) => {
+                calls.push(method);
+                if (method === 'confirm_folder_change') {
+                  ensure(JSON.stringify(params.issue) === JSON.stringify(issue), 'Wrong folder confirmation payload');
+                  ensure(params.choice === (command.paused ? 'mirror' : 'keep'), 'Wrong folder deletion choice');
+                  return {...ui.latest, folder_issues: [], folder_change: 'confirmed'};
+                }
+                ensure(method === 'sync', 'Unexpected RPC: ' + method);
+                return {...ui.latest, folder_change: undefined};
+              };
+              button(command.paused ? 'Also trash Zotero collection' : 'Keep deletion on this device').click();
+              const expected = command.paused ? 'confirm_folder_change' : 'confirm_folder_change,sync';
+              for (let i = 0; i < 40 && (calls.join(',') !== expected || ui.busy); i++) await Zotero.Promise.delay(25);
+              ensure(calls.join(',') === expected && !ui.busy, 'Confirmation resumed sync at the wrong time: ' + calls.join(','));
+              ensure(button('Sync Conflicts (0)'), 'Confirmation did not clear the resolved folder decision');
+            } finally {
+              ui.rpc = saved.rpc; ui.latest = saved.latest; ui.syncFailure = saved.syncFailure; ui.tab = saved.tab;
+              clearTimeout(ui.timer); ui.render();
+            }
+          }
+          else if (command.action === 'trash_matched_collection') {
+            const ensure = (value, message) => {if (!value) throw Error(message);};
+            const native = {Zotero};
+            Services.scriptloader.loadSubScript('chrome://notable/content/library.js', native);
+            const make = async (name, parent) => {
+              const row = new Zotero.Collection(); row.name = name;
+              if (parent) row.parentID = parent.id;
+              await row.saveTx(); return row;
+            };
+            const root = await make('Disposable connected root');
+            const folder = await make('Matching collection', root);
+            const child = await make('Subcollection', folder);
+            const other = await make('Unaffected collection', root);
+            const paper = new Zotero.Item('journalArticle'); paper.setField('title', 'Kept in My Library');
+            paper.setCollections([child.id, other.id]); await paper.saveTx();
+            const inventory = [folder, child].map(row => [row.key, row.parentKey || '', row.name, row.version || 0])
+              .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+            let staleRejected = false;
+            try { await native.notableTrashLinkedCollection({root: root.key, key: folder.key, inventory: inventory.slice(0, 1)}); }
+            catch (_) { staleRejected = true; }
+            ensure(staleRejected && !folder.deleted && !child.deleted, 'Changed collection inventory caused a deletion');
+            const result = await native.notableTrashLinkedCollection({root: root.key, key: folder.key, inventory});
+            ensure(result.trashed && folder.deleted && child.deleted, 'Zotero did not move the collection subtree to Trash');
+            ensure(!root.deleted && !other.deleted && !paper.deleted && paper.getCollections().includes(other.id),
+              'Deleting the collection changed other collections or trashed a paper');
+            const restored = await native.notableRestoreLinkedCollection({root: root.key, key: folder.key, parent: root.key, version: folder.version});
+            ensure(restored.restored && !folder.deleted && !child.deleted, 'The original Zotero collection and subcollection were not restored');
+            await Zotero.DB.executeTransaction(() => Zotero.Items.trash([paper.id]));
+            const restoredPaper = await native.notableRestoreLinkedItem({key: paper.key, parent: '', version: paper.version});
+            ensure(restoredPaper.restored && !paper.deleted && paper.getCollections().includes(other.id),
+              'The original Zotero reference was not restored');
+            await native.notableTrashLinkedCollection({root: root.key, key: folder.key, inventory});
+            response.trashedCollection = folder.key;
+          }
 """
 
 def checks(client, root, checked):
+    import json
+    import sqlite3
     from docx import Document
     from tests.test_zotero_intake import write_intake_pdf
     client.authorize()
@@ -383,6 +548,7 @@ def checks(client, root, checked):
     assert 'missing_pdf_parents' in catalog
     checked('native_item_events_reference_actions_and_bounded_filename_status_' + result['version'])
     checked('native_unchanged_background_check_unlocks_pdf_and_dismiss_buttons')
+    checked('native_dismiss_requires_explicit_confirmation')
     source = root / 'inbox-lifecycle.pdf'
     source.write_bytes(live.pdf_bytes())
     office = root / 'inbox-lifecycle.docx'
@@ -402,12 +568,25 @@ def checks(client, root, checked):
         live.command(root, 'inbox_alert_layout', snapshot=result['alertFixture'], width=width)
         live.command(root, 'snapshot', filename=f'inbox-alert-{width}.png')
     checked('native_Inbox_alerts_wrap_without_clipping_at_wide_and_narrow_widths')
+    for width, paused in [(1040, False), (640, True)]:
+        live.command(root, 'folder_deletion_layout', snapshot=result['alertFixture'], width=width, paused=paused)
+    checked('native_folder_deletion_decision_wraps_saved_alerts_and_respects_sync_pause')
+    trashed = live.command(root, 'trash_matched_collection')['trashedCollection']
+    assert client.get('collection', trashed)['deleted'], 'The worker could not read a saved collection in Zotero Trash'
+    checked('native_mirror_deletion_uses_collection_trash_and_keeps_papers_in_the_library')
     intake = root / 'ToSort'
     intake.mkdir()
     matched_pdf = intake / 'Synthetic ToSort match.pdf'
     write_intake_pdf(matched_pdf, 'Synthetic unique ToSort match', doi='10.1000/tosort-native')
     matched = live.command(root, 'tosort_pdf_match', inbox=str(intake), source=str(matched_pdf))
     checked('native_ToSort_DOI_match_requires_confirmation_and_verifies_cleanup_and_filing_selection')
+    state = root / 'profile' / 'notable'
+    config = json.loads((state / 'config.json').read_text(encoding='utf-8'))
+    with sqlite3.connect(state / 'bridge' / 'pilot.sqlite3') as db:
+        db.execute('INSERT OR IGNORE INTO bridge_values VALUES (?, ?)', ('folders', json.dumps({
+            config['zotero_root']: {'cloud': config['tablet_root'], 'root': True}})))
+    live.command(root, 'inbox_filing_editor', key=matched['attachment'])
+    checked('native_filing_updates_filename_citation_and_tags_and_keeps_progress_and_queue_compact')
     for width in [1040, 640]:
         live.command(root, 'tag_entry_layout', key=matched['attachment'], width=width)
         live.command(root, 'snapshot', filename=f'tag-entry-{width}.png')

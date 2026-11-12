@@ -106,6 +106,30 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(proposal['details']['journal'], 'Unknown')
         self.assertEqual(proposal['details']['year'], '12/2')
 
+    def test_filing_citation_and_tags_use_explicit_edits_and_keep_existing_data(self):
+        self.add_pdf()
+        self.zot.items['PARENT23']['tags'] = [{'tag': 'Existing tag', 'type': 1}]
+        self.zot.items['PARENT23']['extra'] = 'Existing citation notes'
+        with patch.object(self.worker.review, 'observe_ready', return_value=True):
+            status = self.worker.scan_inbox(discover=True)
+        row = next(row for row in status['reviews'] if row['kind'] == 'zotero')
+        edits = {'creators': 'Aubrey, Jane', 'date': '2022-09-03', 'venue': 'Reviewed University', 'doi': 'https://doi.org/10.1000/FILING'}
+        filename = self.worker.preview(row['id'], 'book', 'Reviewed title', citation=edits)['filename']
+        self.assertIn('Book', filename)
+        self.assertIn('2022', filename)
+        self.worker.approve(row['id'], row['digest'], filename, 'Reviewed title', 'book', 'ROOT2345',
+                            citation=edits, tags=['New tag', 'Existing tag'])
+        citation = self.zot.items['PARENT23']
+        self.assertEqual(citation['title'], 'Reviewed title')
+        self.assertEqual(citation['itemType'], 'thesis')
+        self.assertEqual(citation['creators'], [{'creatorType': 'author', 'firstName': 'Jane', 'lastName': 'Aubrey'}])
+        self.assertEqual(citation['date'], '2022-09-03')
+        self.assertEqual(citation['university'], 'Reviewed University')
+        self.assertEqual(citation['DOI'], '10.1000/filing')
+        self.assertEqual(citation['extra'], 'Existing citation notes')
+        self.assertEqual([tag for tag in citation['tags'] if tag['tag'] in {'Existing tag', 'New tag'}],
+                         [{'tag': 'Existing tag', 'type': 1}, {'tag': 'New tag'}])
+
     def test_filename_preview_does_not_reintroduce_unknown_placeholders(self):
         path = self.add_pdf()
         details = {'title': 'Targeted K-edge nanoprobes', 'document_type': 'journal_article',
@@ -249,6 +273,92 @@ class WorkerTests(unittest.TestCase):
         self.cloud.update_item(current.id, expected_hash=current.hash, name='Tablet rename', scope_id=self.croot.id)
         self.worker.sync()
         self.assertEqual(self.zot.collection_records[key]['name'], 'Tablet rename')
+
+    def test_confirm_tablet_folder_deletion_preserves_branch_and_keeps_syncing(self):
+        folder = self.cloud.create_folder('Test', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        nested = self.cloud.create_folder('Nested', folder.id, str(uuid.uuid4()), self.croot.id)
+        self.worker.sync()
+        maps = self.worker.state.read('folders')
+        key = next(k for k, link in maps.items() if link['cloud'] == folder.id)
+        child = next(k for k, link in maps.items() if link['cloud'] == nested.id)
+        self.add_pdf()
+        self.zot.items['PARENT23']['collections'] = [child]
+        with patch.object(self.worker.review, 'observe_ready', return_value=True):
+            self.worker.sync()
+        row = next(row for row in self.worker.review.rows() if row['kind'] == 'zotero')
+        self.worker.approve(row['id'], row['digest'], 'Reviewed.pdf', 'Dissertation', 'thesis_dissertation', child)
+        self.worker.sync()
+        documents = self.worker.state.read('documents')
+        paper = next(item for item in self.cloud.library() if item.id in documents)
+        self.cloud.update_item(paper.id, expected_hash=paper.hash, parent='trash', scope_id=self.croot.id)
+        self.cloud.update_item(folder.id, expected_hash=folder.hash, parent='trash', scope_id=self.croot.id)
+        unrelated = self.cloud.create_folder('Still syncing', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        replacement = self.cloud.create_folder('Test', self.croot.id, str(uuid.uuid4()), self.croot.id)
+
+        result = self.worker.sync()
+        self.assertEqual(len(result['folder_issues']), 1)
+        issue = result['folder_issues'][0]
+        self.assertEqual((issue['tablet_name'], issue['tablet_state']), ('Test', 'trash'))
+        self.assertEqual(set(result['blocked_collections']), {key, child})
+        self.assertTrue(result['last_sync_at'])
+        self.assertEqual(self.worker.state.read('documents'), documents)
+        self.assertFalse(result['deletions'], 'Folder deletion must not become a per-paper deletion')
+        self.assertIn(unrelated.id, {link['cloud'] for link in result['mappings'].values()})
+        self.assertNotIn(replacement.id, {link['cloud'] for link in result['mappings'].values()})
+
+        stale = self.worker.confirm_folder_change({**issue, 'tablet_name': 'Older snapshot'})
+        self.assertEqual(stale['folder_change'], 'changed')
+        cloud_hash, writes = self.cloud.root_hash, self.zot.writes
+        confirmed = self.worker.confirm_folder_change(issue)
+        self.assertEqual(confirmed['folder_change'], 'confirmed')
+        self.assertFalse(confirmed['folder_issues'])
+        self.assertEqual((self.cloud.root_hash, self.zot.writes), (cloud_hash, writes))
+        self.assertIn(child, self.zot.collection_records)
+        self.assertEqual(self.zot.items['PARENT23']['collections'], [child])
+        self.assertTrue(self.zot.file_path('SOURCE23').is_file())
+        restarted = Worker(self.worker.directory, zotero_factory=lambda: self.zot, cloud_factory=lambda: self.cloud)
+        restarted.config = self.worker.config
+        self.assertFalse(restarted.sync()['folder_issues'])
+        self.assertEqual(self.cloud.root_hash, cloud_hash)
+
+    def test_mirror_deleted_zotero_collection_requires_current_tablet_branch(self):
+        folder = self.cloud.create_folder('Matching folder', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        other = self.cloud.create_folder('Other folder', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        self.worker.sync()
+        key = next(k for k, link in self.worker.state.read('folders').items() if link['cloud'] == folder.id)
+        del self.zot.collection_records[key]
+        issue = self.worker.sync()['folder_issues'][0]
+        self.assertEqual(issue['mirror']['side'], 'tablet')
+        self.assertEqual(issue['mirror']['children'], 0)
+        nested = self.cloud.create_folder('Added since review', folder.id, str(uuid.uuid4()), self.croot.id)
+        checked = self.worker.confirm_folder_change(issue, 'mirror')
+        self.assertEqual(checked['folder_change'], 'changed')
+        self.assertFalse(next(item for item in self.cloud.library() if item.id == folder.id).deleted)
+        self.assertEqual(checked['folder_issues'][0]['mirror']['children'], 1)
+        result = self.worker.confirm_folder_change(checked['folder_issues'][0], 'mirror')
+        self.assertEqual(result['folder_choice'], 'mirror')
+        self.assertFalse(result['folder_issues'])
+        records = {item.id: item for item in self.cloud.library()}
+        self.assertEqual(records[folder.id].parent, 'trash')
+        self.assertEqual(records[nested.id].parent, folder.id)
+        self.assertFalse(records[other.id].deleted)
+        self.assertFalse(self.worker.sync()['folder_issues'])
+
+    def test_restore_tablet_folder_keeps_same_connection_and_nested_folder(self):
+        folder = self.cloud.create_folder('Moved to Trash', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        nested = self.cloud.create_folder('Nested', folder.id, str(uuid.uuid4()), self.croot.id)
+        self.worker.sync()
+        original = self.worker.state.read('folders')
+        self.cloud.update_item(folder.id, expected_hash=folder.hash, parent='trash', scope_id=self.croot.id)
+        issue = self.worker.sync()['folder_issues'][0]
+        self.assertEqual(issue['undo']['side'], 'tablet')
+        result = self.worker.confirm_folder_change(issue, 'restore')
+        self.assertFalse(result['folder_issues'])
+        self.assertFalse(result['blocked_collections'])
+        current = {row.id: row for row in self.cloud.library()}
+        self.assertEqual(current[folder.id].parent, self.croot.id)
+        self.assertEqual(current[nested.id].parent, folder.id)
+        self.assertEqual(self.worker.state.read('folders'), original)
 
     def test_concurrent_folder_edits_require_explicit_choice(self):
         child = self.cloud.create_folder('Topic', self.croot.id, str(uuid.uuid4()), self.croot.id)

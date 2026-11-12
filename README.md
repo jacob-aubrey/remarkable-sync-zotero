@@ -19,6 +19,12 @@ If a PDF in your configured ToSort folder identifies a unique Zotero reference t
 
 Matching runs locally. It uses explicit DOI evidence read by the bundled [PyMuPDF](https://pymupdf.readthedocs.io/en/latest/document.html) and the existing DOI normalizer. A printed DOI also needs a matching paper title. Attaching uses Zotero’s existing [stored-copy workflow](https://www.zotero.org/support/attaching_files).
 
+Inbox lets you edit citation details and add paper tags before approval. Changing the document type updates the suggested filename. Use **Suggest filename** to include citation edits or replace a manually entered name. Approval saves the edited fields using the Zotero reference’s existing item type and adds your tags to its current tags. [Zotero item fields](https://www.zotero.org/support/kb/item_types_and_fields) · [Zotero write API](https://www.zotero.org/support/dev/web_api/v3/write_requests)
+
+### Confirm a linked folder deletion
+
+If a linked subfolder is deleted or moved out of the connection, its folder pair pauses while the other folders continue syncing. Open **Sync Conflicts** to review the folder by name. You can keep the deletion on one device, also trash the matching folder, or restore the original folder when it is still in Trash and its previous parent is available. Trashing a Zotero collection keeps its papers in My Library. Trashing a reMarkable folder also removes its contents from the active library. [Zotero collection deletion](https://www.zotero.org/support/collections_and_tags#deleting_collections)
+
 ## Build from source
 
 Use Windows x64 and Python 3.13. Download **third-party-source.zip** from the matching GitHub release and extract it. Its `ocr-build-resources` directory contains the pinned models and their notices.
@@ -30,7 +36,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.13.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.14.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

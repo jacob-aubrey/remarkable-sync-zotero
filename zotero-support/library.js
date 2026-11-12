@@ -22,6 +22,69 @@ function notableReviewItemInTrash(item) {
   return item.deleted || (typeof item.isInTrash === 'function' && item.isInTrash());
 }
 
+async function notableTrashLinkedCollection({root, key, inventory}) {
+  const itemKey = /^[23456789ABCDEFGHIJKLMNPQRSTUVWXYZ]{8}$/;
+  const library = Zotero.Libraries.userLibraryID;
+  if (!itemKey.test(root || '') || !itemKey.test(key || '') || key === root
+      || !Array.isArray(inventory) || !Zotero.Libraries.hasTrash(library)) throw Error('Invalid folder decision');
+  return Zotero.DB.executeTransaction(async () => {
+    const collections = Zotero.Collections.getByLibrary(library, true);
+    const byKey = new Map(collections.map(row => [row.key, row]));
+    const target = byKey.get(key);
+    let ancestor = target;
+    const seen = new Set();
+    while (ancestor && ancestor.key !== root && !seen.has(ancestor.key)) {
+      seen.add(ancestor.key);
+      ancestor = byKey.get(ancestor.parentKey);
+    }
+    if (!target || ancestor?.key !== root) throw Error('The connected collection changed');
+    const children = target.getDescendents(false, 'collection', false).map(child => Zotero.Collections.get(child.id));
+    const current = [target, ...children].map(row => [row.key, row.parentKey || '', row.name, row.version || 0])
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    if (JSON.stringify(current) !== JSON.stringify(inventory)) throw Error('The collection or its subcollections changed');
+    target.deleted = true;
+    await target.save({deleteItems: false});
+    return {trashed: true};
+  });
+}
+
+async function notableRestoreLinkedCollection({root, key, parent, version}) {
+  const itemKey = /^[23456789ABCDEFGHIJKLMNPQRSTUVWXYZ]{8}$/;
+  const library = Zotero.Libraries.userLibraryID;
+  if (![root, key, parent].every(value => itemKey.test(value || '')) || !Number.isInteger(version)
+      || key === root || !Zotero.Libraries.hasTrash(library)) throw Error('Invalid folder decision');
+  return Zotero.DB.executeTransaction(async () => {
+    const active = new Map(Zotero.Collections.getByLibrary(library, true).map(row => [row.key, row]));
+    const target = await Zotero.Collections.getByLibraryAndKeyAsync(library, key);
+    const seen = new Set();
+    let ancestor = active.get(parent);
+    while (ancestor && ancestor.key !== root && !seen.has(ancestor.key)) {
+      seen.add(ancestor.key); ancestor = active.get(ancestor.parentKey);
+    }
+    if (ancestor?.key !== root || !target?.deleted || target.parentKey !== parent || target.version !== version) {
+      throw Error('The collection or its destination changed');
+    }
+    const children = target.getDescendents(false, 'collection', true).map(row => Zotero.Collections.get(row.id));
+    for (const row of [target, ...children]) if (row.deleted) { row.deleted = false; await row.save(); }
+    return {restored: true};
+  });
+}
+
+async function notableRestoreLinkedItem({key, version, parent}) {
+  return Zotero.DB.executeTransaction(async () => {
+    const item = await notableItem(key);
+    if (!item?.deleted || item.version !== version || (item.parentKey || '') !== parent
+        || !(item.isRegularItem() || notableIsPDFFile(item))) throw Error('The Zotero item changed');
+    if (parent) {
+      const owner = await notableItem(parent);
+      if (!owner || notableReviewItemInTrash(owner)) throw Error('The parent reference is in Trash');
+    }
+    item.deleted = false;
+    await item.save();
+    return {restored: true};
+  });
+}
+
 function notableIsPDFFile(item) {
   return item.isFileAttachment() && (item.isPDFAttachment() || /\.pdf$/i.test(item.attachmentFilename || ''));
 }
@@ -432,6 +495,14 @@ function notableRegisterLibraryEndpoint(Base) {
       if (data.action === 'create_collection') {
         try { return reply(200, await notableCreateCollection(data)); }
         catch (error) { return reply(error.navigationStatus || 409, {error: error.navigationStatus ? error.message : 'The collection could not be created. Retry safely.'}); }
+      }
+      if (data.action === 'trash_linked_collection') {
+        try { return reply(200, await notableTrashLinkedCollection(data)); }
+        catch (_) { return reply(409, {error: 'The matching collection changed or could not be moved to Trash.'}); }
+      }
+      if (data.action === 'restore_linked_collection' || data.action === 'restore_linked_item') {
+        try { return reply(200, await (data.action === 'restore_linked_collection' ? notableRestoreLinkedCollection(data) : notableRestoreLinkedItem(data))); }
+        catch (_) { return reply(409, {error: 'The original Zotero record changed or could not be restored.'}); }
       }
       if (data.action === 'navigate_review') {
         try {

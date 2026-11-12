@@ -115,6 +115,28 @@ class ReviewDecisionTests(unittest.TestCase):
         self.assertFalse(next(i for i in self.cloud.library() if i.id == self.paper.id).deleted)
         self.zot.review_action.assert_not_called()
 
+    def test_keep_zotero_resolves_tablet_deletion_without_a_write_to_either_device(self):
+        key, _ = self.deleted()
+        before = self.cloud.root_hash
+        self.store.resolve_deletion(key, 'keep_zotero', cloud=self.cloud, zotero=self.zot, scope=self.root.id)
+        self.assertEqual(self.cloud.root_hash, before)
+        self.zot.review_action.assert_not_called()
+        self.assertEqual(self.store.deletions(), [])
+        self.assertIn(self.paper.id, self.store.suspended_documents())
+
+    def test_restore_zotero_resumes_exact_link_without_changing_tablet_copy(self):
+        record = {'key': 'VIEW2345', 'deleted': True, 'parentItem': 'PARENT23', 'version': 12}
+        self.store.confirm_zotero_deleted(self.paper, self.link, record)
+        row = self.store.local_deletions()[0]
+        self.zot.get.return_value = record
+        self.zot.review_action.return_value = {'restored': True}
+        before = self.cloud.root_hash
+        self.store.resolve_local_deletion(row['id'], 'restore_zotero', cloud=self.cloud, zotero=self.zot, scope=self.root.id)
+        self.zot.review_action.assert_called_once_with('restore_linked_item', {'key': 'VIEW2345', 'version': 12, 'parent': 'PARENT23'})
+        self.assertEqual(self.cloud.root_hash, before)
+        self.assertEqual(self.store.local_deletions(), [])
+        self.assertNotIn(self.paper.id, self.store.suspended_documents())
+
     def test_missing_restore_destination_does_not_commit_unrecoverable_action(self):
         self.link['tablet_parent'] = 'missing-folder'
         key, _ = self.deleted()

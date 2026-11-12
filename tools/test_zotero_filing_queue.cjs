@@ -19,7 +19,7 @@ function fixture() {
 function reviewFixture() {
   const {ui} = fixture(); const fields = new Map(), buttons = new Map();
   const node = (value = '') => ({value, dataset: {}, selectedOptions: [], listeners: {},
-    addEventListener(name, callback) { this.listeners[name] = callback; }, setAttribute() {}});
+    addEventListener(name, callback) { this.listeners[name] = callback; }, setAttribute() {}, replaceChildren() {}});
   ui.el = () => node();
   ui.field = (label, parent, value) => { const input = node(value); input.notableRefreshValue = () => {}; fields.set(label, input); return input; };
   ui.select = (label, parent, options, selected = '') => {
@@ -198,11 +198,25 @@ async function main() {
     assert.equal(fields.get('PDF already found in Zotero').value, 'existing', 'Reuse the single verified existing PDF by default');
     const match = fields.get('PDF already found in Zotero');
     match.value = ''; match.listeners.change();
-    ui.action = async () => ({filename: 'Preview.pdf'});
+    ui.rpc = async () => ({filename: 'Preview.pdf'});
     await buttons.get('Suggest filename').click();
     ui.renderReview({});
     assert.equal(fields.get('Proposed filename').value, 'Preview.pdf', 'A generated filename survives tab switching and queue rerenders');
     assert.equal(fields.get('PDF already found in Zotero').value, '', 'An explicit Keep separate choice survives rerenders');
+    ui.rpc = async (method, params) => {
+      assert.equal(method, 'preview'); assert.equal(params.document_type, 'book');
+      return {filename: 'Paper_Book.pdf'};
+    };
+    const type = fields.get('Document type'); type.value = 'book'; type.listeners.change();
+    await tick();
+    assert.equal(fields.get('Proposed filename').value, 'Paper_Book.pdf', 'Changing the document type refreshes a generated filename');
+    const venue = fields.get('Journal, publisher, or institution'); venue.value = 'Reviewed venue'; venue.listeners.input();
+    const tag = fields.get('Add paper tag'); tag.value = 'Reviewed tag'; tag.listeners.input();
+    let approved;
+    ui.queueFiling = async (_method, params) => {approved = params;};
+    await buttons.get('Approve & file').click();
+    assert.deepEqual(JSON.parse(JSON.stringify(approved.citation)), {venue: 'Reviewed venue'});
+    assert.deepEqual(Array.from(approved.tags), ['Reviewed tag']);
     ui.latest.reviews[0].payload.routine = true;
     ui.renderReview({});
     const destination = fields.get('Linked folders for this batch (Zotero → reMarkable)');

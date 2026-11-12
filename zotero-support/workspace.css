@@ -133,13 +133,15 @@ details { margin: 18px 0; } summary { cursor: pointer; font-weight: 600; }
 .tag-editor-scope { margin-block: 20px; }
 .tag-editor-scope > h3 { margin: 0 0 8px; }
 .tag-editor-scope > .tag-chips:empty { display: none; }
-.tag-editor-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 10px; }
-.tag-editor-entry > .field, .tag-editor-entry > .field > label { display: grid; grid-template-rows: subgrid; margin: 0; }
-.tag-editor-entry > .field { grid-column: 1; grid-row: 1 / span 3; }
-.tag-editor-entry > .field > label { grid-row: 1 / span 2; }
-.tag-editor-entry > .field > label > span { margin-block-end: 6px; }
-.tag-editor-entry input { margin: 0; }
-.tag-editor-entry > .actions { grid-column: 2; grid-row: 2; align-self: start; margin: 0; }
+.tag-editor-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.tag-editor-entry > .field { margin: 0; }
+.tag-editor-entry > .field > label { display: flex; align-items: center; gap: 10px; }
+.tag-editor-entry > .field > label > span { flex: 0 0 auto; margin: 0; }
+.tag-editor-entry input { flex: 1; min-width: 0; margin: 0; }
+.tag-editor-entry > .actions { align-self: start; margin: 0; }
+.recent-tag-list { margin-block: 8px; }
+.recent-tag-list > .tag-chips { margin: 4px 0 0; }
+.recent-tag-list button { min-height: 30px; padding: 3px 9px; }
 .tag-editor-footer { margin-block-end: 0; }
 @media (max-width: 700px) { #app { padding: 18px; } .review-layout { grid-template-columns: 1fr; } .review-layout > aside { contain: none; max-height: 35vh; min-height: 120px; } }
 
@@ -179,10 +181,25 @@ nav button.sync-conflicts-attention[aria-pressed="true"] .button-icon { color: #
 }
 
 .workspace-status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; margin-bottom: 12px; }
+.workspace-status .activity { flex: 1 0 100%; align-items: center; gap: 8px; margin: 0; padding: 5px 10px; border-left-width: 3px; }
+.workspace-status .activity-spinner { flex-basis: 14px; width: 14px; height: 14px; border-width: 2px; }
+.activity-content [role="status"] { display: flex; align-items: center; gap: 8px; }
+.activity-content #activity-title { flex: 0 1 16em; block-size: 1.5em; min-width: 0; font-size: inherit; }
+.activity-content #activity-detail { flex: 1 1 14em; block-size: 1.5em; min-width: 0; margin: 0; }
+.activity-content #activity-progress { flex: 0 0 58px; block-size: 8px; }
+.activity-content #activity-time { block-size: 1.4em; margin: 2px 0 0; }
+.filing-queue { margin: 0 0 10px; padding: 5px 10px; border: 1px solid GrayText; border-radius: 5px; }
+.filing-queue > summary { cursor: pointer; }
+.filing-queue-jobs { max-block-size: min(28vh, 190px); overflow: auto; scrollbar-gutter: stable; }
+.filing-queue-jobs p { margin: 5px 0; }
+.queued-filing { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.queued-filing > .actions { margin: 2px 0; }
+.review-dismiss { max-inline-size: min(420px, calc(100% - 24px)); max-block-size: calc(100vh - 24px); overflow: auto; padding: 16px; border: 1px solid GrayText; border-radius: 7px; }
+.review-dismiss > .actions { margin: 12px 0 0; justify-content: end; }
 #notable-sync-details { flex: 1 0 100%; min-width: 0; }
 #notable-sync-step { margin: 4px 0 0; max-block-size: 4.5em; overflow: auto; overflow-wrap: anywhere; }
 .workspace-status #message { flex: 1 1 220px; margin: 0; min-width: 0; block-size: 1.6em; max-width: 100%; }
-.workspace-status #message.error {
+.workspace-status #message:is(.error, .attention) {
   flex-basis: 100%;
   block-size: auto;
   overflow: visible;

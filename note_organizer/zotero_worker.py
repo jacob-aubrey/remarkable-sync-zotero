@@ -21,7 +21,8 @@ import traceback
 import uuid
 
 from .remarkable_cloud import CloudClient, CloudError, TokenVault, atomic_write
-from .zotero_bridge import Bridge, BridgeState, descendants
+from .zotero_bridge import (Bridge, BridgeState, descendants, folder_blocked_papers, sync_collections,
+                            sync_folder_scope, zotero_folder_inventory)
 from .zotero_pilot import AuthorizationRequired, LocalZotero, PilotError, TransportInterrupted, stable_key
 from .zotero_review import (ReviewStore, fingerprint, cloud_change_intent,
                             cloud_change_done)
@@ -66,6 +67,12 @@ TYPE_MAP = {"journal_article": "journalArticle", "preprint": "preprint", "confer
             "technical_report": "report", "white_paper": "report", "guideline_standard": "standard",
             "presentation_poster": "presentation", "letter_note": "letter", "patent": "patent",
             "patent_application": "patent", "web_or_other": "document", "unknown": "document"}
+CITATION_VENUE = {'journalArticle': 'publicationTitle', 'magazineArticle': 'publicationTitle', 'newspaperArticle': 'publicationTitle',
+                  'preprint': 'repository', 'conferencePaper': 'proceedingsTitle', 'bookSection': 'bookTitle',
+                  'book': 'publisher', 'thesis': 'university', 'report': 'institution', 'presentation': 'meetingName',
+                  'patent': 'issuingAuthority', 'standard': 'organization', 'webpage': 'websiteTitle', 'document': 'publisher'}
+NATIVE_DOI_TYPES = {*TYPE_MAP.values(), 'magazineArticle', 'newspaperArticle', 'webpage'}
+CITATION_EDITS = {'creators', 'date', 'venue', 'doi', 'patent_number'}
 
 
 def file_sha(path):
@@ -75,7 +82,7 @@ def file_sha(path):
 
 def citation_signature(record):
     return fingerprint({key: (record or {}).get(key, "") for key in (
-        "title", "itemType", "creators", "date", "DOI", "publicationTitle", "publisher", "university", "extra")})
+        'title', 'itemType', 'creators', 'date', 'DOI', 'extra', 'issueDate', 'filingDate', 'patentNumber', *set(CITATION_VENUE.values()))})
 
 
 def creator_record(name, creator_type):
@@ -89,6 +96,62 @@ def creator_record(name, creator_type):
         parts = name.rsplit(None, 1)
         first, last = parts if len(parts) == 2 else ('', name)
     return {'creatorType': creator_type, 'firstName': first, 'lastName': last}
+
+
+def creator_role(item_type):
+    return {'presentation': 'presenter', 'patent': 'inventor'}.get(item_type, 'author')
+
+
+def creator_name(creator):
+    return creator.get('name') or ' '.join(filter(None, [creator.get('firstName'), creator.get('lastName')]))
+
+
+def clean_citation_edits(values):
+    from .sorting.metadata_lookup import normalize_doi
+    if values is None:
+        return {}
+    if not isinstance(values, dict) or any(key not in CITATION_EDITS or not isinstance(value, str) or len(value) > 4000
+                                          for key, value in values.items()):
+        raise PilotError('Review the citation fields before continuing.')
+    cleaned = {key: value.strip() for key, value in values.items()}
+    if any('\n' in value or '\r' in value for key, value in cleaned.items() if key != 'creators'):
+        raise PilotError('Use a single line for each citation field other than creators.')
+    if cleaned.get('doi'):
+        doi = normalize_doi(cleaned['doi'])
+        if not doi:
+            raise PilotError('Enter a valid DOI or clear the DOI field.')
+        cleaned['doi'] = doi
+    return cleaned
+
+
+def citation_patch(reference, edits, document_type):
+    if not edits:
+        return {}
+    item_type = reference['itemType']
+    fields = {'date': ('filingDate' if document_type == 'patent_application' else 'issueDate') if item_type == 'patent' else 'date',
+              'venue': CITATION_VENUE.get(item_type), 'doi': 'DOI' if item_type in NATIVE_DOI_TYPES else None,
+              'patent_number': 'patentNumber' if item_type == 'patent' else None}
+    patch = {}
+    extra = reference.get('extra', '')
+    for name, value in edits.items():
+        if name == 'creators':
+            role = creator_role(item_type)
+            primary = {creator_name(row): row for row in reference.get('creators', []) if row.get('creatorType') == role}
+            others = [row for row in reference.get('creators', []) if row.get('creatorType') != role]
+            creators = [line.strip() for line in value.splitlines() if line.strip()]
+            patch['creators'] = [primary.get(name) or creator_record(name, role) for name in creators] + others
+        elif field := fields[name]:
+            patch[field] = value
+            if name == 'doi':
+                extra = re.sub(r'^DOI:[^\r\n]*(?:\r?\n|$)', '', extra, flags=re.I | re.M).strip()
+        else:
+            label = {'venue': 'Publisher', 'doi': 'DOI', 'patent_number': 'Patent Number'}[name]
+            extra = re.sub(rf'^{re.escape(label)}:[^\r\n]*(?:\r?\n|$)', '', extra, flags=re.I | re.M).strip()
+            if value:
+                extra = '\n'.join(filter(None, [extra, f'{label}: {value}']))
+    if extra != reference.get('extra', ''):
+        patch['extra'] = extra
+    return patch
 
 
 def write_packet(transport, packet):
@@ -288,6 +351,10 @@ class Worker:
         from .zotero_bulk import intake_pdf_suggestions
         config = {k: v for k, v in self.config.items() if k != "server_id"}
         pending_reviews = self.review.rows(inbox_order=True)
+        folder_blocks = self.state.read('folder_blocks', {})
+        blocked_tablet = set(folder_blocks.get('tablet', []))
+        pending_reviews = [row for row in pending_reviews if row['kind'] != 'cloud'
+                           or row['payload'].get('tablet_parent') not in blocked_tablet]
         suggestions = intake_pdf_suggestions(pending_reviews) if config.get('inbox') else {}
         for row in pending_reviews:
             if row['id'] in suggestions:
@@ -315,6 +382,7 @@ class Worker:
                 "reviews": pending_reviews, "review_guidance": review_guidance,
                 "deletions": self.review.deletions(), "local_deletions": self.review.local_deletions(), "types": DOCUMENT_TYPE_LABELS,
                 "collections": self.collections, "mappings": self.state.read("folders", {}),
+                'folder_issues': folder_blocks.get('issues', []), 'blocked_collections': folder_blocks.get('zotero', []),
                 "cleanup_pending": len(self.review.cleanups()), "bulk": self.bulk.read(),
                 'filing_summary': {'approved_waiting_sync': len(waiting), 'linked': len(available),
                                    'pdfs_received': sum(bool(row.get('revision')) for row in available.values())},
@@ -839,15 +907,25 @@ class Worker:
             details["document_type"] = reverse[metadata["itemType"]]
         creators = metadata.get("creators", [])
         if creators:
-            details["creators"] = [c.get("name") or " ".join(filter(None, [c.get("firstName"), c.get("lastName")])) for c in creators]
+            details["creators"] = [creator_name(c) for c in creators]
             details["primary_creator"] = details["creators"][0]
-        if metadata.get("date"):
+        item_type = metadata.get('itemType', '')
+        date = metadata.get('date') or metadata.get('issueDate') or metadata.get('filingDate') or ''
+        if date:
             from .sorting.core_logic import _normalize_year
-            year = _normalize_year(metadata['date'])
+            year = _normalize_year(date)
             if year != 'Unknown':
                 details['year'] = year
-        if metadata.get('publicationTitle'):
-            details['journal'] = metadata['publicationTitle']
+        venue = metadata.get(CITATION_VENUE.get(item_type, ''), '') or metadata.get('publicationTitle', '')
+        if venue:
+            details['venue_or_publisher'] = venue
+            if item_type in {'journalArticle', 'preprint'} or metadata.get('publicationTitle'):
+                details['journal'] = venue
+        if metadata.get('patentNumber'):
+            details['patent_number'] = metadata['patentNumber']
+        doi_extra = re.search(r'^DOI:\s*([^\r\n]+)', metadata.get('extra', ''), flags=re.I | re.M)
+        if doi := metadata.get('DOI') or (doi_extra[1].strip() if doi_extra else ''):
+            details['identifier'] = {**(details.get('identifier') or {}), 'doi': doi}
         # Extraction warnings about missing fields stop being true when the
         # authoritative Zotero citation supplies them.
         from .sorting.core_logic import _missing_citation_fields, _normalize_year
@@ -899,7 +977,11 @@ class Worker:
         basis = ('Existing filename' if name == path.name else
                  'Zotero citation and local document details' if metadata.get('key') else
                  'Saved source title and local document details' if metadata.get('title') else 'Local document details')
-        return {"details": details, "filename": name, "title": details.get("title", path.stem),
+        citation = {'creators': '\n'.join(creator_name(c) for c in creators if c.get('creatorType') == creator_role(item_type))
+                    if metadata.get('key') else '\n'.join(details.get('creators') or [details.get('primary_creator', '')]),
+                    'date': date or str(details.get('year') or ''), 'venue': venue or details.get('venue_or_publisher') or details.get('journal', ''),
+                    'doi': details.get('identifier', {}).get('doi', ''), 'patent_number': details.get('patent_number') or details.get('identifier', {}).get('patent', '')}
+        return {"details": details, "filename": name, "title": details.get("title", path.stem), 'citation': citation,
                 "document_type": details["document_type"], "parent": metadata.get("key", ""),
                 'naming_evidence': {'source': basis, 'method': 'Naming template' if template else 'Smart naming',
                                     'checked_at': now()},
@@ -1109,7 +1191,7 @@ class Worker:
             if pdf_state == 'preparing' and len(pdf_keys) == 1:
                 references[key]['preparing_attachment'] = pdf_keys[0]
         self.review.reconcile_references(references)
-        return {**native, 'files_settling': files_settling}
+        return {**native, 'files_settling': files_settling, 'collections': collections}
 
     def _catalog(self, client, cloud):
         self.catalog_issues = []
@@ -1119,10 +1201,12 @@ class Worker:
         self.scan_inbox(catalog=True)
         self.progress('Reading reMarkable’s file list…')
         catalog = cloud.library()
-        folders = [r for r in catalog if r.kind == 'CollectionType']
-        scope = descendants(folders, self.config['tablet_root'], lambda r: r.id, lambda r: r.parent,
-                            unavailable={r.id for r in folders if r.deleted})
-        scope = connections.filtered_scope(scope, excluded['tablet'], lambda r: r.id, lambda r: r.parent, self.config['tablet_root'])
+        confirmed = self.state.read('folder_blocks', {}).get('confirmed', {})
+        mappings = self.state.read('folders', {})
+        _, scope, blocked = sync_folder_scope(sync_collections(client, mappings, native['collections']), catalog, self.config['zotero_root'],
+                                               self.config['tablet_root'], mappings, excluded, confirmed)
+        self.state.write('folder_blocks', blocked)
+        held_papers = folder_blocked_papers(documents, catalog, blocked)
         candidates = []
         native_by_digest = None
         prior = {(row['kind'], row['identity']): row for row in self.review.rows(pending_only=False)}
@@ -1200,6 +1284,8 @@ class Worker:
                                                        and name == title_key(Path(r["title"]).stem)]}
                 self.review.offer(row["kind"], row["identity"], row["digest"], payload)
         for identity, link in documents.items():
+            if identity in held_papers:
+                continue  # A folder change is not evidence of an individual paper deletion.
             item = next((r for r in catalog if r.id == identity), None)
             interrupted = prior.get(('cloud', identity))
             if interrupted and interrupted['status'] == 'applying':
@@ -1619,6 +1705,60 @@ class Worker:
         self.review.dismiss(identity, digest)
         return self.status()
 
+    def confirm_folder_change(self, issue, choice='keep'):
+        """Resolve the exact live folder pair the user reviewed."""
+        if not self.config.get('tablet_root') or not isinstance(issue, dict) or choice not in {'keep', 'mirror', 'restore'}:
+            raise PilotError('Choose a current folder issue in Sync Conflicts.')
+        client = self.zotero()
+        try:
+            with self.state.lock():
+                cloud = self.cloud()
+                mappings = self.state.read('folders', {})
+                collections, catalog = sync_collections(client, mappings), cloud.library()
+                confirmed = self.state.read('folder_blocks', {}).get('confirmed', {})
+                scope_args = (collections, catalog, self.config['zotero_root'], self.config['tablet_root'],
+                              mappings, connections.exclusions(self.directory, self.config))
+                _, _, current = sync_folder_scope(*scope_args, confirmed)
+                if issue not in current['issues']:
+                    self.state.write('folder_blocks', current)
+                    return {**self.status(), 'folder_change': 'changed'}
+                if choice == 'restore':
+                    undo = issue.get('undo', {})
+                    if undo.get('side') == 'tablet':
+                        restored = cloud.update_item(issue['tablet'], expected_hash=undo['version'], parent=undo['parent'],
+                                                     scope_id=self.config['tablet_root'], restore=True)
+                        if restored.deleted or restored.parent != undo['parent']:
+                            raise PilotError('The restored reMarkable folder could not be verified.')
+                    elif undo.get('side') == 'zotero':
+                        result = client.review_action('restore_linked_collection', {'key': issue['zotero'],
+                            'root': self.config['zotero_root'], 'parent': undo['parent'], 'version': undo['version']})
+                        if not result.get('restored'):
+                            raise PilotError('The restored Zotero collection could not be verified.')
+                    else:
+                        raise PilotError('The deleted folder is no longer available to restore to its previous parent.')
+                    scope_args = (sync_collections(client, mappings), cloud.library(), *scope_args[2:])
+                elif choice == 'mirror':
+                    mirror = issue.get('mirror', {})
+                    if mirror.get('side') == 'zotero':
+                        result = client.review_action('trash_linked_collection', {'root': self.config['zotero_root'],
+                            'key': issue['zotero'], 'inventory': zotero_folder_inventory(collections, issue['zotero'])})
+                        if not result.get('trashed'):
+                            raise PilotError('Zotero could not verify the matching collection. Sync to review it again.')
+                    elif mirror.get('side') == 'tablet':
+                        folder = next(item for item in catalog if item.id == issue['tablet'])
+                        moved = cloud.update_item(folder.id, expected_hash=folder.hash, parent='trash', scope_id=self.config['tablet_root'])
+                        if not moved.deleted or moved.parent != 'trash':
+                            raise PilotError('The matching reMarkable folder could not be verified in Trash.')
+                    else:
+                        raise PilotError('The matching folder cannot be moved to Trash from this review.')
+                if choice != 'restore':
+                    confirmed = {**confirmed, issue['zotero']: issue['tablet']}
+                _, _, current = sync_folder_scope(*scope_args, confirmed)
+                self.state.write('folder_blocks', current)
+        finally:
+            client.close()
+        return {**self.status(), 'folder_change': 'confirmed', 'folder_choice': choice}
+
     def attach_intake_pdf(self, reference, identity, digest, doi):
         """Attach exactly the ToSort file and citation the user reviewed."""
         from .inbox import file_signature
@@ -1809,8 +1949,12 @@ class Worker:
             self.collections = client.collections()
             completed_at = time.time()
             self.state.write("last_sync_at", completed_at)
-            self.last = {"state": "needs_review" if self.review.rows() or self.review.deletions() or self.review.local_deletions() or result["review"] else "ready",
-                         "message": "Sync finished — some links need attention" if result["review"] else "Sync finished", "updated": completed_at, "result": result}
+            folder_issues = self.state.read('folder_blocks', {}).get('issues', [])
+            folder_count = len(folder_issues)
+            message = ('Sync finished. Review the paused folders in Sync Conflicts.' if folder_count else
+                       'Sync finished — some links need attention' if result['review'] else 'Sync finished')
+            self.last = {"state": "needs_review" if self.review.rows() or self.review.deletions() or self.review.local_deletions()
+                         or result['review'] or folder_count else "ready", "message": message, "updated": completed_at, "result": result}
             self.trace.event("sync_result", actions=len(result.get("actions", [])),
                              reviews=len(result.get("review", [])), partial_indexes=partial_indexes)
             return self.status()
@@ -1820,8 +1964,8 @@ class Worker:
             if started_trace and self.trace.operation:
                 self.trace.finish("completed" if self.last.get("state") in {"ready", "needs_review"} else "stopped")
 
-    def preview(self, identity, document_type, title, template=None):
-        from .sorting.core_logic import build_proposed_filename, validate_filename_template
+    def preview(self, identity, document_type, title, template=None, citation=None):
+        from .sorting.core_logic import _normalize_year, build_proposed_filename, validate_filename_template
         from .zotero_filenames import PLACEHOLDER, title_filename
         row = self.review.row(identity)
         if not row:
@@ -1829,23 +1973,40 @@ class Worker:
         supplement = document_type == 'supporting_information'
         document_type = 'journal_article' if supplement else document_type
         details = {**row["payload"]["details"], "document_type": document_type, "title": title}
-        if supplement:
-            details['is_supplementary_material'] = True
+        details['is_supplementary_material'] = supplement
+        edits = clean_citation_edits(citation)
+        if 'creators' in edits:
+            details['creators'] = [line.strip() for line in edits['creators'].splitlines() if line.strip()]
+            details['primary_creator'] = next(iter(details['creators']), '')
+        if 'date' in edits:
+            details['year'] = _normalize_year(edits['date'])
+        if 'venue' in edits:
+            details.update(journal=edits['venue'], venue_or_publisher=edits['venue'], journal_abbreviation='')
+        if 'patent_number' in edits:
+            details['patent_number'] = edits['patent_number']
+        details['identifier'] = {**details.get('identifier', {}), **{key: edits[field] for key, field in (
+            ('doi', 'doi'), ('patent', 'patent_number')) if field in edits}}
         template = self.config.get("templates", {}).get(document_type, "") if template is None else template
         if template:
             validate_filename_template(template)
         name = build_proposed_filename(details, Path(row["payload"]["path"]).suffix,
                  filename_format="custom" if template else "smart", custom_template=template)
         if not template and PLACEHOLDER.search(name):
-            name = row['payload']['filename']
+            original_type = row['payload'].get('document_type') or row['payload']['details'].get('document_type')
+            original_title = row['payload'].get('title') or row['payload']['details'].get('title')
+            if not edits and document_type == original_type and title == original_title and not supplement:
+                name = row['payload']['filename']
             if PLACEHOLDER.search(name):
                 suffix = Path(row['payload']['path']).suffix
                 name = title_filename(title, suffix, supplement=supplement) or ('Paper_SI' if supplement else 'Paper') + suffix
         return {"filename": name}
 
     def approve(self, identity, digest, filename, title, document_type, collection, research=None, match="", review_token="", _batch=False,
-                main_reference='', main_reference_metadata=None):
+                main_reference='', main_reference_metadata=None, citation=None, tags=None):
         from .sorting.core_logic import validate_document_filename
+        from .zotero_tags import names
+        edits = clean_citation_edits(citation)
+        requested_tags = names([] if tags is None else tags)
         row = self.review.row(identity)
         if not row or row["digest"] != digest:
             raise PilotError("The document changed. Refresh before approving.")
@@ -1894,6 +2055,9 @@ class Worker:
                     raise PilotError('The paper or its Zotero evidence changed. Recheck Zotero and review its current choices before confirming.')
             collections = client.collections()
             mapped = descendants(collections, self.config["zotero_root"], lambda r: r["key"], lambda r: r.get("parentCollection"))
+            blocked = self.state.read('folder_blocks', {})
+            if collection in blocked.get('zotero', []) or (row['kind'] == 'cloud' and row['payload'].get('tablet_parent') in blocked.get('tablet', [])):
+                raise PilotError('This folder’s sync is paused. Review the folder in Sync Conflicts before filing here.')
             if collection not in mapped or any(k not in {r["key"] for r in collections} for k in (research or [])):
                 raise PilotError("Choose a current tablet home and current research collections.")
             parent = row["payload"].get("parent") or stable_key("notable-review", "reference", row["kind"] + row["identity"])
@@ -1939,6 +2103,8 @@ class Worker:
             source_parent = row['payload'].get('parent')
             source_reference = client.get('item', source_parent) if source_parent else None
             if supplement:
+                if edits:
+                    raise PilotError('Edit the main citation separately before filing supporting information.')
                 if not main_reference:
                     raise PilotError('Choose the main paper in Zotero for this supporting information.')
                 main = client.get('item', main_reference)
@@ -1977,6 +2143,18 @@ class Worker:
                 cloud_change_done(cloud, current, intent)
                 approval['cloud_change'] = intent
             reference = client.get("item", parent)
+            fields = citation_patch(reference or {'itemType': TYPE_MAP.get(document_type, 'document')}, edits, document_type)
+            if edits:
+                original = row['approval'].get('citation_original') if row['status'] == 'applying' else None
+                if original is not None:
+                    if any(((reference or {}).get(field) or None) not in (value or None, fields.get(field) or None)
+                           for field, value in original.items()):
+                        raise PilotError('The Zotero citation changed after filing started. Review the saved filing before retrying.')
+                else:
+                    original = {field: (reference or {}).get(field) for field in fields}
+                approval.update(citation_edits=edits, citation_original=original)
+            if requested_tags:
+                approval['tags'] = requested_tags
             if row["kind"] == "zotero" and source_parent and source_reference:
                 if row["status"] != "applying" and row["payload"].get("metadata_signature") != citation_signature(source_reference):
                     raise PilotError("The Zotero citation changed during review. Sync to refresh it before filing.")
@@ -1995,13 +2173,19 @@ class Worker:
                     metadata["date"] = year
                 if document_type in {"journal_article", "preprint", "conference_paper", "book_chapter", "book", "thesis_dissertation", "technical_report"} and details.get("identifier", {}).get("doi"):
                     metadata["DOI"] = details["identifier"]["doi"]
+                metadata.update(fields)
+                if requested_tags:
+                    metadata['tags'] = [{'tag': tag} for tag in requested_tags]
                 reference = client.create("item", metadata)
             else:
                 reference["collections"] = sorted(set(reference.get("collections", []) + [collection] + (research or [])))
                 if not supplement and not (chosen_match and row['kind'] == 'cloud'):
                     reference["title"] = title
-                # Bibliographic metadata already curated in Zotero is retained;
-                # edits to it remain available through Zotero's native item pane.
+                reference.update(fields)
+                existing_tags = reference.get('tags', [])
+                existing_names = {tag['tag'] for tag in existing_tags}
+                if requested_tags:
+                    reference['tags'] = existing_tags + [{'tag': tag} for tag in requested_tags if tag not in existing_names]
                 client.update(reference)
             # Zotero can automatically rename an attachment when its citation
             # changes. Resolve by key again rather than using the pre-save path.
@@ -2776,7 +2960,7 @@ class Worker:
     def dispatch(self, method, params):
         allowed = {"status", "connect", "pair", "folders", "configure", "preview_connection", "preview_disconnect", "disconnect_folder", "pause_sync", "sync", "preview", "approve", "delete_decision", "resolve_conflict", "link", "reindex", "local_delete_decision", "move_link", "scan_library", "import_library", "approve_routine", "tag_context", "set_page_tags", "tag_search", "combine_tag_copies", "remove_unavailable_page_tags"}
         allowed.update({'create_destination', 'scan_inbox', 'paper_tag_candidates', 'suggest_paper_tags', 'save_paper_tags', 'preview_keyword_cleanup', 'remove_reviewed_keywords', 'preview_filename_cleanup', 'queue_filename_cleanup', 'cancel_filename_cleanup', 'retry_bulk', 'dismiss_review', 'runtime_health', 'recheck_review', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source'})
-        allowed.update({'maintenance', 'undo_filename_cleanup', 'attach_intake_pdf'})
+        allowed.update({'maintenance', 'undo_filename_cleanup', 'attach_intake_pdf', 'confirm_folder_change'})
         if method not in allowed:
             raise PilotError("Unsupported plugin request.")
         if method not in {'status', 'pause_sync', 'preview_disconnect', 'runtime_health', 'scan_inbox'}:
