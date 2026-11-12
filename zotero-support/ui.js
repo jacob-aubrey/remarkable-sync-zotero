@@ -737,14 +737,15 @@ var NotableUI = {
     this.busy = true;
     const reviewChangeSerial = this.reviewChangeSerial || 0;
     const checkingInbox = method === 'check_inbox';
-    const localReviewAction = checkingInbox || ['recheck_review', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source', 'create_destination', 'preview_keyword_cleanup', 'remove_reviewed_keywords',
+    const localReviewAction = checkingInbox || ['recheck_review', 'attach_intake_pdf', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source', 'create_destination', 'preview_keyword_cleanup', 'remove_reviewed_keywords',
       'preview_filename_cleanup', 'queue_filename_cleanup', 'cancel_filename_cleanup', 'maintenance'].includes(method);
     const labels = {sync: 'Syncing with reMarkable', scan_library: 'Scanning your Windows library',
       suggest_paper_tags: 'Finding paper keywords and tag suggestions', save_paper_tags: 'Saving your paper-tag choices',
       preview_keyword_cleanup: 'Checking saved keyword evidence', remove_reviewed_keywords: 'Removing selected automatic tags',
       preview_filename_cleanup: 'Checking linked filenames against Zotero citations', queue_filename_cleanup: 'Saving selected filename changes',
       import_library: 'Importing papers into Zotero', approve_routine: 'Filing the selected papers',
-      approve: 'Filing this paper', recheck_review: 'Rechecking local Zotero evidence', check_inbox: 'Checking Zotero for new papers…',
+      approve: 'Filing this paper', attach_intake_pdf: 'Attaching the ToSort PDF',
+      recheck_review: 'Rechecking local Zotero evidence', check_inbox: 'Checking Zotero for new papers…',
       acknowledge_review_finding: 'Saving this library decision', reindex: 'Rebuilding the search index', folders: 'Loading folders',
       maintenance: 'Running the selected local library action'};
     const detail = checkingInbox ? '' : 'Starting…';
@@ -759,6 +760,11 @@ var NotableUI = {
       const previousInbox = checkingInbox ? this.inboxRows() : null;
       const result = checkingInbox ? await this.refreshInbox() : await this.rpc(method, params);
       this.latest = result.reviews ? result : await this.rpc('status');
+      if (result.intake_attachment) {
+        const {reference, key} = result.intake_attachment;
+        if (this.inboxReferenceSelection?.id === reference) this.inboxReferenceSelection.attachment = key;
+        this.zoteroInboxDirty ||= result.native_files_settling;
+      }
       if (['sync', 'set_page_tags', 'combine_tag_copies', 'remove_unavailable_page_tags'].includes(method)) {
         this.tagSyncRevision = (this.tagSyncRevision || 0) + 1;
       }
@@ -775,6 +781,7 @@ var NotableUI = {
         this.reviewDrafts.clear(); this.tagDrafts.clear(); this.linkDrafts.clear(); this.batchCollection = null; this.selected = null;
         this.inboxReferenceSelection = null;
         this.inboxHandoffWaiting = null;
+        this.separateIntakePDFs?.clear();
         this.paperSearch = null; this.tagSearch = null; this.syncDue = null; this.failures = 0; this.syncFailure = '';
       }
       this.badge();
@@ -785,6 +792,8 @@ var NotableUI = {
       }
       if (checkingInbox && this.operation.stopping) this.message('Inbox check stopped.');
       else if (checkingInbox && result.inbox_issues?.length) this.message('Couldn’t finish checking Inbox. Try again.', true);
+      else if (result.intake_attachment) this.message(result.intake_attachment.source_retained
+        ? 'PDF attached in Zotero. The original is still in ToSort.' : 'PDF attached in Zotero.');
       else if (!syncing || !params.automatic || previousSyncFailure || this.latest.status?.state === 'needs_attention') {
         this.message(checkingInbox ? this.inboxCheckResult(previousInbox) : this.statusMessage());
       }
@@ -1726,8 +1735,9 @@ var NotableUI = {
     const suggestions = this.el('datalist', '', card, {id: 'notable-tag-vocabulary'});
     for (const value of context.vocabulary) this.el('option', '', suggestions, {value});
     const editor = (title, kind) => {
-      this.el('h3', title, card);
-      const tags = new Set(draft[kind]), chips = this.el('div', '', card, {class: 'tag-chips'});
+      const section = this.el('section', '', card, {class: 'tag-editor-scope'});
+      this.el('h3', title, section);
+      const tags = new Set(draft[kind]), chips = this.el('div', '', section, {class: 'tag-chips'});
       const remember = () => { draft[kind] = [...tags]; };
       const draw = () => { chips.replaceChildren(); for (const value of [...tags].sort()) {
         const chip = this.button(`${value} ×`, chips, () => { tags.delete(value); remember(); draw(); });
@@ -1735,25 +1745,31 @@ var NotableUI = {
         chip.setAttribute('aria-label', `Remove ${value} from ${title.toLowerCase()}`);
       }};
       draw();
-      const input = this.field(`Add ${title.toLowerCase().replace('tags', 'tag')}`, card, draft[kind + 'Input'] || '');
+      const entry = this.el('div', '', section, {class: 'tag-editor-entry'});
+      const label = `Add ${kind} tag`;
+      const input = this.field(label, entry, draft[kind + 'Input'] || '');
       input.dataset.browse = 'true';
       input.addEventListener('input', () => { draft[kind + 'Input'] = input.value; });
       input.setAttribute('list', 'notable-tag-vocabulary'); input.maxLength = 255;
       const add = () => { const value = input.value.trim(); if (value) { tags.add(value); input.value = ''; input.notableRefreshValue(); draft[kind + 'Input'] = ''; remember(); draw(); }};
       input.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); add(); }});
-      this.button('Add tag', card, add).dataset.browse = 'true';
+      const actions = this.el('div', '', entry, {class: 'actions'});
+      const addButton = this.button('Add tag', actions, add);
+      addButton.dataset.browse = 'true';
+      addButton.setAttribute('aria-label', label);
       return {tags, add};
     };
     const paper = editor('Paper tags', 'paper'), page = editor('Page tags', 'page');
-    this.button('Save tags', card, async () => {
+    this.paperTagPanel(card, {key: context.key});
+    const footer = this.el('div', '', card, {class: 'actions tag-editor-footer'});
+    this.button('Save tags', footer, async () => {
       paper.add(); page.add();
       const result = await this.action('set_page_tags', {key: context.key, page: context.page, page_id: context.page_id,
         tags: [...page.tags], paper_tags: [...paper.tags], token: draft.token}, false);
       if (!result) return;
       this.tagDrafts.delete(draftKey); this.tagEditor = result; this.render(); this.message('Tags saved. They will reach reMarkable on the next sync.');
     }, true);
-    this.button('Close page editor', card, () => { this.tagEditor = null; this.render(); }).dataset.browse = 'true';
-    this.paperTagPanel(card, {key: context.key});
+    this.button('Close page editor', footer, () => { this.tagEditor = null; this.render(); }).dataset.browse = 'true';
   },
   tagSearchState() {
     return this.tagSearch ||= {query: '', scope: 'paper', match: 'all', tags: new Set(), limit: 25};
@@ -2205,7 +2221,9 @@ var NotableUI = {
     return refs.length || files.length ? JSON.stringify([refs, files, evidence]) : row.id;
   },
   queueRows(queue) {
-    const rows = (this.latest?.reviews || []).filter(row => !this.queuedReviewIds().has(row.id));
+    const all = this.latest?.reviews || [], queued = this.queuedReviewIds();
+    const suggested = new Set(all.filter(row => !queued.has(row.id) && this.inboxIntakeMatch(row, queued)).map(row => row.intake_pdf.id));
+    const rows = all.filter(row => !queued.has(row.id) && !suggested.has(row.id));
     if (queue === 'sync-review') return rows.filter(row => row.kind === 'conflict');
     if (queue === 'library') {
       const groups = new Map();
@@ -2220,6 +2238,11 @@ var NotableUI = {
     if (queue === 'inbox-waiting') return incoming.filter(row => row.status !== 'applying' && this.libraryFindings(row).length);
     if (queue === 'inbox') return incoming.filter(row => row.status === 'applying' || !this.libraryFindings(row).length);
     return incoming;
+  },
+  inboxIntakeMatch(row, queued = this.queuedReviewIds()) {
+    const match = row.intake_pdf;
+    return match && !queued.has(match.id) && !this.separateIntakePDFs?.has(match.id)
+      && !this.reviewDrafts.has(match.id) ? match : null;
   },
   inboxRows() {
     return [...this.queueRows('inbox'), ...this.queueRows('inbox-waiting')];
@@ -2388,7 +2411,7 @@ var NotableUI = {
   },
   inboxRowCaption(row, state = this.referencePDFState(row)) {
     if (row.kind === 'reference') {
-      return state === 'none' ? 'Zotero · Needs a PDF'
+      return state === 'none' ? (this.inboxIntakeMatch(row) ? 'Zotero · Matching PDF in ToSort' : 'Zotero · Needs a PDF')
         : state === 'preparing' ? 'Zotero · Preparing filename'
         : state === 'unavailable' ? 'Zotero · PDF unavailable here' : 'Zotero · Needs a check';
     }
@@ -2503,6 +2526,27 @@ var NotableUI = {
     return inspectPDF();
   },
   renderReferencePDFActions(row, parent, inspectPDF, hasSourceLink) {
+    const match = this.inboxIntakeMatch(row);
+    if (match) {
+      const suggestion = this.el('section', '', parent, {class: 'intake-pdf-match', 'aria-label': 'Matching PDF in ToSort'});
+      this.el('strong', 'Matching PDF in ToSort', suggestion);
+      this.el('p', match.filename, suggestion, {class: 'intake-pdf-filename'});
+      this.el('p', `Matching DOI ${match.doi}. Zotero will store a copy and clear the verified original from ToSort.`, suggestion, {class: 'hint'});
+      this.button('Attach PDF from ToSort', suggestion, () => {
+        if (!suggestion.isConnected || this.acquiringPDF || !this.inboxIntakeMatch(row)) return;
+        return this.action('attach_intake_pdf', {reference: row.id, identity: match.id, digest: match.digest, doi: match.doi});
+      }, true, 'folder-input');
+      const separate = this.button('Review ToSort file separately', suggestion, () => {
+        this.separateIntakePDFs ||= new Set();
+        this.separateIntakePDFs.add(match.id);
+        this.inboxFilter = 'all';
+        this.selected = match.id;
+        this.inboxHandoffWaiting = match.id;
+        this.revealReviewSelection = true;
+        this.render();
+      });
+      separate.dataset.browse = 'true';
+    }
     const pdfActions = this.el('div', '', parent, {class: 'reference-pdf-actions'});
     if (hasSourceLink) this.el('p', 'Save the PDF to Downloads in your browser, then attach it here.', pdfActions, {class: 'hint'});
     const acquire = async chooseFile => {

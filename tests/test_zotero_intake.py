@@ -1,12 +1,92 @@
 """Phone references transition to local filing without cloud access."""
 import unittest
+from pathlib import Path
 from unittest.mock import patch
+from note_organizer.zotero_bulk import intake_pdf_doi
+from note_organizer.zotero_pilot import PilotError
 from tests import test_zotero_worker as worker_tests
+
+
+def write_intake_pdf(path, lines, *, doi=None):
+    import pymupdf
+
+    with pymupdf.open() as pdf:
+        pdf.new_page().insert_text((72, 72), lines)
+        if doi:
+            pdf.set_xml_metadata(f'''<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                xmlns:prism="http://prismstandard.org/namespaces/basic/2.0/">
+                <rdf:Description><prism:doi>{doi}</prism:doi></rdf:Description></rdf:RDF>''')
+        pdf.save(path)
 
 
 class LocalIntakeTests(unittest.TestCase):
     setUp = worker_tests.WorkerTests.setUp
     add_pdf = worker_tests.WorkerTests.add_pdf
+
+    def test_tosort_doi_evidence_excludes_bibliography_and_conflicting_ids(self):
+        path = self.root / 'article.pdf'
+        write_intake_pdf(path, 'A Research Paper\nReferences\nDOI: 10.1000/cited')
+        self.assertEqual(intake_pdf_doi(path), {})
+        write_intake_pdf(path, 'A Research Paper\nDOI: 10.1000/ARTICLE\nReferences\nDOI: 10.1000/cited')
+        self.assertEqual(intake_pdf_doi(path), {'doi': '10.1000/article', 'source': 'first-page'})
+        write_intake_pdf(path, 'A Research Paper\nDOI: 10.1000/article', doi='10.1000/different')
+        self.assertEqual(intake_pdf_doi(path), {})
+
+    def test_tosort_doi_suggestion_revalidates_and_attaches_exact_copy(self):
+        inbox = self.root / 'ToSort'
+        inbox.mkdir()
+        self.worker.config.update(inbox=str(inbox), sync_paused=True)
+        self.worker.cloud_factory = lambda: self.fail('Attaching a PDF contacted the tablet')
+        path = inbox / 'Downloaded article.pdf'
+        write_intake_pdf(path, 'A Research Paper', doi='10.1000/article')
+        self.zot.items['PARENT23'] = {'key': 'PARENT23', 'itemType': 'journalArticle',
+            'title': 'A Research Paper', 'DOI': 'https://doi.org/10.1000/ARTICLE', 'collections': []}
+        self.worker.scan_inbox(discover=True)
+        with patch('note_organizer.zotero_review.time.time', return_value=9999999999):
+            result = self.worker.scan_inbox(discover=True)
+        reference = next(row for row in result['reviews'] if row['kind'] == 'reference')
+        match = reference['intake_pdf']
+        self.assertEqual(match['filename'], path.name)
+        self.assertEqual(match['doi'], '10.1000/article')
+        self.assertEqual(match['digest'], worker_tests.file_sha(path))
+        self.assertEqual(self.zot.children('PARENT23'), [], 'Discovery cannot attach the PDF')
+
+        params = (reference['id'], match['id'], match['digest'], match['doi'])
+        self.zot.items['OTHER234'] = {**self.zot.items['PARENT23'], 'key': 'OTHER234'}
+        with self.assertRaisesRegex(PilotError, 'DOI match changed'):
+            self.worker.attach_intake_pdf(*params)
+        ambiguous = self.worker.scan_inbox(discover=True)
+        self.assertFalse(any(row.get('intake_pdf') for row in ambiguous['reviews']))
+        del self.zot.items['OTHER234']
+        self.worker.scan_inbox(discover=True)
+
+        original = path.read_bytes()
+        path.write_bytes(original + b'changed')
+        with self.assertRaisesRegex(PilotError, 'ToSort PDF changed'):
+            self.worker.attach_intake_pdf(*params)
+        path.write_bytes(original)
+        native_action = self.zot.review_action
+
+        def attach(action, data=None):
+            if action != 'attach_intake_pdf':
+                return native_action(action, data)
+            self.assertEqual(data['parent'], 'PARENT23')
+            self.assertNotEqual(Path(data['source']), path)
+            self.assertEqual(Path(data['source']).read_bytes(), original)
+            self.zot.items['SOURCE23'] = {'key': 'SOURCE23', 'itemType': 'attachment', 'parentItem': 'PARENT23'}
+            self.zot.file_path('SOURCE23').write_bytes(original)
+            return {'key': 'SOURCE23'}
+
+        with patch.object(self.zot, 'review_action', side_effect=attach), \
+                patch('note_organizer.inbox._finish_verified_copy', side_effect=OSError('file is locked')) as cleanup:
+            result = self.worker.attach_intake_pdf(*params)
+            cleanup.assert_called_once()
+        self.assertTrue(result['intake_attachment']['source_retained'])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.worker.review.row(match['id'])['status'], 'attached')
+        self.assertTrue(result['config']['sync_paused'])
+        with self.assertRaisesRegex(PilotError, 'ToSort match changed'):
+            self.worker.attach_intake_pdf(*params)
 
     def test_phone_reference_retires_when_pdf_arrives(self):
         self.zot.items['PARENT23'] = {'key': 'PARENT23', 'itemType': 'journalArticle',

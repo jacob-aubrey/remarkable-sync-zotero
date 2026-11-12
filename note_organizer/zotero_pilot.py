@@ -383,7 +383,8 @@ class LocalZotero:
         import httpx2
         import time
         self.authorize()
-        retryable = action in {'catalog', 'inventory', 'bulk_import', 'bulk_import_status', 'prepare_upload', 'finish_upload', 'reparent'}
+        retryable = action in {'catalog', 'inventory', 'bulk_import', 'bulk_import_status', 'prepare_upload', 'finish_upload', 'reparent',
+                               'attach_intake_pdf'}
         for attempt in range(3 if retryable else 1):
             try:
                 # Keep long import polling separate from the SDK connection.

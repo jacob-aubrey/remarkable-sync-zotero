@@ -12,7 +12,9 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import sys
+from tempfile import TemporaryDirectory
 import threading
 import time
 import traceback
@@ -283,8 +285,13 @@ class Worker:
 
     def status(self):
         from .sorting.core_logic import DOCUMENT_TYPE_LABELS
+        from .zotero_bulk import intake_pdf_suggestions
         config = {k: v for k, v in self.config.items() if k != "server_id"}
         pending_reviews = self.review.rows(inbox_order=True)
+        suggestions = intake_pdf_suggestions(pending_reviews) if config.get('inbox') else {}
+        for row in pending_reviews:
+            if row['id'] in suggestions:
+                row['intake_pdf'] = suggestions[row['id']]
         paper_reviews = [row for row in pending_reviews if row['status'] == 'pending' and row['kind'] in PAPER_REVIEW_KINDS]
         review_guidance = {'version': REVIEW_GUIDANCE_VERSION,
             'needs_upgrade': [row['id'] for row in paper_reviews if not review_guidance_ready(row['payload'])],
@@ -907,11 +914,12 @@ class Worker:
             if kind == 'zotero':
                 raise PilotError('Open the attachment in Zotero to finish the download or check whether the file is readable.')
             return
-        from .zotero_bulk import observed_digest
+        from .zotero_bulk import intake_pdf_doi, observed_digest
         digest = observed_digest(path, self.file_digests)
         if kind == 'inbox':
             self.review.supersede_inbox(path, identity)
         old = self.review.row(fingerprint([kind, identity])[:24])
+        intake_pdf = kind == 'inbox' and path.suffix.lower() == '.pdf'
         signature = citation_signature(metadata)
         same_pending_source = (old and old['status'] == 'pending'
             and old['payload'].get('proposal_revision') == 2 and review_guidance_ready(old['payload'])
@@ -919,13 +927,21 @@ class Worker:
             and old['payload'].get('naming_signature') == self._naming_signature()
             and old['payload'].get('parent', '') == (metadata or {}).get('key', '')
             and old['payload'].get('path') == str(path)
+            and (not intake_pdf or 'intake_doi' in old['payload'])
             and not any(old['payload'].get(key) for key in
                         ('unavailable', 'local_recheck_error', 'tablet_evidence_stale')))
-        if old and old['digest'] == digest and (old['status'] in {'approved', 'applying', 'ignored'} or same_pending_source):
+        if old and old['digest'] == digest and (old['status'] in {'approved', 'applying', 'ignored', 'attached'} or same_pending_source):
             return  # Do not re-extract every paper on every timer tick.
         payload = {**self._proposal(path, metadata), "path": str(path), "source": kind, "metadata_signature": signature,
                    'proposal_revision': 2,
                    'source_collections': (metadata or {}).get('collections', []) if kind == 'zotero' else [], **extra}
+        if intake_pdf:
+            payload['intake_doi'] = {}
+            root = self.config.get('inbox')
+            if (root and not payload.get('details', {}).get('is_supplementary_material')
+                    and not re.search(r'(?:^|[_ -])si$', path.stem, re.I)
+                    and path.resolve().parent == Path(root).resolve()):
+                payload['intake_doi'] = intake_pdf_doi(path)
         if old and old['status'] == 'pending' and old['digest'] == digest:
             previous = {key: old['payload'].get(key, '') for key in ('title', 'filename', 'document_type')}
             if any(payload.get(key, '') != previous[key] for key in previous):
@@ -1011,6 +1027,7 @@ class Worker:
                                         'reason': f'Could not check this tablet paper: {error}'})
 
     def _catalog_local(self, client, *, local=False):
+        from .zotero_bulk import doi_key, references_by_doi
         native = client.review_action("catalog")
         documents = self.state.read("documents", {})
         excluded = connections.exclusions(self.directory, self.config)
@@ -1066,6 +1083,7 @@ class Worker:
         linked_parents = {row.get('parent') for row in documents.values()} | excluded['parents']
         inventory = native.get('pdf_inventory')
         missing_parents = set(native.get('missing_pdf_parents', [])) if inventory is None else set()
+        doi_references = references_by_doi(native['parents']) if self.config.get('inbox') else {}
         references = {}
         for key, parent in native['parents'].items():
             homes = set(parent.get('collections', []))
@@ -1084,6 +1102,10 @@ class Worker:
             references[key] = {'title': parent.get('title') or 'Untitled reference', 'parent': key,
                                'url': parent.get('url') or ('https://doi.org/' + parent['DOI'] if parent.get('DOI') else ''),
                                'pdf_state': pdf_state, 'missing_file': pdf_state == 'unavailable', 'routine': False}
+            if pdf_state == 'none' and doi_references:
+                doi = doi_key(parent.get('DOI'))
+                if len(doi_references.get(doi, [])) == 1:
+                    references[key]['intake_doi'] = doi
             if pdf_state == 'preparing' and len(pdf_keys) == 1:
                 references[key]['preparing_attachment'] = pdf_keys[0]
         self.review.reconcile_references(references)
@@ -1597,6 +1619,62 @@ class Worker:
         self.review.dismiss(identity, digest)
         return self.status()
 
+    def attach_intake_pdf(self, reference, identity, digest, doi):
+        """Attach exactly the ToSort file and citation the user reviewed."""
+        from .inbox import file_signature
+        from .zotero_bulk import digest_file, intake_pdf_suggestions, references_by_doi
+
+        pending = self.review.rows()
+        match = intake_pdf_suggestions(pending).get(reference)
+        if not match or (match['id'], match['digest'], match['doi']) != (identity, digest, doi):
+            raise PilotError('The ToSort match changed. Check Inbox before attaching.')
+        row = next(row for row in pending if row['id'] == identity)
+        parent = next(row['identity'] for row in pending if row['id'] == reference)
+        root = self.config.get('inbox')
+        path = Path(row['payload']['path'])
+        if not root or path.suffix.lower() != '.pdf' or path.resolve().parent != Path(root).resolve():
+            raise PilotError('The PDF is no longer in ToSort. Check Inbox before attaching.')
+        try:
+            signature = file_signature(path)
+            if file_sha(path) != digest:
+                raise PilotError('The ToSort PDF changed. Check Inbox before attaching.')
+        except OSError as error:
+            raise PilotError('The ToSort PDF is unavailable. Check Inbox before attaching.') from error
+
+        client = self.zotero()
+        try:
+            native = client.review_action('catalog', {'parents_only': True})
+            candidates = references_by_doi(native['parents']).get(doi, [])
+            excluded = connections.exclusions(self.directory, self.config)
+            linked = self.state.read('documents', {})
+            if (len(candidates) != 1 or candidates[0]['key'] != parent or parent in excluded['parents']
+                    or any(link.get('parent') == parent for link in linked.values())):
+                raise PilotError('The Zotero reference or its DOI match changed. Check Inbox before attaching.')
+            # Native Zotero imports from a private snapshot. An in-progress
+            # download or replacement can never change the bytes being attached.
+            with TemporaryDirectory(prefix='intake-pdf-', dir=self.directory) as scratch:
+                staged = Path(scratch) / path.name
+                shutil.copyfile(path, staged)
+                if file_sha(staged) != digest or file_signature(path) != signature:
+                    raise PilotError('The ToSort PDF changed. Check Inbox before attaching.')
+                result = client.review_action('attach_intake_pdf', {'parent': parent, 'doi_value': candidates[0]['DOI'],
+                    'source': str(staged), 'md5': digest_file(staged, 'md5')})
+            if result.get('error'):
+                raise PilotError(result['error'])
+            key = result['key']
+            attachment = client.get('item', key)
+            stored = client.file_path(key)
+            if (not attachment or attachment.get('parentItem') != parent or attachment.get('deleted')
+                    or stored.resolve() == path.resolve() or file_sha(stored) != digest):
+                raise PilotError('The stored Zotero copy could not be verified. The ToSort file was kept.')
+            self.review.finish_intake_attachment(identity, digest, {'source': str(path), 'signature': signature,
+                                                                    'sha256': digest, 'target': key})
+            self.cleanup_intake(client, identity=identity)
+        finally:
+            client.close()
+        result = self.scan_inbox(discover=True)
+        return {**result, 'intake_attachment': {'reference': reference, 'key': key, 'source_retained': path.exists()}}
+
     def approve_routine(self, entries, collection):
         """One explicit batch decision, revalidated file by file, never blind approval."""
         if collection not in self.state.read("folders", {}):
@@ -2026,11 +2104,13 @@ class Worker:
         finally:
             client.close()
 
-    def cleanup_intake(self, client):
+    def cleanup_intake(self, client, *, identity=None):
         from .inbox import _finish_verified_copy
         for job in self.review.cleanups():
+            if identity and job['identity'] != identity:
+                continue
             row = self.review.row(job["identity"])
-            if not row or row["status"] != "approved":
+            if not row or row["status"] not in {"approved", "attached"}:
                 continue
             data = job["payload"]
             source = Path(data["source"])
@@ -2696,7 +2776,7 @@ class Worker:
     def dispatch(self, method, params):
         allowed = {"status", "connect", "pair", "folders", "configure", "preview_connection", "preview_disconnect", "disconnect_folder", "pause_sync", "sync", "preview", "approve", "delete_decision", "resolve_conflict", "link", "reindex", "local_delete_decision", "move_link", "scan_library", "import_library", "approve_routine", "tag_context", "set_page_tags", "tag_search", "combine_tag_copies", "remove_unavailable_page_tags"}
         allowed.update({'create_destination', 'scan_inbox', 'paper_tag_candidates', 'suggest_paper_tags', 'save_paper_tags', 'preview_keyword_cleanup', 'remove_reviewed_keywords', 'preview_filename_cleanup', 'queue_filename_cleanup', 'cancel_filename_cleanup', 'retry_bulk', 'dismiss_review', 'runtime_health', 'recheck_review', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source'})
-        allowed.update({'maintenance', 'undo_filename_cleanup'})
+        allowed.update({'maintenance', 'undo_filename_cleanup', 'attach_intake_pdf'})
         if method not in allowed:
             raise PilotError("Unsupported plugin request.")
         if method not in {'status', 'pause_sync', 'preview_disconnect', 'runtime_health', 'scan_inbox'}:

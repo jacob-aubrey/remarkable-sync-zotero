@@ -43,6 +43,78 @@ def doi_key(value):
     return normalize_doi(value).casefold()
 
 
+def intake_pdf_doi(path):
+    """Read only explicit document DOI evidence, leaving bibliography hits out."""
+    import pymupdf
+    from xml.etree import ElementTree
+    from .sorting.metadata_lookup import extract_doi_candidates
+
+    try:
+        with pymupdf.open(path) as pdf:
+            if not pdf.is_pdf or pdf.needs_pass or not len(pdf):
+                return {}
+            xml = pdf.get_xml_metadata()
+            first = pdf[0].get_text()[:12000]
+    except (RuntimeError, OSError, ValueError):
+        return {}
+    metadata = set()
+    if xml and len(xml) <= 128_000 and '<!DOCTYPE' not in xml.upper():
+        try:
+            rdf = '{http://www.w3.org/1999/02/22-rdf-syntax-ns#}'
+            for description in ElementTree.fromstring(xml).iter(rdf + 'Description'):
+                fields = [*description.attrib.items(), *((child.tag, child.text) for child in description)]
+                for tag, value in fields:
+                    if tag == '{http://purl.org/dc/elements/1.1/}identifier' or (
+                            tag.startswith('{http://prismstandard.org/namespaces/basic/') and tag.endswith('}doi')):
+                        doi = doi_key(value)
+                        if doi:
+                            metadata.add(doi)
+        except ElementTree.ParseError:
+            pass
+    front = re.split(r'^\s*(?:references|bibliography)\s*$', first, maxsplit=1, flags=re.I | re.M)[0]
+    printed = {doi for line in front.splitlines()
+               if re.match(r'^\s*(?:doi\s*[:=]|https?://(?:dx\.)?doi\.org/)', line, re.I)
+               for doi in extract_doi_candidates(line)}
+    candidates = metadata | printed
+    if len(candidates) != 1:
+        return {}
+    return {'doi': next(iter(candidates)), 'source': 'metadata' if metadata else 'first-page'}
+
+
+def references_by_doi(parents):
+    result = defaultdict(list)
+    for parent in parents.values():
+        doi = doi_key(parent.get('DOI'))
+        if doi and not parent.get('deleted'):
+            result[doi].append(parent)
+    return result
+
+
+def intake_pdf_suggestions(rows):
+    sources = defaultdict(list)
+    for row in rows:
+        payload = row['payload']
+        if row['kind'] == 'inbox' and row['status'] == 'pending' and not payload.get('local_recheck_error'):
+            evidence = payload.get('intake_doi', {})
+            if evidence.get('doi'):
+                sources[evidence['doi']].append(row)
+    matches = {}
+    for row in rows:
+        payload = row['payload']
+        doi = payload.get('intake_doi') if row['kind'] == 'reference' and row['status'] == 'pending' else None
+        if payload.get('pdf_state') != 'none' or not doi or len(sources[doi]) != 1:
+            continue
+        source = sources[doi][0]
+        evidence = source['payload']['intake_doi']
+        if evidence['source'] == 'first-page':
+            title = title_key(payload.get('title', ''))
+            if len(title) < 12 or title != title_key(source['payload'].get('title', '')):
+                continue  # A printed DOI can refer to a different work.
+        matches[row['id']] = {'id': source['id'], 'digest': source['digest'], 'doi': doi,
+                              'filename': Path(source['payload']['path']).name}
+    return matches
+
+
 def inspect_document(path, *, evidence=False):
     from .sorting.core_logic import extract_document, _basic_details_from_extraction, _document_doi_candidates
     extraction = extract_document(path)

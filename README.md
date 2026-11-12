@@ -13,6 +13,12 @@ The plugin supports Zotero 10.0.6 and later in the 10.0 series.
 
 The XPI includes the Windows helper and OCR models. Zotero handles future updates through its plugin manager.
 
+### Attach a download from ToSort
+
+If a PDF in your configured ToSort folder identifies a unique Zotero reference that needs a PDF, Inbox shows the download on that reference. Choose **Attach PDF from ToSort** to store the PDF in Zotero. The plugin clears the original from ToSort after verifying the stored copy, then opens the filename and filing review. Choose **Review ToSort file separately** to use the usual ToSort workflow instead.
+
+Matching runs locally. It uses explicit DOI evidence read by the bundled [PyMuPDF](https://pymupdf.readthedocs.io/en/latest/document.html) and the existing DOI normalizer. A printed DOI also needs a matching paper title. Attaching uses Zotero’s existing [stored-copy workflow](https://www.zotero.org/support/attaching_files).
+
 ## Build from source
 
 Use Windows x64 and Python 3.13. Download **third-party-source.zip** from the matching GitHub release and extract it. Its `ocr-build-resources` directory contains the pinned models and their notices.
@@ -24,7 +30,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.12.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.13.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

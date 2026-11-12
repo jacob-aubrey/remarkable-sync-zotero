@@ -263,6 +263,88 @@ BRANCH = r"""
             await ui.closeProcess(ui.process);
             await ui.refresh();
           }
+          else if (command.action === 'tosort_pdf_match') {
+            const ensure = (value, message) => {if (!value) throw Error(message);};
+            const waitFor = async (predicate, message) => {
+              for (let i = 0; i < 160; i++) {
+                if (await predicate()) return;
+                await Zotero.Promise.delay(50);
+              }
+              throw Error(message + ' · ' + ui.view.document.getElementById('message').textContent);
+            };
+            clearTimeout(ui.inboxTimer);
+            const configPath = PathUtils.join(ui.statePath, 'config.json');
+            const config = JSON.parse(await IOUtils.readUTF8(configPath));
+            await IOUtils.writeUTF8(configPath, JSON.stringify({...config, inbox: command.inbox}));
+            await ui.closeProcess(ui.process);
+            const parent = new Zotero.Item('journalArticle');
+            parent.setField('title', 'Synthetic unique ToSort match');
+            parent.setField('DOI', '10.1000/tosort-native');
+            await parent.saveTx();
+            const expected = await Zotero.Utilities.Internal.md5Async(command.source);
+            const scan = () => ui.rpc('scan_inbox', {discover: true});
+            await scan();
+            await Zotero.Promise.delay(2250);
+            ui.latest = await scan();
+            const reference = ui.latest.reviews.find(row => row.kind === 'reference' && row.identity === parent.key);
+            ensure(reference?.intake_pdf?.doi === '10.1000/tosort-native', 'Native DOI suggestion missing');
+            ensure(parent.getAttachments().length === 0 && await IOUtils.exists(command.source), 'Discovery changed Zotero or ToSort');
+            ui.tab = 'inbox'; ui.inboxFilter = 'needs-pdf'; ui.selected = reference.id; ui.render();
+            const doc = ui.view.document;
+            const button = label => [...doc.querySelectorAll('button')].find(node => node.textContent === label);
+            await waitFor(() => button('Review ToSort file separately'), 'Separate review button missing');
+            ensure(!ui.inboxRows().some(row => row.id === reference.intake_pdf.id), 'Suggested file duplicated the Zotero entry');
+            button('Review ToSort file separately').click();
+            await waitFor(() => ui.renderedReviewId === reference.intake_pdf.id, 'Separate review did not open the ordinary ToSort entry');
+            ui.separateIntakePDFs.clear(); ui.inboxFilter = 'needs-pdf'; ui.selected = reference.id; ui.render();
+            await waitFor(() => button('Attach PDF from ToSort'), 'Explicit attachment button missing');
+            button('Attach PDF from ToSort').click();
+            await waitFor(() => !ui.busy && parent.getAttachments().length === 1 && !ui.inboxRows().some(row => row.id === reference.intake_pdf.id),
+              'Confirmed ToSort attachment did not complete');
+            const attachment = await Zotero.Items.getAsync(parent.getAttachments()[0]);
+            ensure(attachment.parentKey === parent.key && attachment.isStoredFileAttachment(), 'PDF was not stored under the existing reference');
+            ensure(await Zotero.Utilities.Internal.md5Async(await attachment.getFilePathAsync()) === expected, 'Stored PDF bytes changed');
+            ensure(!await IOUtils.exists(command.source), 'Verified source stayed in ToSort');
+            ensure(ui.latest.config.sync_paused, 'Attach PDF resumed tablet sync');
+            await Zotero.Promise.delay(2250);
+            await ui.checkInbox();
+            const filing = ui.latest.reviews.find(row => row.kind === 'zotero' && row.identity === attachment.key);
+            ensure(filing?.id === ui.renderedReviewId && ui.inboxFilter === 'all', 'ToSort attachment did not keep its filing form selected');
+            ensure(filing.inbox_order === reference.inbox_order, 'ToSort attachment changed Inbox arrival order');
+            response.attachment = attachment.key;
+          }
+          else if (command.action === 'tag_entry_layout') {
+            const ensure = (value, message) => {if (!value) throw Error(message);};
+            ui.tab = 'tags';
+            ui.tagEditor = {key: command.key, page: 0, page_id: 'tag-layout-page', token: 'fixture',
+              title: 'Synthetic tag editor', paper_tags: ['Existing paper tag'], page_tags: [], vocabulary: []};
+            ui.render();
+            ui.view.resizeTo(command.width, 760);
+            const doc = ui.view.document;
+            doc.documentElement.style.colorScheme = 'dark';
+            await Zotero.Promise.delay(180);
+            for (const kind of ['paper', 'page']) {
+              const input = doc.querySelector(`input[data-notable-field="Add ${kind} tag"]`);
+              const entry = input.closest('.tag-editor-entry');
+              const box = input.getBoundingClientRect(), label = input.closest('label').firstElementChild.getBoundingClientRect();
+              const button = entry.querySelector(`button[aria-label="Add ${kind} tag"]`);
+              const add = button.getBoundingClientRect();
+              ensure(box.top - label.bottom >= 0 && box.top - label.bottom <= 10,
+                kind + ' tag label gap is ' + (box.top - label.bottom));
+              ensure(add.left >= box.right && Math.abs(add.top - box.top) <= 2,
+                kind + ' Add tag offset is ' + (add.top - box.top));
+              input.value = `A new ${kind} tag`;
+              input.dispatchEvent(new ui.view.KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true}));
+              ensure(entry.closest('.tag-editor-scope').querySelector('.tag-chips').textContent.includes(`A new ${kind} tag`),
+                'Enter did not add a draft ' + kind + ' tag');
+            }
+            const footer = doc.querySelector('.tag-editor-footer');
+            ensure(footer === footer.parentElement.lastElementChild, 'Tag editor actions are not at the bottom');
+            ensure([...footer.querySelectorAll('button')].map(node => node.textContent).join('|') === 'Save tags|Close page editor',
+              'The two footer actions are not together');
+            ensure(doc.documentElement.scrollWidth <= ui.view.innerWidth + 1, 'Tag editor overflowed its viewport');
+            ui.tagEditor = null;
+          }
           else if (command.action === 'inbox_alert_layout') {
             ui.latest = command.snapshot;
             ui.tab = 'inbox';
@@ -292,6 +374,7 @@ BRANCH = r"""
 
 def checks(client, root, checked):
     from docx import Document
+    from tests.test_zotero_intake import write_intake_pdf
     client.authorize()
     result = live.command(root, 'phone_intake')
     catalog = client.review_action('catalog')
@@ -319,6 +402,16 @@ def checks(client, root, checked):
         live.command(root, 'inbox_alert_layout', snapshot=result['alertFixture'], width=width)
         live.command(root, 'snapshot', filename=f'inbox-alert-{width}.png')
     checked('native_Inbox_alerts_wrap_without_clipping_at_wide_and_narrow_widths')
+    intake = root / 'ToSort'
+    intake.mkdir()
+    matched_pdf = intake / 'Synthetic ToSort match.pdf'
+    write_intake_pdf(matched_pdf, 'Synthetic unique ToSort match', doi='10.1000/tosort-native')
+    matched = live.command(root, 'tosort_pdf_match', inbox=str(intake), source=str(matched_pdf))
+    checked('native_ToSort_DOI_match_requires_confirmation_and_verifies_cleanup_and_filing_selection')
+    for width in [1040, 640]:
+        live.command(root, 'tag_entry_layout', key=matched['attachment'], width=width)
+        live.command(root, 'snapshot', filename=f'tag-entry-{width}.png')
+    checked('native_tag_editor_aligns_both_fields_and_buttons_and_keeps_footer_at_bottom')
     # The shared packaged search check runs after this fixture. Restore its OCR
     # setting before it asks the private worker to reindex a scanned PDF.
     live.command(root, 'restore_intake_test_ocr', enabled=result['originalOCR'])

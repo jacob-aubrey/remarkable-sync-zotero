@@ -130,6 +130,17 @@ details { margin: 18px 0; } summary { cursor: pointer; font-weight: 600; }
 .queued-filing .actions { margin: 4px 0; }
 .tag-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
 .tag-chips button { border-radius: 16px; overflow-wrap: anywhere; }
+.tag-editor-scope { margin-block: 20px; }
+.tag-editor-scope > h3 { margin: 0 0 8px; }
+.tag-editor-scope > .tag-chips:empty { display: none; }
+.tag-editor-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 10px; }
+.tag-editor-entry > .field, .tag-editor-entry > .field > label { display: grid; grid-template-rows: subgrid; margin: 0; }
+.tag-editor-entry > .field { grid-column: 1; grid-row: 1 / span 3; }
+.tag-editor-entry > .field > label { grid-row: 1 / span 2; }
+.tag-editor-entry > .field > label > span { margin-block-end: 6px; }
+.tag-editor-entry input { margin: 0; }
+.tag-editor-entry > .actions { grid-column: 2; grid-row: 2; align-self: start; margin: 0; }
+.tag-editor-footer { margin-block-end: 0; }
 @media (max-width: 700px) { #app { padding: 18px; } .review-layout { grid-template-columns: 1fr; } .review-layout > aside { contain: none; max-height: 35vh; min-height: 120px; } }
 
 .review-link-badge { display: inline-block; font-weight: 600; color: CanvasText; background: color-mix(in srgb, Highlight 16%, Canvas); border: 1px solid Highlight; border-radius: 4px; padding: 3px 8px; margin: 6px 0; }
@@ -191,6 +202,9 @@ nav button.sync-conflicts-attention[aria-pressed="true"] .button-icon { color: #
 .inbox-sort select { width: auto; }
 .inbox-controls > .queue-summary { flex-basis: 100%; margin: 0; }
 .reference-intake > p { max-inline-size: 68ch; }
+.intake-pdf-match { border: 1px solid GrayText; border-radius: 5px; margin-block: 12px; padding: 12px; }
+.intake-pdf-match .intake-pdf-filename { margin: 4px 0; overflow-wrap: anywhere; }
+.intake-pdf-match .actions { margin-block-end: 0; }
 .reference-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-block: 8px; }
 .reference-comparison > section { border: 1px solid GrayText; border-radius: 5px; padding: 12px; }
 .reference-comparison p { margin: 6px 0; }

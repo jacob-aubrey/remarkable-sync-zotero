@@ -251,6 +251,7 @@ async function notableInventory(parent) {
 // One native import per digest may run at a time. Polling keeps the private
 // transport cancellable while Zotero completes its ordinary metadata lookup.
 var notableBulkJobs = new Map();
+var notableIntakePDFJobs = new Map();
 
 function notableDOI(value) {
   return String(value || '').replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, '').replace(/^doi:\s*/i, '').trim().toLowerCase();
@@ -448,6 +449,16 @@ function notableRegisterLibraryEndpoint(Base) {
         } catch (error) {
           return reply(error.navigationStatus || 409, {error: error.navigationStatus ? error.message : 'The surviving reference could not be verified.'});
         }
+      }
+      if (data.action === 'attach_intake_pdf') {
+        const signature = JSON.stringify([data.source, data.doi_value, data.md5]);
+        const active = notableIntakePDFJobs.get(data.parent);
+        if (active && active.signature !== signature) return reply(200, {error: 'Another attachment is being stored for this reference.'});
+        const job = active || {signature, promise: notableAttachIntakePDF(data)};
+        notableIntakePDFJobs.set(data.parent, job);
+        try { return reply(200, await job.promise); }
+        catch (error) { return reply(200, {error: error.intakeMessage || 'Zotero could not store the PDF. The ToSort file was kept.'}); }
+        finally { if (notableIntakePDFJobs.get(data.parent) === job) notableIntakePDFJobs.delete(data.parent); }
       }
       if (data.action === 'bulk_import' || data.action === 'bulk_import_status') {
         if (!/^[a-f0-9]{64}$/.test(data.digest || '')) return reply(400, {error: 'Invalid import identity'});
@@ -677,4 +688,37 @@ async function notableAcquirePDF(key, file = null, {describe = false} = {}) {
     : await Zotero.Attachments.addAvailableFile(item);
   if (!attachment) throw Error('No available file found. Open the source link, download the PDF, and use Attach downloaded PDF.');
   return describe ? {attachment, outcome: 'added'} : attachment;
+}
+
+async function notableAttachIntakePDF(data) {
+  const reject = message => { throw Object.assign(Error(message), {intakeMessage: message}); };
+  if (typeof data.source !== 'string' || !/\.pdf$/i.test(data.source) || !/^[a-f0-9]{32}$/.test(data.md5 || '')
+      || typeof data.doi_value !== 'string' || !data.doi_value) {
+    reject('The ToSort attachment request is invalid. Check Inbox before attaching.');
+  }
+  const state = Zotero.File.pathToFile(PathUtils.join(Zotero.Profile.dir, 'notable'));
+  const source = Zotero.File.pathToFile(data.source);
+  if (!source.isFile() || !source.parent?.parent || !state.equals(source.parent.parent)
+      || !source.parent.leafName.startsWith('intake-pdf-')) {
+    reject('The ToSort PDF could not be verified. Check Inbox before attaching.');
+  }
+  const parent = await notableItem(data.parent);
+  if (!parent?.isRegularItem() || notableReviewItemInTrash(parent) || parent.getField('DOI') !== data.doi_value) {
+    reject('The Zotero reference changed. Check Inbox before attaching.');
+  }
+  const status = await notableReferencePDFState(data.parent);
+  if (status.replacement || !['none', 'available'].includes(status.state)) {
+    reject('Zotero already has a file for this reference, or the reference changed. Check Inbox before attaching.');
+  }
+  if (await Zotero.Utilities.Internal.md5Async(data.source) !== data.md5) {
+    reject('The ToSort PDF changed. Check Inbox before attaching.');
+  }
+  // The ordinary Add PDF workflow rechecks the target after file selection.
+  const attachment = await notableAcquirePDF(data.parent, data.source);
+  const stored = await attachment.getFilePathAsync();
+  if (attachment.parentKey !== data.parent || notableReviewItemInTrash(attachment) || !attachment.isStoredFileAttachment()
+      || !stored || await Zotero.Utilities.Internal.md5Async(stored) !== data.md5) {
+    reject('Zotero has a different PDF or the stored copy could not be verified. The ToSort file was kept.');
+  }
+  return {key: attachment.key};
 }

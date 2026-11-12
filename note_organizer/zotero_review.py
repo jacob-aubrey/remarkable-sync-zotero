@@ -212,7 +212,7 @@ class ReviewStore(Ledger):
         encoded = json.dumps(payload)
         old = db.execute("SELECT digest,status,payload FROM review_queue WHERE id=?", (key,)).fetchone()
         if old and old[0] == digest:
-            if old[1] in {"approved", "ignored"} or (old[1] in {"pending", "applying"} and old[2] == encoded):
+            if old[1] in {"approved", "ignored", "attached"} or (old[1] in {"pending", "applying"} and old[2] == encoded):
                 return key
         # Keep an explicitly approved action journal during recovery. A
         # changed input gets a new pending review instead of stale consent.
@@ -245,6 +245,15 @@ class ReviewStore(Ledger):
             if not row or row['digest'] != digest or row['status'] != 'pending':
                 raise PilotError('Only a current pending review can be dismissed. Finish or recover an active filing first.')
             db.execute("UPDATE review_queue SET status='ignored' WHERE id=?", (identity,))
+
+    def finish_intake_attachment(self, identity, digest, cleanup):
+        """Retire the ToSort review and record its verified cleanup together."""
+        with self.connect() as db:
+            changed = db.execute("UPDATE review_queue SET status='attached' WHERE id=? AND kind='inbox' AND digest=? AND status='pending'",
+                                 (identity, digest)).rowcount
+            if not changed:
+                raise PilotError('The ToSort review changed. The files were retained.')
+            db.execute("INSERT OR REPLACE INTO intake_cleanup VALUES(?,?,'pending')", (identity, json.dumps(cleanup)))
 
     def mark_unavailable(self, identity, reason):
         with self.connect() as db:
