@@ -162,6 +162,13 @@ class ReviewStore(Ledger):
             rows = db.execute("SELECT * FROM local_deletions WHERE status!='resolved' ORDER BY rowid").fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
+    def retire_merge_deletions(self, cloud_id, keys):
+        with self.connect() as db:
+            for row in db.execute("SELECT id,payload FROM local_deletions WHERE status='pending'").fetchall():
+                payload = json.loads(row['payload'])
+                if payload['cloud'] == cloud_id and payload['key'] in keys:
+                    db.execute("UPDATE local_deletions SET status='resolved',action='native_merge' WHERE id=?", (row['id'],))
+
     def resolve_local_deletion(self, identity, choice, *, cloud, zotero, scope):
         if choice not in {'trash_tablet', 'keep_tablet', 'restore_zotero'}:
             raise PilotError('Choose how to handle the Zotero deletion.')

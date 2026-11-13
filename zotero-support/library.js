@@ -611,6 +611,24 @@ function notableRegisterLibraryEndpoint(Base) {
           return reply(error.navigationStatus || 409, {error: error.navigationStatus ? error.message : 'The surviving reference could not be verified.'});
         }
       }
+      if (data.action === 'inspect_link_merge') {
+        const {parent, keys} = data;
+        const validKey = key => typeof key === 'string' && /^[23456789ABCDEFGHIJKLMNPQRSTUVWXYZ]{8}$/.test(key);
+        if (!validKey(parent) || !Array.isArray(keys) || keys.length > 2 || !keys.every(validKey)) {
+          return reply(400, {error: 'Choose a saved Zotero link'});
+        }
+        try {
+          const reference = await notableReviewNavigationItem(parent, 'references', {allowMissing: true});
+          const attachments = {};
+          for (const key of keys) {
+            const item = await notableReviewNavigationItem(key, 'pdf', {allowMissing: true});
+            if (item && item.key !== key) attachments[key] = item.toJSON();
+          }
+          return reply(200, {parent: reference?.toJSON() || null, attachments});
+        } catch (error) {
+          return reply(error.navigationStatus || 409, {error: 'Zotero could not verify the merge history.'});
+        }
+      }
       if (data.action === 'attach_intake_pdf') {
         const signature = JSON.stringify([data.source, data.doi_value, data.md5]);
         const active = notableIntakePDFJobs.get(data.parent);

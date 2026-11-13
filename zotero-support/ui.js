@@ -2954,6 +2954,7 @@ var NotableUI = {
   },
   syncDecisionCount() {
     return (this.latest.deletions || []).length + (this.latest.local_deletions || []).length + (this.latest.folder_issues || []).length
+      + (this.latest.status?.result?.review || []).filter(issue => issue.merge).length
       + this.syncDecisions.filter(job => job.connection !== this.filingConnection() || !this.syncDecisionEvidence(job.method, job.params)).length;
   },
   syncReviewAvailable() {
@@ -2962,9 +2963,9 @@ var NotableUI = {
   syncWarnings() {
     const queued = new Set((this.latest?.reviews || []).map(row => row.identity));
     const pendingTrash = new Set((this.latest?.deletions || []).map(row => row.payload.cloud));
-    return (this.latest?.status?.result?.review || []).filter(issue => !this.isQueueMessage(issue)
+    return (this.latest?.status?.result?.review || []).filter(issue => issue.merge || (!this.isQueueMessage(issue)
       && !queued.has(issue.attachment) && !queued.has(issue.cloud) && !queued.has(issue.collection)
-      && !pendingTrash.has(issue.cloud));
+      && !pendingTrash.has(issue.cloud)));
   },
   decisionLocations(parent, locations, {folder = false} = {}) {
     const boxes = [];
@@ -3521,7 +3522,9 @@ var NotableUI = {
     const shown = new Set();
     if (this.syncDecisionReadError) this.el('p', this.syncDecisionReadError, content, {role: 'alert', class: 'message error'});
     this.renderFolderIssues(content, shown);
+    const mergeWarnings = this.syncWarnings().filter(issue => issue.merge);
     for (const row of this.latest.local_deletions || []) {
+      if (mergeWarnings.some(issue => issue.cloud === row.payload.cloud)) continue;
       const card = this.el('section', '', content, {class: 'card decision'});
       this.el('h2', 'Trashed in Zotero: ' + row.payload.title, card);
       if (this.renderSavedSyncDecision(card, 'local_delete_decision', row.id, shown)) continue;
@@ -3577,8 +3580,15 @@ var NotableUI = {
       for (const issue of warnings) {
         const link = (this.latest.links || []).find(row => row.cloud === issue.cloud || row.source_key === issue.attachment || row.view_key === issue.attachment);
         const card = this.el('section', '', group, {class: 'sync-decision-item'});
-        this.el('h3', issue.title || link?.name || (issue.attachment ? 'Zotero attachment ' + issue.attachment : 'Sync warning'), card);
+        const title = issue.title || link?.name || (issue.attachment ? 'Zotero attachment ' + issue.attachment : 'Sync warning');
+        this.el('h3', issue.merge ? 'Zotero merge or attachment change: ' + title : title, card);
         this.el('p', issue.reason, card);
+        if (issue.merge) {
+          if (issue.parent) this.reviewNavigationButton('Show surviving reference in Zotero', card, 'references', [issue.parent]);
+          if (link) this.button('Check connection', card, () => this.previewLinkRepair(link.cloud)).dataset.browse = 'true';
+          if (link) this.renderLinkRepair(card, link.cloud);
+          continue;
+        }
         if (issue.attachment) this.reviewNavigationButton('Show affected attachment in Zotero', card, 'attachment', [issue.attachment]);
         if (issue.collection) this.reviewNavigationButton('Show Zotero collection', card, 'collection', [issue.collection]);
         if (issue.parent) this.reviewNavigationButton('Open affected reference in Zotero', card, 'references', [issue.parent]);
@@ -4072,8 +4082,8 @@ var NotableUI = {
         const ownerLinks = (this.latest.links || []).filter(link => link.parent === linked[0].key);
         if (!mergeReady) this.el('p', 'Keep the linked PDF and its notes while checking these references.', advice);
         else if (linked.length === 1 && ownerLinks.length === 1 && !ownerLinks[0].paused && !ownerLinks[0].unavailable) {
-          this.el('p', 'Keep the reference marked “Linked to reMarkable” as the survivor when possible. Keep the linked PDF and its notes.', advice);
-        } else this.el('p', 'Check the existing tablet connections before merging; automatic reassignment of sync links after a merge is not supported yet. Keep the linked PDF and its notes.', advice);
+          this.el('p', 'Keep the reference marked “Linked to reMarkable” as the survivor when possible. Keep the linked PDF and its notes. Zotero can combine matching attachments during a merge.', advice);
+        } else this.el('p', 'Check the existing tablet connections before merging. If both references are linked, keep them separate to preserve both connections. Keep the linked PDF and its notes.', advice);
       }
       const list = this.el('ul', '', participants, {class: 'review-participants'});
       for (const reference of references.values()) {
@@ -4370,7 +4380,7 @@ var NotableUI = {
   },
   async previewLinkRepair(identity) {
     const result = await this.action('preview_link_repair', {identity}, false);
-    this.linkRepair = result.link_repair; this.render();
+    if (result) { this.linkRepair = result.link_repair; this.render(); }
   },
   renderLinkRepair(parent, identity) {
     const preview = this.linkRepair;
@@ -4378,7 +4388,7 @@ var NotableUI = {
     const card = this.el('section', '', parent, {class: 'card'});
     this.el('h3', 'Reconnect to the surviving Zotero reference?', card);
     this.el('p', preview.title, card);
-    this.el('p', 'The existing PDF, tablet copy, and notes will be kept.' + (preview.paused ? ' The connection will stay paused.' : ''), card, {class: 'hint'});
+    this.el('p', 'The connection will use the verified Zotero PDF and keep the same tablet copy and notes.' + (preview.paused ? ' The connection will stay paused.' : ''), card, {class: 'hint'});
     this.reviewNavigationButton('Open surviving reference', card, 'references', [preview.parent]);
     this.button('Reconnect surviving reference', card, async () => {
       await this.action('repair_link', {identity, token: preview.token}, false);

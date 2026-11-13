@@ -1313,15 +1313,32 @@ class Worker:
             self.review.observe_live(item)
             if item and not item.deleted and link.get("parent"):
                 parent = client.get("item", link["parent"])
-                key = link.get("view_key") or link.get("source_key")
-                view = client.get("item", key) if key else None
-                if (not parent or parent.get('deleted')) and view and not view.get('deleted') and view.get('parentItem') != link['parent']:
-                    if self._reconcile_merged_parent(identity, client):
-                        link = self.state.read('documents', {}).get(identity, link)
-                        parent = client.get('item', link['parent'])
-                self.review.observe_zotero_live(identity, parent)
-                self.review.observe_zotero_live(identity, view)
-                self.review.confirm_zotero_deleted(item, link, parent if parent and parent.get("deleted") else view)
+                files = {key: client.get('item', key) for key in self._link_pdf_keys(link)}
+                if self._link_identity_changed(link, parent, files) or self._link_attachment_undo_possible(link):
+                    evidence = None
+                    try:
+                        evidence = self._link_merge_evidence(client, link, files)
+                        if evidence:
+                            if self._reconcile_merged_parent(identity, client, evidence=evidence, strict=True):
+                                continue
+                            raise PilotError('The Zotero merge changed again while the connection was being checked.')
+                        if any(record and not record.get('deleted') and record.get('parentItem') != link['parent']
+                               for record in files.values()):
+                            raise PilotError('A linked PDF moved to another reference. Check its original connection in Zotero.')
+                    except (AuthorizationRequired, TransportInterrupted):
+                        raise
+                    except (PilotError, CloudError, OSError, ValueError) as error:
+                        if isinstance(error, CloudError) and 'authorization expired' in str(error).lower():
+                            raise
+                        self.review.retire_merge_deletions(identity, {link['parent'], *files})
+                        self.catalog_issues.append({'cloud': identity, 'title': link['name'], 'merge': True,
+                            'parent': (evidence or {}).get('parent', {}).get('key'),
+                            'reason': 'Zotero merge or attachment change needs review. ' + str(error)})
+                        continue
+                for record in [parent, *files.values()]:
+                    self.review.observe_zotero_live(identity, record)
+                deleted = next((record for record in [parent, *files.values()] if record and record.get('deleted')), None)
+                self.review.confirm_zotero_deleted(item, link, deleted)
             if item and (item.deleted or item.parent == "trash") and link.get("parent"):
                 published = self.state.directory / "publisher"
                 from .zotero_pilot import Ledger
@@ -2341,16 +2358,52 @@ class Worker:
         finally:
             client.close()
 
-    def _link_repair_snapshot(self, identity, client, *, merge_recovery=False):
-        """Verify a native parent merge without replacing PDFs or publication state."""
+    @staticmethod
+    def _link_pdf_keys(link):
+        return {link.get('source_key'), link.get('view_key')} - {None, ''}
+
+    @staticmethod
+    def _link_identity_changed(link, parent, files):
+        return (not parent or parent.get('deleted') or any(
+            not record or record.get('deleted') or record.get('parentItem') != link['parent']
+            for record in files.values()))
+
+    @staticmethod
+    def _link_attachment_undo_possible(link):
+        history = link.get('repair_history', [])
+        return bool(history and history[-1].get('to') == link['parent'] and history[-1].get('previous_pdfs')
+                    and history[-1].get('action') != 'Followed Zotero Undo')
+
+    def _link_merge_evidence(self, client, link, files):
+        evidence = client.review_action('inspect_link_merge', {'parent': link['parent'], 'keys': sorted(files)})
+        parent = evidence.get('parent')
+        replacements = evidence.get('attachments', {})
+        if parent and (parent['key'] != link['parent'] or replacements):
+            return {'parent': parent, 'attachments': replacements}
+        # Undo restores the old records and removes Zotero's forward relations.
+        # Reverse a recorded repair only when the original PDFs are live again.
+        history = link.get('repair_history', [])
+        if history and history[-1].get('to') == link['parent'] and history[-1].get('action') != 'Followed Zotero Undo':
+            change = history[-1]
+            former = client.get('item', change['from'])
+            original_keys = {key: previous for key, previous in change.get('previous_pdfs', {}).items() if key in files}
+            original = {key: client.get('item', original_keys.get(key, key)) for key in files}
+            if ((change['from'] != link['parent'] or original_keys) and former and not former.get('deleted') and original and all(
+                    record and not record.get('deleted') and record.get('parentItem') == former['key']
+                    for record in original.values())):
+                return {'parent': former, 'attachments': {key: original[key] for key in original_keys}, 'undo': True}
+        return None
+
+    def _link_repair_snapshot(self, identity, client, evidence=None):
+        """Verify native merge identity, PDF bytes, and the original tablet copy."""
         from .zotero_pilot import marker
         links = self.state.read('documents', {})
         link = links.get(identity)
         if not link or not link.get('parent') or not link.get('baseline'):
             raise PilotError('This saved connection is unavailable. Recheck Zotero before repairing it.')
-        if any(row['payload'].get('cloud') == identity for row in [*self.review.deletions(), *([] if merge_recovery else self.review.local_deletions())]):
+        if any(row['payload'].get('cloud') == identity for row in self.review.deletions()):
             raise PilotError('Finish this paper’s deletion decision before repairing its connection.')
-        keys = {link.get('source_key'), link.get('view_key')} - {None, ''}
+        keys = self._link_pdf_keys(link)
         if any(row['status'] == 'applying' and (row['identity'] in keys | {identity}
                or row['approval'].get('source') in keys or row['approval'].get('match') == identity)
                for row in self.review.rows()):
@@ -2361,19 +2414,24 @@ class Worker:
         publication = publisher.get(identity)
         if publication.get('pending_md5') or publisher.upload_intent(identity):
             raise PilotError('This PDF has an unfinished publication. Recover that operation before repairing its connection.')
-        resolved = client.review_action('inspect_review_reference', {'key': link['parent']})
+        evidence = evidence or self._link_merge_evidence(client, link, keys)
+        if not evidence:
+            raise PilotError('This connection already uses the current Zotero reference, or its merge could not be verified.')
+        target = evidence['parent']['key']
+        resolved = client.review_action('inspect_review_reference', {'key': target})
         parent = resolved.get('parent', {})
-        if (resolved.get('requested') != link['parent'] or not parent.get('key') or parent.get('deleted')
+        if (resolved.get('requested') != target or parent.get('key') != target or parent.get('deleted')
                 or parent.get('itemType') in {'attachment', 'annotation', 'note'}):
             raise PilotError('The surviving Zotero reference could not be verified.')
-        if parent['key'] == link['parent']:
-            raise PilotError('This connection already uses the current Zotero reference. No merge repair is needed.')
         if link.get('collection') not in parent.get('collections', []):
             raise PilotError('The surviving reference is outside its linked collection. Restore that membership in Zotero, then retry.')
+        pdfs = {key: evidence['attachments'].get(key, {}).get('key', key) for key in keys}
+        if len(set(pdfs.values())) != len(pdfs):
+            raise PilotError('Zotero combined the original and the tablet view. Inspect both copies before reconnecting.')
         if any(cloud != identity and (other.get('parent') == parent['key']
-               or keys & ({other.get('source_key'), other.get('view_key')} - {None, ''}))
+               or (keys | set(pdfs.values())) & self._link_pdf_keys(other))
                for cloud, other in links.items()):
-            raise PilotError('Another tablet connection uses this reference or PDF. Keep the connections separate until their ownership is resolved.')
+            raise PilotError('Another tablet connection uses this reference or PDF. Undo the merge in Zotero to keep both connections.')
         desktop_original = self.state.directory / 'originals' / (link['baseline'] + '.pdf')
         tablet_original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (link['baseline'] + '.pdf')
         # Cloud-origin papers keep their clean baseline in the cloud adapter's
@@ -2387,30 +2445,32 @@ class Worker:
         files = []
         if not keys:
             raise PilotError('This connection has no recorded Zotero PDF. Restore its PDF before repairing it.')
-        for key in sorted(keys):
-            record = client.get('item', key)
+        for key, current_key in sorted(pdfs.items()):
+            record = client.get('item', current_key)
             if (not record or record.get('deleted') or record.get('itemType') != 'attachment'
                     or record.get('parentItem') != parent['key'] or record.get('contentType') != 'application/pdf'):
-                raise PilotError('A connected PDF was removed or replaced. Restore that exact attachment in Zotero before repairing; no replacement PDF was guessed.')
-            path = client.file_path(key)
+                raise PilotError('A connected PDF was removed or replaced. Undo the merge in Zotero to recover the original attachment.')
+            path = client.file_path(current_key)
             content = path.read_bytes()
             sha = hashlib.sha256(content).hexdigest()
             md5 = hashlib.md5(content).hexdigest()
             if key == link.get('view_key'):
                 # This is the same ownership contract used by publish(). A
                 # parent repair cannot adopt an independently reassigned PDF.
-                if (record.get('linkMode') != 'imported_file'
-                        or marker(bridge.namespace, identity) not in record.get('note', '')):
+                note = record.get('note', '')
+                ownership = marker(bridge.namespace, identity)
+                if (record.get('linkMode') != 'imported_file' or ownership not in note
+                        or any(value != ownership for value in re.findall(r'Notable pilot: [a-f0-9]{64}', note))):
                     raise PilotError('The connected tablet PDF changed ownership or storage mode. Restore its managed attachment before repairing.')
                 source = link.get('source_key')
-                if source and source != key and ('Notable source attachment: ' + source) not in record.get('note', ''):
+                if source and source != key and ('Notable source attachment: ' + pdfs[source]) not in note:
                     raise PilotError('The tablet view’s original source ownership changed. Restore its source attachment link before repairing.')
                 expected = publication.get('md5')
                 if (expected and expected != md5) or (not expected and sha != link['baseline']):
                     raise PilotError('The connected PDF changed since its last publication. Retain its annotations and recover that change before repairing.')
             elif sha != link['baseline']:
                 raise PilotError('The original source PDF changed. Compare its edition before repairing this connection.')
-            files.append({'key': key, 'record': record, 'sha256': sha, 'md5': md5})
+            files.append({'key': current_key, 'record': record, 'sha256': sha, 'md5': md5, 'filename': path.stem})
         library = cloud.library()
         scope = descendants(library, self.config['tablet_root'], lambda item: item.id, lambda item: item.parent,
                             unavailable={item.id for item in library if item.deleted})
@@ -2422,46 +2482,49 @@ class Worker:
             raise PilotError('The tablet original changed. Its edition must be reviewed before reconnecting.')
         return {'identity': identity, 'connection': [client.server_id, self.config['zotero_root'], self.config['tablet_root']],
                 'link': link, 'parent': parent, 'inventory': resolved['inventory'], 'files': files,
-                'tablet_hash': tablet.hash, 'publication': publication,
+                'tablet_hash': tablet.hash, 'publication': publication, 'pdfs': pdfs, 'undo': evidence.get('undo', False),
                 'paused': self.review.link_control(identity)['paused']}
 
-    def _reconcile_merged_parent(self, identity, client):
-        """Follow native merge evidence only when every owned PDF survives intact."""
-        links = self.state.read('documents', {})
-        old = links.get(identity, {})
-        if not old.get('parent'):
-            return False
-        parent = client.get('item', old['parent'])
-        view = client.get('item', old.get('view_key') or old.get('source_key'))
-        if ((parent and not parent.get('deleted')) or not view or view.get('deleted')
-                or not view.get('parentItem') or view['parentItem'] == old['parent']):
-            return False
+    def _commit_link_repair(self, snapshot, action):
+        identity, old, pdfs = snapshot['identity'], snapshot['link'], snapshot['pdfs']
+        with self.state.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            stored = db.execute("SELECT value FROM bridge_values WHERE key='documents'").fetchone()
+            links = json.loads(stored[0]) if stored else {}
+            if links.get(identity) != old:
+                raise PilotError('This connection changed. Review its repair again.')
+            link = {**old, 'parent': snapshot['parent']['key']}
+            for field in ('source_key', 'view_key'):
+                if old.get(field):
+                    link[field] = pdfs[old[field]]
+            previous_view = old.get('view_key') or old.get('source_key')
+            current_view = link.get('view_key') or link.get('source_key')
+            if current_view != previous_view:
+                # Zotero chose an existing attachment and filename. This does
+                # not represent a user request to rename the tablet document.
+                link['desktop_name'] = next(file['filename'] for file in snapshot['files'] if file['key'] == current_view)
+            link['repair_history'] = [*old.get('repair_history', []), {
+                'time': time.time(), 'action': action, 'from': old['parent'], 'to': link['parent'],
+                'previous_pdfs': {new: key for key, new in pdfs.items() if new != key},
+            }]
+            links[identity] = link
+            db.execute("UPDATE bridge_values SET value=? WHERE key='documents'", (json.dumps(links),))
+        self.review.retire_merge_deletions(identity, {old['parent'], *pdfs})
+
+    def _reconcile_merged_parent(self, identity, client, *, evidence=None, strict=False):
+        """Follow native merge or Undo evidence when the owned PDFs are verified."""
         try:
-            snapshot = self._link_repair_snapshot(identity, client, merge_recovery=True)
-            if snapshot['parent']['key'] != view['parentItem']:
-                return False
+            snapshot = self._link_repair_snapshot(identity, client, evidence)
             with self.state.lock():
-                current = self._link_repair_snapshot(identity, client, merge_recovery=True)
+                current = self._link_repair_snapshot(identity, client)
                 if fingerprint(current) != fingerprint(snapshot):
                     return False
-                with self.state.connect() as db:
-                    db.execute('BEGIN IMMEDIATE')
-                    stored = db.execute("SELECT value FROM bridge_values WHERE key='documents'").fetchone()
-                    links = json.loads(stored[0]) if stored else {}
-                    if links.get(identity) != snapshot['link']:
-                        return False
-                    links[identity] = {**links[identity], 'parent': snapshot['parent']['key'],
-                        'repair_history': [*links[identity].get('repair_history', []), {'time': time.time(),
-                            'action': 'Followed verified native merge', 'from': old['parent'], 'to': snapshot['parent']['key']}]}
-                    db.execute("UPDATE bridge_values SET value=? WHERE key='documents'", (json.dumps(links),))
-            with self.review.connect() as db:
-                for row in db.execute("SELECT id,payload FROM local_deletions WHERE status='pending'").fetchall():
-                    payload = json.loads(row['payload'])
-                    if payload.get('cloud') == identity and payload.get('key') == old['parent']:
-                        db.execute("UPDATE local_deletions SET status='resolved',action='verified_native_merge' WHERE id=?", (row['id'],))
+                self._commit_link_repair(current, 'Followed Zotero Undo' if current['undo'] else 'Followed verified native merge')
             return True
         except (PilotError, OSError, ValueError):
-            return False  # Ambiguous or changed evidence keeps the existing review.
+            if strict:
+                raise
+            return False
 
     def preview_link_repair(self, identity):
         client = self.zotero()
@@ -2481,19 +2544,7 @@ class Worker:
                 snapshot = self._link_repair_snapshot(identity, client)
                 if not token or fingerprint(snapshot) != token:
                     raise PilotError('The reference, PDF, notes, or tablet document changed. Review the connection repair again.')
-                # Update one private ledger entry atomically. Native records, tablet
-                # identity, publication receipts, baselines, and pause state stay put.
-                with self.state.connect() as db:
-                    db.execute('BEGIN IMMEDIATE')
-                    stored = db.execute("SELECT value FROM bridge_values WHERE key='documents'").fetchone()
-                    links = json.loads(stored[0]) if stored else {}
-                    if links.get(identity) != snapshot['link']:
-                        raise PilotError('This connection changed. Review its repair again.')
-                    link = {**links[identity], 'parent': snapshot['parent']['key']}
-                    link['repair_history'] = [*link.get('repair_history', []), {'time': time.time(),
-                        'action': 'Reconnected native merge survivor', 'from': snapshot['link']['parent'], 'to': link['parent']}]
-                    links[identity] = link
-                    db.execute("UPDATE bridge_values SET value=? WHERE key='documents'", (json.dumps(links),))
+                self._commit_link_repair(snapshot, 'Followed Zotero Undo' if snapshot['undo'] else 'Reconnected native merge survivor')
                 return self.status()
         finally:
             client.close()
@@ -2523,6 +2574,20 @@ class Worker:
     def local_delete_decision(self, identity, choice):
         client = self.zotero()
         try:
+            row = next((row for row in self.review.local_deletions() if row['id'] == identity), None)
+            if row:
+                cloud = row['payload']['cloud']
+                link = self.state.read('documents', {}).get(cloud)
+                if not link:
+                    raise PilotError('The linked paper changed. Sync again before deciding.')
+                keys = self._link_pdf_keys(link)
+                if row['payload']['key'] not in {link['parent'], *keys} or self._link_merge_evidence(client, link, keys):
+                    self.review.retire_merge_deletions(cloud, {row['payload']['key']})
+                    raise PilotError('Zotero merged or reconnected this paper. Sync again to check its connection.')
+                records = [client.get('item', key) for key in keys]
+                if row['payload']['key'] == link['parent'] and any(
+                        record and record.get('parentItem') != link['parent'] for record in records):
+                    raise PilotError('A linked PDF moved to another reference. Sync again to review the connection.')
             self.review.resolve_local_deletion(identity, choice, cloud=self.cloud(), zotero=client, scope=self.config["tablet_root"])
             return self.status()
         finally:
@@ -2807,10 +2872,25 @@ class Worker:
         page_add, page_remove = changes(page)
         links = self.state.read('documents', {})
         row = links.get(cloud)
-        if not row or row.get('parent') != parent_key or row.get('view_key') != key:
+        if not row or not row.get('view_key'):
             raise PilotError('The Zotero reference or its PDF link changed. Reopen the PDF to review the edit.')
         if row.get('last_tag_edit') == edit_id:
             return {'tag_edit_applied': edit_id}
+        original = (parent_key, key)
+        for repair in row.get('repair_history', []):
+            if parent_key == repair.get('from'):
+                remap = {previous: current for current, previous in repair.get('previous_pdfs', {}).items()}
+                parent_key, key = repair['to'], remap.get(key, key)
+        if (row.get('parent'), row.get('view_key')) == original:
+            parent_key, key = original
+        if (row.get('parent'), row.get('view_key')) != (parent_key, key):
+            raise PilotError('The Zotero reference or its PDF link changed. Reopen the PDF to review the edit.')
+        # Tag removals approved before a merge do not cover tags on the other
+        # reference. A partially written edit also requires fresh review.
+        if original != (parent_key, key) and row.get('tag_edit_writing'):
+            raise PilotError('Zotero merged this reference during a saved tag edit. Review the current paper and page tags.')
+        if original != (parent_key, key) and paper_remove:
+            raise PilotError('Zotero merged this reference. Review the saved paper-tag removals on the surviving reference.')
         if page_id not in row.get('page_map', []) or row.get('page_map_digest') != pdf_digest:
             raise PilotError('The PDF changed. Reopen it and check the page before adding its tags again.')
         if row.get('tag_pending'):

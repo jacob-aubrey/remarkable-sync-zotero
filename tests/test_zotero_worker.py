@@ -45,6 +45,8 @@ class ReviewZotero(BridgeZotero):
             return {'key': data['key'], 'parent': data['parent']}
         if action == 'inventory':
             return {'inventory': [{'key': r['key']} for r in self.items.values() if r.get('parentItem') == data['parent']]}
+        if action == 'inspect_link_merge':
+            return {'parent': None, 'attachments': {}}
         if action == 'adopt':
             self.items[data['key']]['note'] = data['marker']
             return {'adopted': True, 'native': 0}

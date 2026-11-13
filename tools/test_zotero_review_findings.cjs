@@ -75,7 +75,7 @@ async function main() {
   refs[1].itemType = 'journalArticle';
   ui.latest.links.push({parent: 'OTHER234', name: 'Another tablet article'});
   const twoLinked = node(); ui.renderReviewFindings(row, twoLinked);
-  assert.match(text(twoLinked), /automatic reassignment of sync links after a merge is not supported/);
+  assert.match(text(twoLinked), /If both references are linked, keep them separate to preserve both connections/);
   assert.doesNotMatch(text(twoLinked), /Keep the reference marked “Linked to reMarkable” as the survivor/);
 
   // A remembered missing source must not look like a second current PDF.

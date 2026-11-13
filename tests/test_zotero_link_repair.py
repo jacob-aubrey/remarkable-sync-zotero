@@ -28,6 +28,7 @@ class LinkRepairTests(unittest.TestCase):
         self.tablet = SimpleNamespace(id=self.cloud_id, parent=self.cloud_root_id, deleted=False, hash='cloud-revision')
         self.tablet_pdf = self.path.read_bytes()
         self.native_calls = []
+        self.replacements = {}
         self.native = SimpleNamespace(server_id='synthetic-server', close=lambda: None,
             review_action=self.native_action, get=lambda kind, key: copy.deepcopy(self.records.get(key)),
             file_path=lambda key: self.path)
@@ -50,6 +51,8 @@ class LinkRepairTests(unittest.TestCase):
 
     def native_action(self, action, data):
         self.native_calls.append(action)
+        if action == 'inspect_link_merge':
+            return {'parent': copy.deepcopy(self.parent), 'attachments': copy.deepcopy(self.replacements)}
         self.assertEqual(action, 'inspect_review_reference', 'Repair must never write to Zotero')
         return {'requested': data['key'], 'parent': copy.deepcopy(self.parent), 'inventory': copy.deepcopy(self.inventory)}
 
@@ -71,6 +74,39 @@ class LinkRepairTests(unittest.TestCase):
         self.record['deleted'] = True
         self.assertFalse(self.worker._reconcile_merged_parent(self.cloud_id, self.native))
 
+    def test_replaced_attachment_and_undo_keep_the_same_tablet_and_receipt(self):
+        self.record['deleted'] = True
+        replacement = {**self.record, 'key': 'NEWPDF23', 'deleted': False}
+        self.records['NEWPDF23'] = self.replacements['VIEW2345'] = replacement
+        receipt = self.publisher.get(self.cloud_id)
+        self.assertTrue(self.worker._reconcile_merged_parent(self.cloud_id, self.native))
+        repaired = self.worker.state.read('documents')[self.cloud_id]
+        self.assertEqual(repaired['view_key'], 'NEWPDF23')
+        self.assertEqual(repaired['repair_history'][-1]['previous_pdfs'], {'NEWPDF23': 'VIEW2345'})
+        self.replacements.clear()
+        former = {**self.parent, 'key': 'FORMER23'}
+        self.records['FORMER23'] = former
+        self.record.update(parentItem='FORMER23', deleted=False)
+        replacement['note'] = ''
+        original_action = self.native.review_action
+        self.native.review_action = lambda action, data: (
+            {'requested': 'FORMER23', 'parent': former, 'inventory': []}
+            if action == 'inspect_review_reference' and data['key'] == 'FORMER23' else original_action(action, data))
+        self.assertTrue(self.worker._reconcile_merged_parent(self.cloud_id, self.native))
+        restored = self.worker.state.read('documents')[self.cloud_id]
+        self.assertEqual((restored['parent'], restored['view_key']), ('FORMER23', 'VIEW2345'))
+        self.assertEqual(self.publisher.get(self.cloud_id), receipt)
+
+    def test_saved_trash_decision_rechecks_for_native_merge_before_touching_tablet(self):
+        record = {'key': 'FORMER23', 'itemType': 'journalArticle', 'deleted': True}
+        self.records[record['key']] = record
+        self.worker.review.confirm_zotero_deleted(self.tablet, self.link, record)
+        decision = self.worker.review.local_deletions()[0]
+        with self.assertRaisesRegex(PilotError, 'merged or reconnected'):
+            self.worker.local_delete_decision(decision['id'], 'trash_tablet')
+        self.assertEqual(self.worker.review.local_deletions(), [])
+        self.assertFalse(self.tablet.deleted)
+
     def preview(self):
         return self.worker.preview_link_repair(self.cloud_id)['link_repair']
 
@@ -91,7 +127,7 @@ class LinkRepairTests(unittest.TestCase):
         self.assertEqual(self.publisher.get(self.cloud_id), receipt)
         self.assertEqual(self.path.read_bytes(), pdf)
         self.assertTrue(self.worker.review.link_control(self.cloud_id)['paused'])
-        self.assertEqual(self.native_calls, ['inspect_review_reference', 'inspect_review_reference'])
+        self.assertEqual(self.native_calls, ['inspect_link_merge', 'inspect_review_reference'] * 2)
 
     def test_cloud_origin_uses_retained_source_baseline_without_desktop_originals(self):
         self.assertFalse((self.worker.state.directory / 'originals').exists())
