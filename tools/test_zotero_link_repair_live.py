@@ -21,7 +21,7 @@ BRANCH = """
             const removed = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, command.removed || 'RPRFRM23');
             await mergeItems(survivor, [removed]); response.merged = removed.deleted;
           } else if (command.action === 'undo_merge_fixture') {
-            await Zotero.UndoHistory.undo();
+            response.undone = await Zotero.UndoHistory.undo();
           }
 """
 
@@ -69,7 +69,6 @@ def repair_checks(client, root, checked):
     assert ledger.get(tablet.id) == receipt and file_sha(client.file_path('RPRPDF23')) == sha
     assert {key: client.get('item', key) for key in keys} == before
     checked('confirmed_repair_preserves_native_records_PDF_bytes_notes_tablet_ID_baseline_and_publication_receipt')
-    sync_merge_checks(client, root, checked)
     return None
 
 
@@ -227,9 +226,16 @@ def check_two_links(client, root, checked):
     checked('merging_two_linked_references_keeps_both_tablet_documents_but_leaves_one_connection_held')
 
 
+def native_checks(client, root, checked):
+    # Exercise Undo before the independent manual-repair fixture writes native
+    # items. Zotero invalidates its Undo stack after outside changes.
+    sync_merge_checks(client, root, checked)
+    return repair_checks(client, root, checked)
+
+
 if __name__ == '__main__':
     marker = "          else if (command.action === 'reindex')"
     assert marker in live.BOOTSTRAP
     live.BOOTSTRAP = live.BOOTSTRAP.replace(marker, BRANCH + marker, 1)
-    live.native_checks = repair_checks
+    live.native_checks = native_checks
     live.main()
