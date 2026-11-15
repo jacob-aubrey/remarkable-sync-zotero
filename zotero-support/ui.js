@@ -631,7 +631,8 @@ var NotableUI = {
     if (this.latest?.folder_issues?.length) return 'Folder sync needs a decision. Open Sync Conflicts.';
     const issues = this.latest?.status?.result?.review || [];
     const pending = this.latest?.reviews?.length || 0;
-    if (pending && ((issues.length && issues.every(issue => this.isQueueMessage(issue))) || !this.latest?.status?.message)) {
+    if (pending && ((issues.length && issues.every(issue => this.isQueueMessage(issue)) && !this.syncWarnings().length)
+        || !this.latest?.status?.message)) {
       return 'Ready';
     }
     return this.latest?.status?.message || 'Ready';
@@ -750,7 +751,7 @@ var NotableUI = {
   async pauseSync() {
     if (this.pausing) return;
     this.pausing = true; clearTimeout(this.timer); this.timer = null;
-    this.cancelAfterSync('Sync was paused. Review the item and choose the action again.');
+    this.cancelAfterSync('Sync was paused. Review the item and choose the action again.', true);
     this.filingQueuePaused = true;
     try { await this.saveFilingQueue(); } catch (_) { this.queueError = 'The queue could not be saved. Sync is being paused.'; }
     if (this.operation) { this.operation.stopping = true; this.operation.yielding = false; }
@@ -760,7 +761,10 @@ var NotableUI = {
       this.latest = await this.rpc('pause_sync'); this.badge();
       if (this.view && !this.view.closed) this.render();
     } catch (error) { this.message(error.message, true); throw error; }
-    finally { this.pausing = false; this.disable(this.busy); this.schedule(); this.badge(); this.drainSyncDecisions(); this.drainTagEdits(); }
+    finally {
+      this.pausing = false; this.disable(this.busy); this.schedule(); this.badge();
+      this.drainSyncDecisions(); this.drainTagEdits(); this.drainAfterSync();
+    }
   },
   clearFolderEditor() {
     this.changingFolder = false; this.setupDirty = false; this.setupDraft = null;
@@ -927,7 +931,7 @@ var NotableUI = {
         const {checked, resolved, unavailable} = result.keyword_recheck;
         if (params.parent && this.saveFeedback?.tab === this.tab) this.message(this.saveFeedback.value, false, true);
         else this.message(checked || unavailable
-          ? `Checked ${checked} keyword ${checked === 1 ? 'warning' : 'warnings'}. ${resolved} cleared${unavailable ? `, ${unavailable} unavailable` : ''}.`
+          ? `Ran ${checked} keyword ${checked === 1 ? 'check' : 'checks'}. ${resolved} ${resolved === 1 ? 'warning' : 'warnings'} cleared${unavailable ? `, ${unavailable} unavailable` : ''}.`
           : 'There are no keyword warnings left to recheck.');
       }
       else if (result.folder_change) {
@@ -1374,7 +1378,7 @@ var NotableUI = {
   async recheckKeywordsAfterSave(parent) {
     const warnings = this.latest?.status?.result?.review || [];
     if (!parent || !(this.latest?.links || []).some(link => link.parent === parent &&
-      (link.keyword_has_zotero_tags || link.keyword_manual_tags?.length ||
+      (link.keyword_has_zotero_tags || link.keyword_parent_unavailable || link.keyword_manual_tags?.length ||
         warnings.some(issue => issue.kind === 'keywords' && issue.cloud === link.cloud)))) return;
     try {
       await this.action('recheck_keyword_warnings', {parent}, this.tab === 'sync-review');
@@ -3035,19 +3039,35 @@ var NotableUI = {
     return `${decisions} sync ${decisions === 1 ? 'decision' : 'decisions'}`;
   },
   syncDecisionCount() {
-    return (this.latest.deletions || []).length + (this.latest.local_deletions || []).length + (this.latest.folder_issues || []).length
-      + (this.latest.status?.result?.review || []).filter(issue => issue.merge).length
+    const merges = this.syncWarnings().filter(issue => issue.merge);
+    const localDeletions = (this.latest.local_deletions || []).filter(row => !merges.some(issue => issue.cloud && issue.cloud === row.payload?.cloud));
+    return (this.latest.deletions || []).length + localDeletions.length + (this.latest.folder_issues || []).length + merges.length
       + this.syncDecisions.filter(job => job.connection !== this.filingConnection() || !this.syncDecisionEvidence(job.method, job.params)).length;
   },
   syncReviewAvailable() {
     return this.latest && (this.queueRows('sync-review').length || this.syncDecisionCount() || this.syncWarnings().length);
   },
   syncWarnings() {
-    const queued = new Set((this.latest?.reviews || []).map(row => row.identity));
-    const pendingTrash = new Set((this.latest?.deletions || []).map(row => row.payload.cloud));
-    return (this.latest?.status?.result?.review || []).filter(issue => issue.merge || (!this.isQueueMessage(issue)
-      && !queued.has(issue.attachment) && !queued.has(issue.cloud) && !queued.has(issue.collection)
-      && !pendingTrash.has(issue.cloud)));
+    const reviews = this.latest?.reviews || [];
+    const pendingTrash = new Set((this.latest?.deletions || []).map(row => row.payload?.cloud).filter(Boolean));
+    const seen = new Set();
+    return (this.latest?.status?.result?.review || []).filter(issue => {
+      const {cloud, attachment, collection, parent} = issue;
+      // Suppress only notices already represented by the matching decision.
+      // Other notices about the same paper may still need attention.
+      if (this.isQueueMessage(issue) && reviews.some(row =>
+        (cloud && row.kind === 'cloud' && row.identity === cloud) ||
+        (attachment && row.kind === 'zotero' && row.identity === attachment))) return false;
+      if (issue.kind === 'conflict' && reviews.some(row => row.kind === 'conflict' && (
+        (cloud && row.payload.type === 'paper' && row.payload.cloud === cloud) ||
+        (collection && row.payload.type === 'folder' && row.payload.zotero === collection)))) return false;
+      if (cloud && pendingTrash.has(cloud) && !attachment && /^Linked tablet PDF is (?:unavailable|missing)/.test(issue.reason || '')) return false;
+      if (!cloud && !attachment && !collection && !parent) return true;
+      const key = JSON.stringify([issue.kind, !!issue.merge, cloud, attachment, collection, parent, issue.reason]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   },
   decisionLocations(parent, locations, {folder = false} = {}) {
     const boxes = [];
@@ -3566,7 +3586,7 @@ var NotableUI = {
           const notes = item.isPDFAttachment() ? ` · ${item.getAnnotations().length} annotations` : '';
           this.el('p', item.getDisplayTitle() + notes, pane, {class: 'hint'});
         }
-        this.reviewNavigationButton('Open PDF in Zotero', pane, 'pdf', [attachmentKey]);
+        this.reviewNavigationButton('Open PDF in Zotero', pane, 'pdf', [attachmentKey], {expectedParent: parentKey});
         return parent;
       });
       Promise.all(pending).then(([left, right]) => {
@@ -3633,9 +3653,10 @@ var NotableUI = {
     const shown = new Set();
     if (this.syncDecisionReadError) this.el('p', this.syncDecisionReadError, content, {role: 'alert', class: 'message error'});
     this.renderFolderIssues(content, shown);
-    const mergeWarnings = this.syncWarnings().filter(issue => issue.merge);
+    const warnings = this.syncWarnings();
+    const mergeWarnings = warnings.filter(issue => issue.merge);
     for (const row of this.latest.local_deletions || []) {
-      if (mergeWarnings.some(issue => issue.cloud === row.payload.cloud)) continue;
+      if (mergeWarnings.some(issue => issue.cloud && issue.cloud === row.payload.cloud)) continue;
       const card = this.el('section', '', content, {class: 'card decision'});
       this.el('h2', 'Trashed in Zotero: ' + row.payload.title, card);
       if (this.renderSavedSyncDecision(card, 'local_delete_decision', row.id, shown)) continue;
@@ -3682,7 +3703,6 @@ var NotableUI = {
       this.el('h2', job.title, card);
       this.renderQueuedSyncDecision(card, job);
     }
-    const warnings = this.syncWarnings();
     if (warnings.length) {
       const group = this.el('details', '', content, {class: 'card decision sync-warnings'});
       group.open = this.syncWarningsOpen !== false;
@@ -3692,17 +3712,15 @@ var NotableUI = {
         this.button('Recheck keyword warnings', group, () => this.action('recheck_keyword_warnings'), false, 'refresh-cw');
       }
       for (const issue of warnings) {
-        const links = this.latest.links || [];
-        const cloudLink = issue.cloud && links.find(row => row.cloud === issue.cloud);
-        const link = cloudLink || (issue.attachment && links.find(row => row.source_key === issue.attachment || row.view_key === issue.attachment));
+        const link = issue.cloud && this.latest.links?.find(row => row.cloud === issue.cloud);
         const card = this.el('section', '', group, {class: 'sync-decision-item'});
-        const title = issue.title || link?.name || (issue.attachment ? 'Zotero attachment ' + issue.attachment : 'Sync warning');
+        const title = issue.title || (issue.attachment ? 'Zotero attachment ' + issue.attachment : link?.name) || 'Sync warning';
         this.el('h3', issue.merge ? 'Zotero merge or attachment change: ' + title : title, card);
         this.el('p', issue.reason, card);
         if (issue.kind === 'keywords') {
-          const pdf = link?.parent === issue.parent && (link?.view_key || link?.source_key);
-          if (pdf) this.reviewNavigationButton('Open PDF in Zotero', card, 'pdf', [pdf]);
-          this.button('Recheck keywords', card, () => this.action('recheck_keyword_warnings', {cloud: issue.cloud}), false, 'refresh-cw');
+          const pdf = issue.parent && link?.parent === issue.parent && (link.view_key || link.source_key);
+          if (pdf) this.reviewNavigationButton('Open PDF in Zotero', card, 'pdf', [pdf], {expectedParent: issue.parent});
+          if (issue.cloud) this.button('Recheck keywords', card, () => this.action('recheck_keyword_warnings', {cloud: issue.cloud}), false, 'refresh-cw');
         }
         if (issue.merge) {
           if (issue.parent) this.reviewNavigationButton('Show surviving reference in Zotero', card, 'references', [issue.parent]);
@@ -3710,10 +3728,11 @@ var NotableUI = {
           if (link) this.renderLinkRepair(card, link.cloud);
           continue;
         }
-        if (issue.attachment) this.reviewNavigationButton('Show affected attachment in Zotero', card, 'attachment', [issue.attachment]);
+        if (issue.attachment) this.reviewNavigationButton('Show affected attachment in Zotero', card, 'attachment', [issue.attachment], {expectedParent: issue.parent});
         if (issue.collection) this.reviewNavigationButton('Show Zotero collection', card, 'collection', [issue.collection]);
         if (issue.parent) this.reviewNavigationButton('Open affected reference in Zotero', card, 'references', [issue.parent]);
-        if (link?.parent && link.parent !== issue.parent) {
+        else if (link?.parent && !issue.attachment) this.reviewNavigationButton('Open linked reference in Zotero', card, 'references', [link.parent]);
+        if (issue.kind !== 'keywords' && issue.attachment && issue.parent && link?.parent && link.parent !== issue.parent) {
           this.el('p', 'Already linked to reMarkable · ' + (link.name || link.parent), card, {class: 'hint'});
           this.reviewNavigationButton('Open reference already linked to reMarkable', card, 'references', [link.parent]);
         }
@@ -4028,7 +4047,7 @@ var NotableUI = {
   reviewNavigationButton(label, parent, target, keys, context = {}) {
     const button = this.button(label, parent, async () => {
       let result;
-      try { result = await notableNavigateReview({target, keys}); }
+      try { result = await notableNavigateReview({target, keys, ...(context.expectedParent ? {expected_parent: context.expectedParent} : {})}); }
       catch (error) {
         if (context.conflict) throw Error(error.message + ' Use Sync now to refresh this device conflict before deciding.');
         throw error;
@@ -4899,10 +4918,18 @@ var NotableUI = {
         if (await this.action('undo_filename_cleanup', {identity: row.cloud})) this.schedule(1000);
       });
     }
-    if (row.keyword_check) {
-      const labels = {found: 'Paper keywords checked and added where missing.', no_stated_keywords: 'No stated keyword list found in the readable first pages.',
+    const keywordCheck = row.keyword_review || row.keyword_check;
+    if (keywordCheck || row.keyword_parent_unavailable) {
+      const labels = {found: 'Stated keywords found in the linked PDFs.', no_stated_keywords: 'No stated keyword list found in the readable first pages.',
         needs_text_recognition: 'Keywords need text recognition or manual checking.', extraction_failed: 'The keyword check failed; sync will retry.'};
-      this.el('p', labels[row.keyword_check.status] || 'Keyword check pending.', card, {class: 'hint'});
+      const label = row.keyword_parent_unavailable ? 'The Zotero reference is unavailable for keyword checking.'
+        : row.keyword_has_zotero_tags || keywordCheck?.status === 'tagged_manually' ? 'This paper already has Zotero tags.'
+        : labels[keywordCheck?.status] || 'Keyword check pending.';
+      this.el('p', label, card, {class: 'hint'});
+      if (row.cloud && !row.unavailable && (row.keyword_parent_unavailable || row.keyword_has_zotero_tags ||
+          ['needs_text_recognition', 'extraction_failed', 'tagged_manually'].includes(keywordCheck?.status))) {
+        this.button('Recheck keywords', card, () => this.action('recheck_keyword_warnings', {cloud: row.cloud}), false, 'refresh-cw');
+      }
     }
     const edit = this.el('details', '', card); this.el('summary', 'Rename or move', edit);
     const key = JSON.stringify([this.filingConnection(), row.cloud]), draft = this.linkDrafts.get(key) || {};

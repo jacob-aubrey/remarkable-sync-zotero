@@ -138,6 +138,27 @@ class LinkRepairTests(unittest.TestCase):
         self.assertEqual(file_sha(self.original), self.link['baseline'])
         self.assertFalse((self.worker.state.directory / 'originals').exists())
 
+    def test_verified_repair_retires_only_its_merge_warning(self):
+        original = {'cloud': self.cloud_id, 'merge': True, 'reason': 'Review the native merge.'}
+        independent = {'cloud': self.cloud_id, 'reason': 'An independent sync warning.'}
+        other_link = {'cloud': 'other-document', 'merge': True, 'reason': 'Check an unrelated merge.'}
+        self.worker.last = {'state': 'needs_review', 'message': 'Sync finished — some links need attention',
+                            'result': {'review': [original, independent, other_link]}}
+        self.assertEqual(self.worker.status()['status']['result']['review'], [original, independent, other_link])
+        status = self.worker.repair_link(self.cloud_id, self.preview()['token'])['status']
+        self.assertEqual(status['result']['review'], [independent, other_link])
+
+    def test_verified_repair_refreshes_keyword_tags_against_the_surviving_parent(self):
+        check = {'status': 'needs_text_recognition', 'title': 'Old parent', 'keywords': []}
+        self.worker.state.write('documents', {self.cloud_id: {**self.link, 'keyword_check': check,
+            'keyword_parent_unavailable': True, 'keyword_has_zotero_tags': True}})
+        status = self.worker.repair_link(self.cloud_id, self.preview()['token'])
+        self.assertEqual(status['status']['result']['review'][0]['title'], self.parent['title'])
+        repaired = self.worker.state.read('documents')[self.cloud_id]
+        self.assertNotIn('keyword_parent_unavailable', repaired)
+        self.assertNotIn('keyword_has_zotero_tags', repaired)
+        self.assertEqual(repaired['keyword_check'], {**check, 'title': self.parent['title']})
+
     def test_desktop_and_legacy_origins_reuse_their_existing_baseline_store(self):
         desktop = self.worker.state.directory / 'originals' / self.original.name
         desktop.parent.mkdir()

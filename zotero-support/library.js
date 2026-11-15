@@ -318,6 +318,11 @@ async function notableNavigateReview(data) {
   if (target !== 'references' && keys.length !== 1) {
     throw notableNavigationError('Choose one Zotero target for this action.', 400);
   }
+  const expectedParent = data.expected_parent;
+  if (expectedParent !== undefined && (!['attachment', 'pdf'].includes(target)
+      || typeof expectedParent !== 'string' || !/^[23456789ABCDEFGHIJKLMNPQRSTUVWXYZ]{8}$/.test(expectedParent))) {
+    throw notableNavigationError('The review has an invalid Zotero attachment parent. Recheck it before navigating.', 400);
+  }
   const libraryID = Zotero.Libraries.userLibraryID;
   const items = [], replacements = [];
   let collection;
@@ -338,6 +343,9 @@ async function notableNavigateReview(data) {
   if (items.some(item => item.libraryID !== libraryID || notableReviewItemInTrash(item)
       || !notableReviewTargetType(item, target))) {
     throw notableNavigationError('A Zotero review item changed while navigation was being checked. Recheck the review before retrying.');
+  }
+  if (expectedParent && items[0].parentKey !== expectedParent) {
+    throw notableNavigationError('This attachment moved to another reference. Recheck the review before opening it.');
   }
   if (!win || !pane || typeof win.focus !== 'function') {
     throw notableNavigationError('Open the Zotero library window, then retry this navigation.');

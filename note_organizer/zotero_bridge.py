@@ -268,6 +268,10 @@ class Bridge:
             for row in self.review_policy.rows():
                 if row['kind'] == 'conflict':
                     (applying_conflicts if row['status'] == 'applying' else pending_conflicts).add(row['identity'])
+            if apply:
+                for issue in blocked['issues']:
+                    if {issue['zotero_state'], issue['tablet_state']} & {'trash', 'outside'}:
+                        self.review_policy.retire_conflict(issue['zotero'])
         folder_conflicts = set()
 
         def scan_folder_conflicts():
@@ -291,10 +295,11 @@ class Bridge:
                     folder_conflicts.add(key)
                     if apply and self.review_policy and key not in applying_conflicts:
                         conflict = {'type': 'folder', 'zotero': key, 'cloud': item.id, 'desktop': desktop, 'tablet': tablet,
+                                    'destinations': {folder: maps[folder]['cloud'] for folder in (desktop[1], tablet[1])},
                                     'cloud_hash': item.hash, 'version': row.get('version', 0), 'routine': False}
                         self.review_policy.offer('conflict', key, fingerprint(conflict), conflict)
                     if not (apply and self.review_policy):
-                        reviews.append({'collection': key, 'title': row['name'],
+                        reviews.append({'kind': 'conflict', 'collection': key, 'title': row['name'],
                                         'reason': 'This folder changed on both devices. Open Sync Conflicts to review it.'})
 
         def hold_conflicted_folders():
@@ -527,12 +532,19 @@ class Bridge:
                     zname, cname = desktop[0] != old_desktop[0], remote[0] != old_remote[0]
                     zhome, chome = desktop[1] != old_desktop[1], remote[1] != old_remote[1]
                     if ((zname and cname and desktop[0] != remote[0]) or (zhome and chome and desktop[1] != remote[1])):
-                        conflict = {"type": "paper", "cloud": identity, "zotero": parent["key"], "desktop": desktop, "tablet": remote,
-                                    "cloud_hash": item.hash, "version": parent.get("version", 0), "file_md5": hashlib.md5(path.read_bytes()).hexdigest()}
                         if apply and self.review_policy:
+                            plan = self.desktop_document_plan(row, desktop[0], home, expected_parent=parent)
+                            files = [{field: entry[field] for field in ('key', 'before_filename', 'md5')}
+                                     for entry in plan['files']]
+                            conflict = {'type': 'paper', 'cloud': identity, 'zotero': parent['key'],
+                                        'desktop': desktop, 'tablet': remote, 'cloud_hash': item.hash,
+                                        'destinations': {folder: maps[folder]['cloud'] for folder in (home, remote[1])},
+                                        'version': parent.get('version', 0), 'file_key': key, 'files': files,
+                                        'file_md5': next(entry['md5'] for entry in files if entry['key'] == key)}
                             self.review_policy.offer('conflict', identity, fingerprint(conflict), conflict)
                         suspended.add(identity)
-                        reviews.append({"cloud": identity, "reason": "This paper was renamed or moved on both devices. Choose a version in review."})
+                        reviews.append({"kind": "conflict", "cloud": identity,
+                                        "reason": "This paper was renamed or moved on both devices. Choose a version in review."})
                         continue
                     if (zname or cname or zhome or chome) and apply:
                         chosen_home = home if zhome else remote[1]
@@ -822,9 +834,11 @@ class Bridge:
                 from .zotero_tagging import backfill_keywords, keyword_warning
                 original = self.sources.path.parent / 'remarkable' / 'baselines' / (baseline + '.pdf')
                 backfill_keywords(self.zot, row['parent'], original, row, save)
-                if warning := keyword_warning(ck, row):
-                    reviews.append(warning)
-                self._tags(row['parent'], bundle, ck, row, save)
+                try:
+                    self._tags(row['parent'], bundle, ck, row, save)
+                finally:
+                    if warning := keyword_warning(ck, row):
+                        reviews.append(warning)
                 self.progress(f'Received tablet PDF {number} of {len(cloud_pdfs)}…')
         return {"mode": "apply" if apply else "plan", "actions": reports, "review": reviews,
                 "folder_issues": blocked['issues'], "folders": len({**saved_maps, **maps}), "documents": len(documents)}

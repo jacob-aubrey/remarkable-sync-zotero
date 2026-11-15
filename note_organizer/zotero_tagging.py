@@ -241,7 +241,11 @@ def linked_keyword_report(client, record, original, link, previous=None):
             return None
         seen.add(digest)
         result = keyword_report(path, vocabulary)
-        if _pdf_digest(path) != digest:
+        try:
+            unchanged = _pdf_digest(path) == digest
+        except OSError:
+            unchanged = False
+        if not unchanged:
             raise ValueError('The PDF changed while checking keywords. Try again after it finishes saving.')
         return result
 
@@ -261,7 +265,8 @@ def linked_keyword_report(client, record, original, link, previous=None):
     if report['status'] != 'found':
         for key in dict.fromkeys(filter(None, (link.get('source_key'), link.get('view_key')))):
             item = client.get('item', key)
-            if (not item or item.get('deleted') or item.get('parentItem') != record['key']
+            if (not item or item.get('key') != key or item.get('deleted') or item.get('itemType') != 'attachment'
+                    or item.get('parentItem') != record['key']
                     or item.get('contentType') != 'application/pdf'):
                 continue
             try:
@@ -274,6 +279,18 @@ def linked_keyword_report(client, record, original, link, previous=None):
             if candidate and (candidate['status'] == 'found'
                     or candidate['status'] == 'no_stated_keywords' and report['status'] != 'no_stated_keywords'
                     or candidate['status'] == 'needs_text_recognition' and report['status'] == 'extraction_failed'):
+                current = client.get('item', key)
+                if (not current or current.get('deleted') or current.get('key') != key or current.get('itemType') != 'attachment'
+                        or current.get('parentItem') != record['key'] or current.get('contentType') != 'application/pdf'):
+                    raise ValueError('The Zotero attachment changed while checking keywords. See its current reference and recheck.')
+                try:
+                    same_path = client.file_path(key) == path
+                except (AuthorizationRequired, TransportInterrupted):
+                    raise
+                except (OSError, PilotError):
+                    same_path = False
+                if not same_path:
+                    raise ValueError('The Zotero attachment file changed while checking keywords. Recheck after it is available.')
                 report, attachment = candidate, key
                 if report['status'] == 'found':
                     break
@@ -289,46 +306,67 @@ KEYWORD_WARNING_REASONS = {
 def keyword_needs_recheck(link):
     check = link.get('keyword_review', link.get('keyword_check', {}))
     status = check.get('status')
-    return not link.get('unavailable') and (status in KEYWORD_WARNING_REASONS or status == 'tagged_manually')
+    return bool(link.get('parent')) and not link.get('unavailable') and (status in KEYWORD_WARNING_REASONS or status == 'tagged_manually')
 
 
 def keyword_warning(cloud, link):
     check = link.get('keyword_review', link.get('keyword_check', {}))
     reason = KEYWORD_WARNING_REASONS.get(check.get('status'))
-    if reason and not link.get('unavailable') and not link.get('keyword_has_zotero_tags'):
+    if reason and link.get('parent') and not any(link.get(field) for field in (
+            'unavailable', 'keyword_has_zotero_tags', 'keyword_parent_unavailable')):
         return {'kind': 'keywords', 'cloud': cloud, 'parent': link.get('parent'), 'title': check.get('title', ''),
                 'reason': reason}
     return None
 
 
+def update_keyword_tag_coverage(link, paper_tags):
+    """Record whether current paper-level tags cover the extraction warning."""
+    check = link.get('keyword_review', link.get('keyword_check', {}))
+    covered = bool(paper_tags) and check.get('status') in KEYWORD_WARNING_REASONS
+    if covered == bool(link.get('keyword_has_zotero_tags')):
+        return False
+    if covered:
+        link['keyword_has_zotero_tags'] = True
+    else:
+        link.pop('keyword_has_zotero_tags', None)
+    return True
+
+
 def backfill_keywords(client, parent, path, row, save):
     """Check the linked PDFs and preserve manual removals of automatic keywords."""
+    def reference():
+        record = client.get('item', parent)
+        if (not record or record.get('key') != parent or record.get('deleted')
+                or record.get('itemType') in {'attachment', 'note', 'annotation'}):
+            raise ValueError('The paper is unavailable for its keyword check.')
+        return record
+
     previous = row.get('keyword_check', {})
-    record = client.get('item', parent)
-    if not record or record.get('deleted'):
-        raise ValueError('The paper is unavailable for its keyword check.')
+    record = reference()
     report = linked_keyword_report(client, record, path, row, previous)
     existing = record.get('tags', [])
+    previous_keywords = {normal(value['tag']) for value in previous.get('keywords', [])}
+    reported = {normal(value['tag']): value['tag'] for value in report['keywords']}
+    if reported.keys() - previous_keywords - {normal(value['tag']) for value in existing}:
+        # Read the current Zotero tags just before adding keywords: parsing a PDF can
+        # take long enough for a separate native edit to change the reference.
+        record = reference()
+        existing = record.get('tags', [])
     current = {normal(value['tag']) for value in existing}
-    removed = {normal(value['tag']) for value in previous.get('keywords', [])} - current
-    keywords = [value['tag'] for value in report['keywords'] if normal(value['tag']) not in removed]
+    removed = previous_keywords - current
+    keywords = [value for key, value in reported.items() if key not in removed]
     tags = append_tags(existing, keywords)
     if tags != existing:
         record['tags'] = tags
         client.authorize()
         client.update(record)
-    reliable = {normal(value['tag']) for value in report['keywords']}
-    cleanup = [value for key, value in cleanup_candidates(previous).items() if key not in reliable and key in current]
-    updated = {**report, 'cleanup': cleanup}
-    covered = bool(tags) and updated['status'] in KEYWORD_WARNING_REASONS
-    if (updated != previous or 'keyword_review' in row
-            or bool(row.get('keyword_has_zotero_tags')) != covered):
-        row['keyword_check'] = updated
-        if covered:
-            row['keyword_has_zotero_tags'] = True
-        else:
-            row.pop('keyword_has_zotero_tags', None)
-        row.pop('keyword_review', None)
+    cleanup = [value for key, value in cleanup_candidates(previous).items() if key not in reported and key in current]
+    updated = {**report, 'title': record.get('title', ''), 'cleanup': cleanup}
+    review = row.pop('keyword_review', None)
+    unavailable = row.pop('keyword_parent_unavailable', None)
+    row['keyword_check'] = updated
+    coverage_changed = update_keyword_tag_coverage(row, tags)
+    if updated != previous or review is not None or unavailable or coverage_changed:
         save()
     return row['keyword_check']
 

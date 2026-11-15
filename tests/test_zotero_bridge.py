@@ -293,6 +293,28 @@ class BridgeTests(unittest.TestCase):
         self.engine.run(apply=True)
         self.assertEqual(self.zot.items[parent]["tags"], [{"tag": "My own label"}])
 
+    def test_keyword_warning_uses_paper_tags_after_tablet_reconciliation(self):
+        item, bundle = self.tablet()
+        with pymupdf.open() as scan:
+            scan.new_page()
+            bundle[item.id + '.pdf'] = scan.tobytes()
+        content = json.loads(bundle[item.id + '.content'])
+        content['tags'] = [{'name': 'Tablet paper tag'}]
+        bundle[item.id + '.content'] = json.dumps(content).encode()
+
+        result = self.engine.run(apply=True)
+        link = self.state.read('documents')[item.id]
+        self.assertEqual(link['keyword_check']['status'], 'needs_text_recognition')
+        self.assertTrue(link['keyword_has_zotero_tags'])
+        self.assertFalse(any(issue.get('kind') == 'keywords' for issue in result['review']))
+
+        current = self.cloud.records[item.id]
+        self.cloud.update_item(item.id, expected_hash=current.hash, scope_id=self.cloud.root.id, tags=[])
+        result = self.engine.run(apply=True)
+        self.assertNotIn('keyword_has_zotero_tags', self.state.read('documents')[item.id])
+        warning, = [issue for issue in result['review'] if issue.get('kind') == 'keywords']
+        self.assertEqual(warning['cloud'], item.id)
+
     def test_inserted_page_preserves_tag_identity_and_moves_search_page_mapping(self):
         item, bundle = self.tablet()
         content = json.loads(bundle[item.id + '.content'])

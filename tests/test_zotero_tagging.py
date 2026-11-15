@@ -8,7 +8,7 @@ import pymupdf
 
 from note_organizer.zotero_tagging import (
     METADATA, PRINTED, analyse, append_tags, backfill_keywords, cleanup_candidates, document_keywords,
-    keyword_candidates, stated_keywords,
+    keyword_candidates, keyword_report, linked_keyword_report, stated_keywords,
 )
 from note_organizer.zotero_pilot import PilotError
 from tests import test_zotero_worker as fixtures
@@ -163,8 +163,80 @@ class TagWorkflowTests(unittest.TestCase):
         self.assertEqual(links['tablet']['keyword_check']['status'], 'needs_text_recognition')
         self.assertEqual(self.worker.status()['status'].get('result', {}).get('review', []), [])
         parent['tags'].clear()
-        result = self.worker.recheck_keyword_warnings(parent='PARENT23')
+        result = self.worker.recheck_keyword_warnings()
+        self.assertEqual(result['keyword_recheck']['checked'], 2)
         self.assertEqual(len(result['status']['result']['review']), 2)
+
+    def test_recheck_retires_a_trashed_reference_warning_and_recovers_when_restored(self):
+        self.keyword_warning_link()
+        parent = self.zot.items['PARENT23']
+        parent['deleted'] = True
+        result = self.worker.recheck_keyword_warnings(cloud='tablet')
+        self.assertEqual(result['keyword_recheck'], {'checked': 1, 'resolved': 1, 'unavailable': 0})
+        self.assertEqual([row['cloud'] for row in result['status']['result']['review']], ['another-tablet'])
+        self.assertTrue(self.worker.state.read('documents')['tablet']['keyword_parent_unavailable'])
+
+        parent.pop('deleted')
+        result = self.worker.recheck_keyword_warnings()
+        self.assertEqual({row['cloud'] for row in result['status']['result']['review']}, {'tablet', 'another-tablet'})
+        self.assertNotIn('keyword_parent_unavailable', self.worker.state.read('documents')['tablet'])
+
+    def test_recheck_keeps_warning_if_attachment_is_reparented_during_extraction(self):
+        path, _ = self.keyword_warning_link()
+        path.unlink()
+        make_pdf(path)
+
+        def reparent(document, vocabulary):
+            report = keyword_report(document, vocabulary)
+            if document == path:
+                self.zot.items['SOURCE23']['parentItem'] = 'OTHERREF'
+            return report
+
+        with patch('note_organizer.zotero_tagging.keyword_report', side_effect=reparent):
+            result = self.worker.recheck_keyword_warnings(cloud='tablet')
+        self.assertEqual(result['keyword_recheck'], {'checked': 0, 'resolved': 0, 'unavailable': 1})
+        self.assertEqual(len(result['status']['result']['review']), 2)
+
+    def test_recheck_uses_reference_tags_added_while_reading(self):
+        self.keyword_warning_link()
+
+        def tag_during_check(client, record, original, link):
+            report = linked_keyword_report(client, record, original, link)
+            self.zot.items['PARENT23']['tags'] = [{'tag': 'Added while checking', 'type': 0}]
+            return report
+
+        with patch('note_organizer.zotero_tagging.linked_keyword_report', side_effect=tag_during_check):
+            result = self.worker.recheck_keyword_warnings(cloud='tablet')
+        self.assertEqual(result['keyword_recheck']['resolved'], 1)
+        self.assertEqual([row['cloud'] for row in result['status']['result']['review']], ['another-tablet'])
+
+    def test_recheck_does_not_overwrite_a_concurrent_relink(self):
+        path, _ = self.keyword_warning_link()
+        path.unlink()
+        make_pdf(path)
+
+        def relink(client, record, original, link):
+            report = linked_keyword_report(client, record, original, link)
+            saved = self.worker.state.read('documents')
+            saved['tablet']['parent'] = 'NEWREF23'
+            saved['another-tablet']['name'] = 'Changed outside recheck'
+            self.worker.state.write('documents', saved)
+            return report
+
+        with patch('note_organizer.zotero_tagging.linked_keyword_report', side_effect=relink):
+            result = self.worker.recheck_keyword_warnings(cloud='tablet')
+        self.assertEqual(result['keyword_recheck'], {'checked': 0, 'resolved': 0, 'unavailable': 1})
+        saved = self.worker.state.read('documents')
+        self.assertEqual(saved['tablet']['parent'], 'NEWREF23')
+        self.assertEqual(saved['another-tablet']['name'], 'Changed outside recheck')
+        self.assertNotIn('keyword_review', saved['tablet'])
+
+    def test_recheck_waits_for_bridge_ledger_writer(self):
+        self.keyword_warning_link()
+        with self.worker.state.lock(), patch.object(self.worker, 'zotero') as client:
+            with self.assertRaisesRegex(PilotError, 'already in use'):
+                self.worker.recheck_keyword_warnings()
+        client.assert_not_called()
 
     def test_legacy_cleanup_previews_evidence_and_removes_only_selected_automatic_tags(self):
         self.add_pdf()
@@ -207,6 +279,23 @@ class TagWorkflowTests(unittest.TestCase):
         report = backfill_keywords(self.zot, 'PARENT23', path, row, lambda: None)
         self.assertEqual([entry['tag'] for entry in report['cleanup']], ['Models and'])
         self.assertEqual([tag['tag'] for tag in self.zot.items['PARENT23']['tags']], ['Models and', 'nanoparticles'])
+
+    def test_backfill_preserves_reference_edits_made_while_reading(self):
+        path = self.add_pdf()
+        path.unlink()
+        make_pdf(path)
+
+        def edit_reference(client, record, original, link, previous):
+            report = linked_keyword_report(client, record, original, link, previous)
+            self.zot.items['PARENT23'].update(title='Native title edit', tags=[{'tag': 'Native tag edit', 'type': 0}])
+            return report
+
+        with patch('note_organizer.zotero_tagging.linked_keyword_report', side_effect=edit_reference):
+            checked = backfill_keywords(self.zot, 'PARENT23', path, {}, lambda: None)
+        item = self.zot.items['PARENT23']
+        self.assertEqual(item['title'], checked['title'])
+        self.assertEqual(checked['title'], 'Native title edit')
+        self.assertEqual([tag['tag'] for tag in item['tags']], ['Native tag edit', 'Spectral CT', 'nanoparticles'])
 
     def test_automatic_suggestions_reuse_current_analysis_and_do_not_write_tags(self):
         path = self.add_pdf()

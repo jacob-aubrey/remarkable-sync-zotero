@@ -54,6 +54,8 @@ def packed(values):
 
 
 def reconcile(bridge, parent_key, item, bundle, row, save):
+    from .zotero_tagging import update_keyword_tag_coverage
+
     content = json.loads(bundle[item.id + ".content"])
     remote_paper, remote_pages = tablet_tags(content)
     parent = bridge.zot.get("item", parent_key)
@@ -84,6 +86,8 @@ def reconcile(bridge, parent_key, item, bundle, row, save):
         base = flatten(baseline['paper'], baseline['pages']) if baseline else None
         desired = set(merge(base, local, remote))
         if baseline and local == remote == base:
+            if update_keyword_tag_coverage(row, local_paper):
+                save()
             return
     target = packed(desired)
     paper, pages = target['paper'], target['pages']
@@ -99,6 +103,7 @@ def reconcile(bridge, parent_key, item, bundle, row, save):
         parent["tags"] = [existing.get(tag, {"tag": tag}) for tag in paper]
         bridge.zot.authorize()
         bridge.zot.update(parent)
+    update_keyword_tag_coverage(row, paper)
     row['page_tags'] = pages
     row['tag_pending']['desktop_done'] = True
     save()

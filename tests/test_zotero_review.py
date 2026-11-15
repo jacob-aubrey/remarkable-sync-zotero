@@ -156,6 +156,31 @@ class ReviewDecisionTests(unittest.TestCase):
         self.assertEqual(self.store.local_deletions(), [])
         self.assertNotIn(self.paper.id, self.store.suspended_documents())
 
+    def test_observed_zotero_undo_gives_a_repeated_trash_a_new_decision(self):
+        item = {'key': 'VIEW2345', 'deleted': True, 'parentItem': 'PARENT23', 'version': 12}
+        self.store.confirm_zotero_deleted(self.paper, self.link, item)
+        first = self.store.local_deletions()[0]['id']
+        self.store.observe_zotero_live(self.paper.id, {**item, 'deleted': False})
+        self.assertEqual(self.store.local_deletions(), [])
+        for _ in range(2):
+            self.store.confirm_zotero_deleted(self.paper, self.link, item)
+        repeated, = self.store.local_deletions()
+        self.assertNotEqual(repeated['id'], first)
+        with self.assertRaisesRegex(PilotError, 'no longer pending'):
+            self.store.resolve_local_deletion(first, 'trash_tablet', cloud=self.cloud, zotero=self.zot, scope=self.root.id)
+
+    def test_observed_tablet_restore_renews_a_repeated_trash_with_the_same_hash(self):
+        first, removed = self.deleted()
+        self.store.observe_live(self.paper)
+        self.assertEqual(self.store.deletions(), [])
+        kwargs = {'attachment': 'VIEW2345', 'parent': 'PARENT23', 'inventory': []}
+        repeated = self.store.confirm_deleted(removed, self.link, **kwargs)
+        self.assertNotEqual(repeated, first)
+        self.assertEqual(self.store.confirm_deleted(removed, self.link, **kwargs), repeated)
+        self.assertEqual([row['id'] for row in self.store.deletions()], [repeated])
+        with self.assertRaisesRegex(PilotError, 'already has a different recorded decision'):
+            self.store.resolve_deletion(first, 'pdf_only', cloud=self.cloud, zotero=self.zot, scope=self.root.id)
+
     def test_missing_restore_destination_does_not_commit_unrecoverable_action(self):
         self.link['tablet_parent'] = 'missing-folder'
         key, _ = self.deleted()

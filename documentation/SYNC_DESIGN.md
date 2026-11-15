@@ -1,5 +1,17 @@
 # Working while sync runs
 
+## Sync Conflicts and Sync Warnings audit for 0.19.23
+
+| Workflow | Evidence, presentation, and recovery |
+| --- | --- |
+| Paper and folder name or location conflicts | The bridge compares each device with its saved name and location. Independent edits can combine. Competing edits create a review for the affected item. The worker revalidates the selected destination and live evidence before acting, then saves an intent for recovery if the response is interrupted. A newer attachment rename can invalidate the choice even when its PDF bytes have the same digest. |
+| Trash and restore | An explicit Trash record creates a decision for the linked item and revision. An unavailable copy calls for inspection. Confirmed choices wait in the profile queue, and destructive Zotero choices revalidate the selected scope and the reviewed inventory in the native transaction. After an observed restore, trashing the same item again creates a new decision even when the file evidence repeats. |
+| Native Zotero merges and moved attachments | Repair uses native replacement relations and checks the attachment, original digest, and tablet document. A committed repair clears that link’s stale merge notice. PDF navigation checks the current Zotero parent before opening an attachment named by a warning. |
+| Keyword extraction and tags | The worker retains the extraction outcome and checks current tags on the affected reference. A tagged scan can still have no embedded text. A bulk recheck reevaluates earlier tag coverage, including when the last tag has been removed, and updates only the keyword fields for still-matching links. |
+| Warning visibility and queued rechecks | Review rows suppress only the matching notices. Independent warnings remain visible for the same paper. The workspace accepts a keyword recheck during a transfer and runs it once the worker is available, including after a failed or paused transfer. |
+
+Regression fixtures cover changed names and attachment ownership, warning identity, tag removal, merge repair, repeat Trash events, and interrupted work. If an interrupted decision encounters a newer independent edit, the affected link stays paused. The workspace has no separate action for abandoning or rebasing that partial decision. The packaged smoke tests use disposable Zotero profiles and simulated cloud operations. Physical-device interruption and cross-computer reconciliation are outside that verification.
+
 ## Sync audit for 0.19.18
 
 Sync services track stable item IDs and revisions, then reconcile changes against a known state. OneDrive uses push notifications in its Windows client and exposes a paged delta feed with deletion records and a full rescan when a checkpoint expires. Google Drive provides a paged change log, notification hints, and binary file revisions. Zotero uses version-conditional writes and compares current edits against the previous synced copy so it can merge independent fields. Its desktop app syncs library data separately from attachment files. [OneDrive sync](https://learn.microsoft.com/en-us/sharepoint/sync-process) · [Graph delta](https://learn.microsoft.com/en-us/graph/api/driveitem-delta?view=graph-rest-1.0) · [Google Drive changes](https://developers.google.com/workspace/drive/api/guides/manage-changes) · [Google Drive revisions](https://developers.google.com/workspace/drive/api/guides/change-overview) · [Zotero API syncing](https://www.zotero.org/support/dev/web_api/v3/syncing) · [Zotero desktop syncing](https://www.zotero.org/support/sync)

@@ -124,17 +124,30 @@ class ReviewStore(Ledger):
             rows = db.execute("SELECT * FROM intake_cleanup WHERE status='pending'").fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
+    @staticmethod
+    def _trash_decision_id(rows, evidence, restored_actions):
+        """Keep retries of one Trash event distinct from a later observed event."""
+        key = fingerprint(evidence)[:24]
+        for row in rows:
+            if row['id'] == key and row['status'] == 'resolved' and row['action'] in restored_actions:
+                key = fingerprint([*evidence, key])[:24]
+        return key
+
     def confirm_zotero_deleted(self, item, link, record):
         if not item or item.deleted or not record:
             return
         if not record.get('deleted'):
             self.observe_zotero_live(item.id, record)
             return
-        key = fingerprint(["zotero-trash", item.id, item.hash, record["key"]])[:24]
         payload = {"cloud": item.id, "cloud_hash": item.hash, "title": link["name"], "key": record["key"]}
         with self.connect() as db:
-            for old in db.execute("SELECT id,payload FROM local_deletions WHERE status!='resolved' AND id!=?", (key,)).fetchall():
-                if json.loads(old["payload"])["cloud"] == item.id:
+            db.execute('BEGIN IMMEDIATE')
+            rows = db.execute("SELECT id,status,action FROM local_deletions WHERE json_extract(payload,'$.cloud')=? ORDER BY rowid",
+                              (item.id,)).fetchall()
+            key = self._trash_decision_id(rows, ['zotero-trash', item.id, item.hash, record['key']],
+                                          {'restore_zotero', 'restored_in_zotero'})
+            for old in rows:
+                if old['id'] != key and old['status'] != 'resolved':
                     db.execute("UPDATE local_deletions SET status='resolved',action='superseded' WHERE id=?", (old["id"],))
             db.execute("INSERT OR IGNORE INTO local_deletions VALUES(?,?,'pending','')", (key, json.dumps(payload)))
 
@@ -374,14 +387,17 @@ class ReviewStore(Ledger):
     def confirm_deleted(self, cloud_item, link, *, attachment, parent, inventory):
         if not cloud_item or not (cloud_item.deleted or cloud_item.parent == "trash"):
             return None  # Missing IDs and unreachable cloud are not deletion proof.
-        key = fingerprint(["tablet-trash", cloud_item.id, cloud_item.hash])[:24]
         payload = {"cloud": cloud_item.id, "cloud_hash": cloud_item.hash, "title": link["name"],
                    "restore_parent": link.get("tablet_parent"), "attachment": attachment,
                    "source_attachment": link.get("source_key", "") if link.get("source_key") != attachment else "", "parent": parent,
                    "inventory": inventory}
         with self.connect() as db:
-            for old in db.execute("SELECT id,payload FROM deletion_decisions WHERE status!='resolved' AND id!=?", (key,)).fetchall():
-                if json.loads(old["payload"])["cloud"] == cloud_item.id:
+            db.execute('BEGIN IMMEDIATE')
+            rows = db.execute("SELECT id,status,action FROM deletion_decisions WHERE json_extract(payload,'$.cloud')=? ORDER BY rowid",
+                              (cloud_item.id,)).fetchall()
+            key = self._trash_decision_id(rows, ['tablet-trash', cloud_item.id, cloud_item.hash], {'restore'})
+            for old in rows:
+                if old['id'] != key and old['status'] != 'resolved':
                     db.execute("UPDATE deletion_decisions SET status='resolved',action='superseded',result=? WHERE id=?", (json.dumps({"reason": "Newer tablet trash revision"}), old["id"]))
             db.execute("INSERT OR IGNORE INTO deletion_decisions VALUES(?,?,'pending','','{}')", (key, json.dumps(payload)))
             db.execute("UPDATE deletion_decisions SET payload=? WHERE id=? AND status='pending'", (json.dumps(payload), key))

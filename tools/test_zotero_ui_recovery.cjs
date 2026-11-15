@@ -222,6 +222,67 @@ async function main() {
       ['recheck_keyword_warnings', {parent: 'PARENT23'}, true]]);
   }
   {
+    const {ui} = fixture();
+    const keyword = {kind: 'keywords', cloud: 'paper', parent: 'PARENT23', reason: 'Unreadable PDF'};
+    const duplicate = {attachment: 'ATTACH23', cloud: 'paper', parent: 'PARENT24', reason: 'Exact PDF already linked'};
+    const paperConflict = {kind: 'conflict', cloud: 'paper', reason: 'Both names changed'};
+    const folderConflict = {kind: 'conflict', collection: 'FOLDER23', reason: 'Both folder names changed'};
+    const filing = {cloud: 'pending', reason: 'Review this new tablet document before importing it.'};
+    const unrepresented = {cloud: 'missing', reason: filing.reason};
+    ui.latest.reviews = [
+      {kind: 'conflict', identity: 'paper', payload: {type: 'paper', cloud: 'paper'}},
+      {kind: 'conflict', identity: 'FOLDER23', payload: {type: 'folder', zotero: 'FOLDER23'}},
+      {kind: 'zotero', identity: 'ATTACH23', payload: {}},
+      {kind: 'cloud', identity: 'pending', payload: {}}];
+    ui.latest.status.result = {review: [keyword, duplicate, paperConflict, {...keyword}, folderConflict, filing, unrepresented]};
+    assert.deepEqual(Array.from(ui.syncWarnings()), [keyword, duplicate, unrepresented],
+      'One decision on a link cannot hide unrelated warnings; only represented or repeated notices collapse');
+  }
+  {
+    const {ui, context, buttons, node} = viewFixture();
+    const calls = [];
+    ui.latest.links = [{cloud: 'paper', view_key: 'ATTACH23', parent: 'PARENT23'},
+      {cloud: 'unrelated', source_key: 'ATTACH24', parent: 'PARENT24'}];
+    ui.latest.status.result = {review: [
+      {kind: 'keywords', cloud: 'paper', parent: 'PARENT23', reason: 'Unreadable PDF'},
+      {kind: 'keywords', attachment: 'ATTACH24', reason: 'Missing paper evidence'},
+      {kind: 'keywords', cloud: 'stale', attachment: 'ATTACH24', parent: 'PARENT23', reason: 'Stale link'},
+      {cloud: 'paper', reason: 'Tablet PDF changed'},
+      {cloud: 'paper', attachment: 'ATTACH25', parent: 'PARENT25', reason: 'Exact PDF already linked'}]};
+    context.notableNavigateReview = async (...args) => { calls.push(...args); return {}; };
+    ui.renderReview(node(), 'sync-review');
+    assert.equal(buttons.get('Open PDF in Zotero').length, 1);
+    assert.equal(buttons.get('Recheck keywords').length, 2, 'An unscoped row cannot start a bulk keyword recheck');
+    assert.equal(buttons.get('Open linked reference in Zotero').length, 1);
+    assert.equal(buttons.get('Open reference already linked to reMarkable').length, 1);
+    await buttons.get('Open PDF in Zotero')[0].click();
+    await buttons.get('Show affected attachment in Zotero').at(-1).click();
+    assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+      {target: 'pdf', keys: ['ATTACH23'], expected_parent: 'PARENT23'},
+      {target: 'attachment', keys: ['ATTACH25'], expected_parent: 'PARENT25'}]);
+  }
+  for (const [evidence, label, canCheck] of [
+    [{keyword_review: {status: 'found'}}, 'Stated keywords found in the linked PDFs.', false],
+    [{keyword_has_zotero_tags: true}, 'This paper already has Zotero tags.', true],
+    [{keyword_review: {status: 'tagged_manually'}}, 'This paper already has Zotero tags.', true],
+    [{keyword_parent_unavailable: true}, 'The Zotero reference is unavailable for keyword checking.', true],
+    [{}, 'Keywords need text recognition or manual checking.', true],
+    [{unavailable: true}, 'Keywords need text recognition or manual checking.', false]
+  ]) {
+    const {ui, buttons, node} = viewFixture();
+    const root = node();
+    ui.renderLinkedPaper(root, {cloud: 'paper', parent: 'PARENT23', name: 'Paper',
+      keyword_check: {status: 'needs_text_recognition'}, ...evidence});
+    assert.ok(root.children[0].children.some(child => child.textContent === label));
+    assert.equal(buttons.has('Recheck keywords'), canCheck);
+    if (canCheck) {
+      const calls = [];
+      ui.action = async (...args) => calls.push(args);
+      await buttons.get('Recheck keywords')[0].click();
+      assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['recheck_keyword_warnings', {cloud: 'paper'}]]);
+    }
+  }
+  {
     const {ui, fields, buttons, node} = viewFixture();
     ui.latest.mappings = {Z: {cloud: 'T', root: true}};
     ui.latest.deletions = [{id: 'deletion', payload: {title: 'Paper', inventory: [], restore_parent: 'removed-folder'}}];
@@ -359,6 +420,33 @@ async function main() {
     failSync(Error('worker stopped'));
     await Promise.all([sync, pending, keywordRecheck]);
     assert.deepEqual(calls, ['sync', 'recheck_keyword_warnings']);
+    assert.equal(ui.afterSync.length, 0);
+  }
+  {
+    const {ui} = fixture();
+    let finishSync, finishPause;
+    const calls = [];
+    ui.rpc = method => {
+      calls.push(method);
+      if (method === 'sync') return new Promise(resolve => { finishSync = resolve; });
+      if (method === 'pause_sync') return new Promise(resolve => { finishPause = resolve; });
+      assert.equal(method, 'recheck_keyword_warnings');
+      return {...ui.latest, keyword_recheck: {checked: 1, resolved: 1, unavailable: 0}};
+    };
+    const sync = ui.action('sync');
+    const recheck = ui.action('recheck_keyword_warnings');
+    const result = recheck.catch(error => error);
+    const pending = assert.rejects(ui.action('dismiss_review', {identity: 'ref'}), /Sync was paused/);
+    const pause = ui.pauseSync();
+    while (!finishPause) await tick();
+    finishSync(ui.latest);
+    await sync;
+    assert.deepEqual(calls, ['sync', 'pause_sync'], 'The recheck waits for the pause to finish');
+    finishPause(ui.latest);
+    await Promise.all([pause, pending]);
+    assert.equal((await result).keyword_recheck?.resolved, 1, 'Pausing transfers retains a requested local recheck');
+    assert.deepEqual(calls, ['sync', 'pause_sync', 'recheck_keyword_warnings']);
+    assert.equal(ui.latest.config.sync_paused, true);
     assert.equal(ui.afterSync.length, 0);
   }
   {

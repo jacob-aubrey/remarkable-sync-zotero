@@ -62,6 +62,19 @@ async function main() {
     assert.equal(result.status, 200); assert.deepEqual(result.value.keys, [key]);
     assert.deepEqual(f.calls, expected);
   }
+  for (const target of ['pdf', 'attachment']) {
+    const f = fixture();
+    const attachment = f.items.get('ATTACH23');
+    attachment.parentKey = 'PARENT23';
+    const request = {target, key: attachment.key, expected_parent: 'PARENT23'};
+    assert.equal((await f.request(request)).status, 200);
+    f.calls.length = 0;
+    attachment.parentKey = 'PARENT24';
+    const stale = await f.request(request);
+    assert.equal(stale.status, 409);
+    assert.match(stale.value.error, /attachment.*another reference/i);
+    assert.deepEqual(f.calls, [], 'A moved attachment cannot open from a stale warning');
+  }
   for (const [data, expectedStatus] of [
     [{target: 'references', keys: ['PARENT23', 'MISSING2']}, 409],
     [{target: 'references', keys: ['PARENT23', 'ATTACH23']}, 409],
@@ -74,6 +87,8 @@ async function main() {
     [{target: 'attachment', key: 'PARENT23'}, 409],
     [{target: 'pdf', key: 'FILE2345'}, 409],
     [{target: 'pdf', key: 'PARENT23'}, 409],
+    [{target: 'pdf', key: 'ATTACH23', expected_parent: 'invalid'}, 400],
+    [{target: 'references', key: 'PARENT23', expected_parent: 'PARENT24'}, 400],
     [{target: 'collection', key: 'MISSING2'}, 409],
     [{target: 'collection', keys: ['CLLECT23', 'CLLECT24']}, 400],
     [{target: 'merge', keys: ['PARENT23', 'PARENT24']}, 400]

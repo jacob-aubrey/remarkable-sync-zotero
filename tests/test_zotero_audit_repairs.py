@@ -85,7 +85,15 @@ class ConflictRecoveryTests(unittest.TestCase):
         self.assertEqual(len(self.cloud.puts), puts)
         self.assertEqual(next(item.hash for item in self.cloud.library() if item.id == child.id), changed.hash)
 
-    def test_partial_paper_rename_resumes_only_the_remaining_attachment(self):
+    def test_confirmed_folder_trash_supersedes_its_pending_name_conflict(self):
+        child, row = self.conflict()
+        item = next(item for item in self.cloud.library() if item.id == child.id)
+        self.cloud.update_item(child.id, expected_hash=item.hash, parent='trash', scope_id=self.croot.id)
+        status = self.worker.sync()
+        self.assertEqual(status['folder_issues'][0]['tablet_state'], 'trash')
+        self.assertEqual(self.worker.review.row(row['id'])['status'], 'superseded')
+
+    def paper_conflict(self):
         source = self.add_pdf()
         self.zot.items['VIEWKEY2'] = {**self.zot.items['SOURCE23'], 'key': 'VIEWKEY2'}
         self.zot.file_path('VIEWKEY2').write_bytes(source.read_bytes())
@@ -97,6 +105,48 @@ class ConflictRecoveryTests(unittest.TestCase):
         payload = {'type': 'paper', 'zotero': 'PARENT23', 'cloud': item.id,
                    'desktop': ['VIEWKEY2', 'ROOT2345'], 'tablet': ['Tablet choice', 'ROOT2345'],
                    'cloud_hash': item.hash, 'version': 0, 'file_md5': hashlib.md5(source.read_bytes()).hexdigest()}
+        return item, payload
+
+    def test_later_desktop_filename_blocks_both_choices_even_with_the_same_pdf_bytes(self):
+        item, payload = self.paper_conflict()
+        identity = self.worker.review.offer('conflict', item.id, fingerprint(payload), payload)
+        file_path = self.zot.file_path
+        renamed = file_path('VIEWKEY2').rename(file_path('VIEWKEY2').with_stem('Later filename'))
+        self.zot.items['VIEWKEY2']['filename'] = renamed.name
+        puts, writes = len(self.cloud.puts), self.zot.writes
+        with patch.object(self.zot, 'file_path', side_effect=lambda key: renamed if key == 'VIEWKEY2' else file_path(key)):
+            for side in ('desktop', 'tablet'):
+                with self.assertRaisesRegex(PilotError, 'changed since review'):
+                    self.worker.resolve_conflict(identity, fingerprint(payload), side)
+        self.assertEqual((len(self.cloud.puts), self.zot.writes), (puts, writes))
+        self.assertEqual(self.worker.review.row(identity)['status'], 'pending')
+        self.assertEqual(hashlib.md5(renamed.read_bytes()).hexdigest(), payload['file_md5'])
+
+    def test_later_secondary_attachment_rename_blocks_an_old_conflict_choice(self):
+        item, payload = self.paper_conflict()
+        payload.update(file_key='VIEWKEY2', files=[{'key': key, 'before_filename': self.zot.file_path(key).name,
+                                                   'md5': payload['file_md5']} for key in ('SOURCE23', 'VIEWKEY2')])
+        identity = self.worker.review.offer('conflict', item.id, fingerprint(payload), payload)
+        self.zot.items['SOURCE23']['filename'] = 'Later source filename.pdf'
+        with self.assertRaisesRegex(PilotError, 'desktop PDF changed since review'):
+            self.worker.resolve_conflict(identity, fingerprint(payload), 'tablet')
+        self.assertEqual(self.zot.items['SOURCE23']['filename'], 'Later source filename.pdf')
+        self.assertEqual(self.worker.review.row(identity)['status'], 'pending')
+
+    def test_successful_conflict_choice_retires_only_its_warning(self):
+        item, payload = self.paper_conflict()
+        digest = fingerprint(payload)
+        identity = self.worker.review.offer('conflict', item.id, digest, payload)
+        matched = {'kind': 'conflict', 'cloud': item.id, 'reason': 'Choose a version in review.'}
+        retained = [{'cloud': item.id, 'reason': 'Independent PDF warning'},
+                    {'kind': 'conflict', 'cloud': 'other-paper', 'reason': 'Other paper conflict'}]
+        for _attempt in range(2):
+            self.worker.last = {'result': {'review': [matched, *retained]}}
+            status = self.worker.resolve_conflict(identity, digest, 'tablet')
+            self.assertEqual(status['status']['result']['review'], retained)
+
+    def test_partial_paper_rename_resumes_only_the_remaining_attachment(self):
+        item, payload = self.paper_conflict()
         identity = self.worker.review.offer('conflict', item.id, fingerprint(payload), payload)
         rename = self.zot.review_action
         renamed = []

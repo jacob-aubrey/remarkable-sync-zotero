@@ -375,9 +375,10 @@ class Worker:
         if warnings or any(issue.get('kind') == 'keywords' for issue in last_issues):
             issues = [issue for issue in last_issues if issue.get('kind') != 'keywords'] + warnings
             status = {**status, 'result': {**last_result, 'review': issues}}
-            if not issues and status.get('message') == 'Sync finished — some links need attention':
-                status.update(message='Sync finished', state='needs_review' if pending_reviews or self.review.deletions()
-                              or self.review.local_deletions() else 'ready')
+        if (not status.get('result', {}).get('review')
+                and status.get('message') == 'Sync finished — some links need attention'):
+            status = {**status, 'message': 'Sync finished', 'state': 'needs_review'
+                      if pending_reviews or self.review.deletions() or self.review.local_deletions() else 'ready'}
         available = {key: row for key, row in documents.items() if not row.get('unavailable')}
         linked_sources = {row.get('source_key') for row in documents.values()}
         waiting = {row['approval'].get('source') or row['kind'] + ':' + row['identity']
@@ -543,37 +544,76 @@ class Worker:
 
         if not isinstance(cloud, str) or not isinstance(parent, str) or (cloud and parent):
             raise PilotError('Choose a linked paper or recheck all keyword warnings.')
-        links = self.state.read('documents', {})
         checked = resolved = 0
-        candidates = [(key, row) for key, row in links.items() if keyword_needs_recheck(row)
-                      and (not cloud or key == cloud) and (not parent or row.get('parent') == parent)
-                      and (cloud or parent or keyword_warning(key, row))]
-        if candidates:
-            client = self.zotero()
-            try:
-                for key, row in candidates:
-                    had_warning = bool(keyword_warning(key, row))
-                    record = client.get('item', row['parent'])
-                    if not record or record.get('deleted') or record.get('itemType') in {'attachment', 'note', 'annotation'}:
-                        continue
-                    has_tags = bool(record.get('tags'))
-                    if has_tags:
-                        row['keyword_has_zotero_tags'] = True
-                    else:
-                        baseline = row.get('baseline', '')
-                        original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
+        keyword_fields = ('keyword_review', 'keyword_has_zotero_tags', 'keyword_parent_unavailable')
+        evidence_fields = ('parent', 'source_key', 'view_key', 'baseline', 'revision', 'unavailable', 'keyword_check', *keyword_fields)
+        with self.state.lock():
+            links = self.state.read('documents', {})
+            candidates = [(key, row) for key, row in links.items() if keyword_needs_recheck(row)
+                          and (not cloud or key == cloud) and (not parent or row['parent'] == parent)]
+            if candidates:
+                client = self.zotero()
+                outcomes = []
+
+                def current_reference(key):
+                    record = client.get('item', key)
+                    if record and (record.get('key') != key or record.get('itemType') in {'attachment', 'note', 'annotation'}):
+                        raise ValueError('The Zotero reference no longer matches the keyword check.')
+                    return record
+
+                try:
+                    for key, row in candidates:
+                        if self.stop.is_set():
+                            raise InterruptedError('Keyword recheck stopped')
+                        reference = row['parent']
                         try:
-                            report = linked_keyword_report(client, record, original, row)
+                            record = current_reference(reference)
+                            if record and not record.get('deleted') and not record.get('tags'):
+                                baseline = row.get('baseline', '')
+                                original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
+                                report = linked_keyword_report(client, record, original, row)
+                                # An edit, deletion, or merge in Zotero can occur during extraction.
+                                record = current_reference(reference)
                         except ValueError:
-                            continue  # The file changed mid-read. Keep the previous check for a retry.
-                        row['keyword_review'] = {'status': report['status'], 'title': record.get('title', '')}
-                        row.pop('keyword_has_zotero_tags', None)
-                    checked += 1
-                    resolved += int(had_warning and not keyword_warning(key, row))
-                if checked:
-                    self.state.write('documents', links)
-            finally:
-                client.close()
+                            continue  # Keep the previous check for a retry if Zotero evidence changed.
+                        updated = row.copy()
+                        if not record or record.get('deleted'):
+                            updated['keyword_parent_unavailable'] = True
+                        else:
+                            updated.pop('keyword_parent_unavailable', None)
+                            if record.get('tags'):
+                                updated['keyword_has_zotero_tags'] = True
+                            else:
+                                updated.pop('keyword_has_zotero_tags', None)
+                                updated['keyword_review'] = {'status': report['status'], 'title': record.get('title', '')}
+                        outcomes.append((key, row, updated))
+                finally:
+                    client.close()
+                if self.stop.is_set():
+                    raise InterruptedError('Keyword recheck stopped')
+                if outcomes:
+                    # Sync holds the bridge lock, and native merge repair can commit across a
+                    # local recheck. Apply only the keyword fields to the still-matching link.
+                    with self.state.connect() as db:
+                        db.execute('BEGIN IMMEDIATE')
+                        saved = db.execute("SELECT value FROM bridge_values WHERE key='documents'").fetchone()
+                        latest = json.loads(saved[0]) if saved else {}
+                        changed = False
+                        for key, before, updated in outcomes:
+                            current = latest.get(key)
+                            if current is None or any(current.get(field) != before.get(field) for field in evidence_fields):
+                                continue
+                            if updated != before:
+                                for field in keyword_fields:
+                                    if field in updated:
+                                        current[field] = updated[field]
+                                    else:
+                                        current.pop(field, None)
+                                changed = True
+                            checked += 1
+                            resolved += int(bool(keyword_warning(key, before)) and not keyword_warning(key, current))
+                        if changed:
+                            db.execute("UPDATE bridge_values SET value=? WHERE key='documents'", (json.dumps(latest),))
         return {**self.status(), 'keyword_recheck': {'checked': checked, 'resolved': resolved,
                                                      'unavailable': len(candidates) - checked}}
 
@@ -1407,6 +1447,8 @@ class Worker:
                     self.review.observe_zotero_live(identity, record)
                 deleted = next((record for record in [parent, *files.values()] if record and record.get('deleted')), None)
                 self.review.confirm_zotero_deleted(item, link, deleted)
+                if deleted:
+                    self.review.retire_conflict(identity)
             if item and (item.deleted or item.parent == "trash") and link.get("parent"):
                 published = self.state.directory / "publisher"
                 from .zotero_pilot import Ledger
@@ -1414,6 +1456,7 @@ class Worker:
                 key = link.get("view_key") or stable_key(namespace, "attachment", identity)
                 inventory = client.review_action("inventory", {"parent": link["parent"]})["inventory"]
                 self.review.confirm_deleted(item, link, attachment=key, parent=link["parent"], inventory=inventory)
+                self.review.retire_conflict(identity)
         return native
 
     def refresh_review_policy(self, client, catalog=None, *, rows=None, cancelled=None):
@@ -1853,6 +1896,7 @@ class Worker:
                         raise PilotError('The matching folder cannot be moved to Trash from this review.')
                 if choice != 'restore':
                     confirmed = {**confirmed, issue['zotero']: issue['tablet']}
+                    self.review.retire_conflict(issue['zotero'])
                 _, _, current = sync_folder_scope(*scope_args, confirmed)
                 self.state.write('folder_blocks', current)
         finally:
@@ -2585,6 +2629,8 @@ class Worker:
                 'paused': self.review.link_control(identity)['paused']}
 
     def _commit_link_repair(self, snapshot, action):
+        from .zotero_tagging import KEYWORD_WARNING_REASONS
+
         identity, old, pdfs = snapshot['identity'], snapshot['link'], snapshot['pdfs']
         with self.state.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -2602,6 +2648,15 @@ class Worker:
                 # Zotero chose an existing attachment and filename. This does
                 # not represent a user request to rename the tablet document.
                 link['desktop_name'] = next(file['filename'] for file in snapshot['files'] if file['key'] == current_view)
+            link.pop('keyword_parent_unavailable', None)
+            for field in ('keyword_check', 'keyword_review'):
+                if field in link:
+                    link[field] = {**link[field], 'title': snapshot['parent'].get('title', '')}
+            check = link.get('keyword_review', link.get('keyword_check', {}))
+            if check.get('status') in KEYWORD_WARNING_REASONS and snapshot['parent'].get('tags'):
+                link['keyword_has_zotero_tags'] = True
+            else:
+                link.pop('keyword_has_zotero_tags', None)
             link['repair_history'] = [*old.get('repair_history', []), {
                 'time': time.time(), 'action': action, 'from': old['parent'], 'to': link['parent'],
                 'previous_pdfs': {new: key for key, new in pdfs.items() if new != key},
@@ -2609,6 +2664,15 @@ class Worker:
             links[identity] = link
             db.execute("UPDATE bridge_values SET value=? WHERE key='documents'", (json.dumps(links),))
         self.review.retire_merge_deletions(identity, {old['parent'], *pdfs})
+        self.review.retire_conflict(identity)
+        self._clear_sync_warnings(lambda issue: issue.get('cloud') == identity and
+                                  (issue.get('merge') or issue.get('kind') == 'conflict'))
+
+    def _clear_sync_warnings(self, matches):
+        result = self.last.get('result', {})
+        if result.get('review'):
+            self.last = {**self.last, 'result': {**result, 'review': [issue for issue in result['review']
+                                if not matches(issue)]}}
 
     def _reconcile_merged_parent(self, identity, client, *, evidence=None, strict=False):
         """Follow native merge or Undo evidence when the owned PDFs are verified."""
@@ -3118,48 +3182,87 @@ class Worker:
             client.close()
 
     def resolve_conflict(self, identity, digest, side):
+        with self.state.lock():
+            return self._resolve_conflict(identity, digest, side)
+
+    def _resolve_conflict(self, identity, digest, side):
         row = self.review.row(identity)
         if not row or row["kind"] != "conflict" or row["digest"] != digest or side not in {"desktop", "tablet"}:
             raise PilotError("This mapping review changed. Refresh before deciding.")
+        payload = row['payload']
+        paper = payload['type'] == 'paper'
+        field, target_key = ('cloud', payload['cloud']) if paper else ('collection', payload['zotero'])
+
+        def matches_warning(issue):
+            return issue.get('kind') == 'conflict' and issue.get(field) == target_key
+
         if row['status'] == 'approved' and row['approval'].get('side') == side:
+            self._clear_sync_warnings(matches_warning)
             return self.status()
         if row['status'] == 'applying' and row['approval'].get('side') != side:
             raise PilotError('Finish recovering the saved conflict choice before choosing another version.')
         client = self.zotero()
         try:
-            payload = row["payload"]
-            paper = payload["type"] == "paper"
             record = client.get("item" if paper else "collection", payload["zotero"])
             cloud = self.cloud()
-            item = next((r for r in cloud.library() if r.id == payload['cloud']), None)
-            if not record or record.get('deleted') or not item or item.deleted:
+            catalog = cloud.library()
+            item = next((r for r in catalog if r.id == payload['cloud']), None)
+            if (not record or record.get('deleted') or not item or item.deleted or item.parent == 'trash'
+                    or item.kind != ('DocumentType' if paper else 'CollectionType')):
                 raise PilotError('The selected item is unavailable. Its saved conflict choice was retained.')
             links = self.state.read("documents", {})
             link = links.get(payload["cloud"]) if paper else None
             mappings = self.state.read('folders', {})
             chosen = payload[side]
-            if chosen[1] not in mappings:
+            if chosen[1] not in mappings or any(mappings.get(key, {}).get('cloud') != tablet_id
+                                               for key, tablet_id in payload.get('destinations', {}).items()):
                 raise PilotError('The chosen destination is no longer connected. Sync before resolving this conflict.')
+            confirmed = self.state.read('folder_blocks', {}).get('confirmed', {})
+            zscope, cscope, _ = sync_folder_scope(sync_collections(client, mappings), catalog,
+                self.config['zotero_root'], self.config['tablet_root'], mappings,
+                connections.exclusions(self.directory, self.config), confirmed)
+            if (chosen[1] not in zscope or mappings[chosen[1]]['cloud'] not in cscope or item.parent not in cscope
+                    or (not paper and (payload['zotero'] not in zscope or item.id not in cscope))):
+                raise PilotError('This item or its destination is outside the connected folders. Sync before resolving this conflict.')
             if paper:
-                if not link:
+                if not link or link.get('parent') != payload['zotero'] or link.get('unavailable'):
                     raise PilotError('The paper connection changed. Sync before resolving its conflict.')
-                path = client.file_path(link.get("view_key") or link.get("source_key"))
+                key = link.get('view_key') or link.get('source_key')
+                if not key or payload.get('file_key', key) != key:
+                    raise PilotError('The connected attachment changed. Sync before resolving its conflict.')
+                path = client.file_path(key)
                 if hashlib.md5(path.read_bytes()).hexdigest() != payload["file_md5"]:
                     raise PilotError("The PDF changed during review. Sync before choosing.")
+            elif mappings.get(payload['zotero'], {}).get('cloud') != payload['cloud']:
+                raise PilotError('The folder connection changed. Sync before resolving its conflict.')
             intent = row['approval'].get('conflict_change') if row['status'] == 'applying' else None
             bridge = Bridge(client, cloud, self.state, self.config['zotero_root'], self.config['tablet_root'])
             if intent is None:
                 # Legacy applying reviews can close an already-achieved choice
                 # without replaying a mutation onto a newer revision.
-                position = ([path.stem, chosen[1]] if paper and chosen[1] in record.get('collections', [])
-                            else [record.get('name'), record.get('parentCollection')])
-                legacy_done = (row['status'] == 'applying' and position == chosen
+                if paper:
+                    homes = [key for key in record.get('collections', []) if key in mappings and key in zscope
+                             and mappings[key]['cloud'] in cscope]
+                    home = link['collection'] if link['collection'] in homes else homes[0] if len(homes) == 1 else None
+                    position = [path.stem, home]
+                    already_chosen = path.stem == chosen[0] and chosen[1] in homes
+                else:
+                    position = [record.get('name'), record.get('parentCollection')]
+                    already_chosen = position == chosen
+                legacy_done = (row['status'] == 'applying' and already_chosen
                                and item.name == chosen[0] and item.parent == mappings[chosen[1]]['cloud'])
                 if not legacy_done and (item.hash != payload['cloud_hash'] or record.get('version', 0) != payload['version']
-                                        or not paper and position != payload['desktop']):
-                    raise PilotError('The folder changed since review. Sync again before choosing.')
-                native = bridge.desktop_document_plan(link, chosen[0], chosen[1]) if paper else {
-                    'parent': {**record, 'name': chosen[0], 'parentCollection': chosen[1]}, 'files': []}
+                                        or position != payload['desktop']):
+                    raise PilotError('The paper or folder changed since review. Sync again before choosing.')
+                if paper:
+                    native = bridge.desktop_document_plan(link, chosen[0], chosen[1], expected_parent=record)
+                    reviewed_files = payload.get('files')
+                    current_files = [{field: entry[field] for field in ('key', 'before_filename', 'md5')}
+                                     for entry in native['files']]
+                    if not legacy_done and reviewed_files is not None and current_files != reviewed_files:
+                        raise PilotError('A desktop PDF changed since review. Sync again before choosing.')
+                else:
+                    native = {'parent': {**record, 'name': chosen[0], 'parentCollection': chosen[1]}, 'files': []}
                 if side == 'desktop':
                     native['parent'] = record
                     for entry in native['files']:
@@ -3175,6 +3278,9 @@ class Worker:
                 return fingerprint({key: item for key, item in value.items() if key != 'version'})
 
             before, target = intent['record_before'], intent['native']['parent']
+            if mappings[chosen[1]]['cloud'] != intent['cloud']['parent'] or (paper and
+                    self._link_pdf_keys(link) != {entry['key'] for entry in intent['native']['files']}):
+                raise PilotError('The destination or attachment connection changed during recovery.')
             if side == 'desktop':
                 if record != before:
                     raise PilotError('The desktop changed while resolving this conflict. Its newer changes were retained.')
@@ -3214,6 +3320,7 @@ class Worker:
                 mappings[payload['zotero']].update(name=chosen[0], desktop_name=chosen[0], tablet_name=chosen[0], zparent=chosen[1], cparent=mappings[chosen[1]]['cloud'])
                 self.state.write('folders', mappings)
             self.review.finish(identity)
+            self._clear_sync_warnings(matches_warning)
             return self.status()
         finally:
             client.close()
