@@ -146,17 +146,23 @@ class TagWorkflowTests(unittest.TestCase):
         self.assertEqual([tag['tag'] for tag in self.zot.items['PARENT23']['tags']], ['Spectral CT', 'nanoparticles'])
         self.assertEqual(links['tablet']['keyword_check']['attachment'], 'SOURCE23')
 
-    def test_manual_tags_clear_unreadable_warnings_only_after_the_tags_exist(self):
-        self.keyword_warning_link()
+    def test_existing_zotero_tags_clear_unreadable_warnings_without_rewriting_tags(self):
+        path, original = self.keyword_warning_link()
         parent = self.zot.items['PARENT23']
-        parent['tags'] = [{'tag': 'Read'}]
-        result = self.worker.recheck_keyword_warnings(parent='PARENT23', confirmed_tags=['Iodine'])
-        self.assertEqual(result['keyword_recheck']['resolved'], 0)
-        parent['tags'].append({'tag': 'Iodine'})
-        result = self.worker.recheck_keyword_warnings(parent='PARENT23', confirmed_tags=['Iodine'])
+        parent['tags'] = [{'tag': 'Iodine', 'type': 1}, {'tag': 'Materials', 'type': 0}]
+        writes = self.zot.writes
+        with patch('note_organizer.zotero_tagging.linked_keyword_report', side_effect=AssertionError('Tags already cover this warning')):
+            result = self.worker.recheck_keyword_warnings()
         self.assertEqual(result['keyword_recheck']['resolved'], 2)
         self.assertEqual(result['status'].get('result', {}).get('review', []), [])
-        parent['tags'].pop()
+        self.assertEqual(self.zot.writes, writes)
+        self.assertEqual([tag['tag'] for tag in parent['tags']], ['Iodine', 'Materials'])
+        links = self.worker.state.read('documents', {})
+        backfill_keywords(self.zot, 'PARENT23', original, links['tablet'],
+                          lambda: self.worker.state.write('documents', links))
+        self.assertEqual(links['tablet']['keyword_check']['status'], 'needs_text_recognition')
+        self.assertEqual(self.worker.status()['status'].get('result', {}).get('review', []), [])
+        parent['tags'].clear()
         result = self.worker.recheck_keyword_warnings(parent='PARENT23')
         self.assertEqual(len(result['status']['result']['review']), 2)
 

@@ -948,7 +948,7 @@ var NotableUI = {
       if (syncing) {
         this.failures = (this.failures || 0) + 1;
         this.syncFailure = error.message;
-        this.cancelAfterSync('Sync stopped before the current state could be checked. Review the item and choose the action again.');
+        this.cancelAfterSync('Sync stopped before the current state could be checked. Review the item and choose the action again.', true);
       }
       if (this.latest) this.latest.status = {...this.latest.status, state: 'needs_attention', message: error.message};
       this.badge(); this.message(error.message, true); throw error;
@@ -1042,9 +1042,12 @@ var NotableUI = {
       }
     } finally { this.drainingAfterSync = false; this.schedule(); }
   },
-  cancelAfterSync(message) {
-    for (const job of this.afterSync) if (job !== this.activeAfterSync) job.reject(Error(message));
-    this.afterSync = this.afterSync.filter(job => job === this.activeAfterSync);
+  cancelAfterSync(message, keepKeywordRechecks = false) {
+    this.afterSync = this.afterSync.filter(job => {
+      if (job === this.activeAfterSync || (keepKeywordRechecks && job.method === 'recheck_keyword_warnings')) return true;
+      job.reject(Error(message));
+      return false;
+    });
     this.refreshAfterSync();
   },
   refreshAfterSync() {
@@ -1162,9 +1165,8 @@ var NotableUI = {
             this.confirmTagSave(context, 'Tags saved. They will reach reMarkable on the next sync.');
           }
         }
-        const added = job.paper.after.filter(tag => !job.paper.before.includes(tag));
         const parent = this.latest.links?.find(row => row.cloud === job.cloud)?.parent || job.parent_key;
-        await this.recheckKeywordsAfterSave(parent, added);
+        await this.recheckKeywordsAfterSave(parent);
       }
     } catch (error) { this.tagEditError = error.message; }
     finally {
@@ -1369,12 +1371,13 @@ var NotableUI = {
     if (status) status.textContent = value;
     if (this.tagEditor === context && value) this.confirmSave(value);
   },
-  async recheckKeywordsAfterSave(parent, added = []) {
+  async recheckKeywordsAfterSave(parent) {
     const warnings = this.latest?.status?.result?.review || [];
     if (!parent || !(this.latest?.links || []).some(link => link.parent === parent &&
-      (link.keyword_manual_tags?.length || warnings.some(issue => issue.kind === 'keywords' && issue.cloud === link.cloud)))) return;
+      (link.keyword_has_zotero_tags || link.keyword_manual_tags?.length ||
+        warnings.some(issue => issue.kind === 'keywords' && issue.cloud === link.cloud)))) return;
     try {
-      await this.action('recheck_keyword_warnings', {parent, confirmed_tags: added}, this.tab === 'sync-review');
+      await this.action('recheck_keyword_warnings', {parent}, this.tab === 'sync-review');
     } catch (_) { /* The action reports the recheck error separately from the confirmed save. */ }
   },
   message(value, error = false, success = false) {
@@ -1552,8 +1555,8 @@ var NotableUI = {
       'Pair reMarkable': 'Save the supplied pairing code’s account connection for this plugin.',
       'Connect Zotero': 'Authorize the existing local Zotero API connection for this plugin.',
       'Save tags': 'Apply the displayed paper and page tags to the selected items.',
-      'Recheck keywords': 'Check this paper’s linked PDFs and current Zotero tags for this warning.',
-      'Recheck keyword warnings': 'Check the papers with keyword warnings using their local PDFs and Zotero tags.',
+      'Recheck keywords': 'Check this paper’s Zotero tags and linked PDFs. During sync, this check queues until sync finishes.',
+      'Recheck keyword warnings': 'Check Zotero tags and local PDFs for these warnings. During sync, this check queues until sync finishes.',
       'Add tag': 'Add the typed tag to this draft. Save or file the paper to apply it.',
       'Add to filing queue': 'Save this paper’s current choices for filing after the active operation finishes.',
       'Resume link': 'Resume this existing connection without creating another tablet document.',
@@ -2265,8 +2268,7 @@ var NotableUI = {
         .concat([...page.tags].filter(tag => !context.page_tags.includes(tag))));
       this.tagDrafts.delete(draftKey); this.tagEditor = result; this.render();
       this.confirmTagSave(result, 'Tags saved. They will reach reMarkable on the next sync.');
-      await this.recheckKeywordsAfterSave(result.parent_key || result.reference?.key,
-        [...paper.tags].filter(tag => !context.paper_tags.includes(tag)));
+      await this.recheckKeywordsAfterSave(result.parent_key || result.reference?.key);
     }, true);
     if (context.parent_key && context.pdf_digest) save.dataset.browse = 'true';
     const reference = context.parent_key || context.reference?.key;
@@ -2325,7 +2327,7 @@ var NotableUI = {
         this.rememberRecentTags(added);
         if (this.tagEditor === context && this.tab === 'tags') this.render();
         this.confirmTagSave(context, 'Paper tags saved to this Zotero reference.');
-        await this.recheckKeywordsAfterSave(context.reference.key, added);
+        await this.recheckKeywordsAfterSave(context.reference.key);
       } finally { draft.saving = false; }
     }, true).dataset.browse = 'true';
     this.button('Show Zotero tags', card, () => this.showZoteroTags(context.reference.key), false, 'tag').dataset.browse = 'true';
@@ -3690,13 +3692,15 @@ var NotableUI = {
         this.button('Recheck keyword warnings', group, () => this.action('recheck_keyword_warnings'), false, 'refresh-cw');
       }
       for (const issue of warnings) {
-        const link = (this.latest.links || []).find(row => row.cloud === issue.cloud || row.source_key === issue.attachment || row.view_key === issue.attachment);
+        const links = this.latest.links || [];
+        const cloudLink = issue.cloud && links.find(row => row.cloud === issue.cloud);
+        const link = cloudLink || (issue.attachment && links.find(row => row.source_key === issue.attachment || row.view_key === issue.attachment));
         const card = this.el('section', '', group, {class: 'sync-decision-item'});
         const title = issue.title || link?.name || (issue.attachment ? 'Zotero attachment ' + issue.attachment : 'Sync warning');
         this.el('h3', issue.merge ? 'Zotero merge or attachment change: ' + title : title, card);
         this.el('p', issue.reason, card);
         if (issue.kind === 'keywords') {
-          const pdf = link?.view_key || link?.source_key;
+          const pdf = link?.parent === issue.parent && (link?.view_key || link?.source_key);
           if (pdf) this.reviewNavigationButton('Open PDF in Zotero', card, 'pdf', [pdf]);
           this.button('Recheck keywords', card, () => this.action('recheck_keyword_warnings', {cloud: issue.cloud}), false, 'refresh-cw');
         }
@@ -4381,7 +4385,7 @@ var NotableUI = {
           status.textContent = draft.saveStatus = result.deferred_until_filing
             ? 'Tag choices saved. They will be added when this paper is filed.'
             : 'Paper tags saved to Zotero. Linked copies will receive them on the next sync.';
-          await this.recheckKeywordsAfterSave(result.parent, result.added);
+          await this.recheckKeywordsAfterSave(result.parent);
         } catch (error) {entry.state = 'failed'; entry.error = error.message; draft.saved = false; render();}
       }, true);
       save.disabled = !!draft.saved;

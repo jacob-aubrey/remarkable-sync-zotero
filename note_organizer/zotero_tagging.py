@@ -280,11 +280,22 @@ def linked_keyword_report(client, record, original, link, previous=None):
     return {**report, 'sha256': digest, 'attachment': attachment, 'title': record.get('title', '')}
 
 
+KEYWORD_WARNING_REASONS = {
+    'extraction_failed': 'The linked PDFs could not be read for keywords. Open the PDF in Zotero, then recheck.',
+    'needs_text_recognition': 'No readable text was found in the linked PDFs. Add paper tags or make the PDF searchable, then recheck.',
+}
+
+
+def keyword_needs_recheck(link):
+    check = link.get('keyword_review', link.get('keyword_check', {}))
+    status = check.get('status')
+    return not link.get('unavailable') and (status in KEYWORD_WARNING_REASONS or status == 'tagged_manually')
+
+
 def keyword_warning(cloud, link):
     check = link.get('keyword_review', link.get('keyword_check', {}))
-    reason = {'extraction_failed': 'The linked PDFs could not be read for keywords. Open the PDF in Zotero, then recheck.',
-              'needs_text_recognition': 'No readable text was found in the linked PDFs. Add paper tags or make the PDF searchable, then recheck.'}.get(check.get('status'))
-    if reason and not link.get('unavailable'):
+    reason = KEYWORD_WARNING_REASONS.get(check.get('status'))
+    if reason and not link.get('unavailable') and not link.get('keyword_has_zotero_tags'):
         return {'kind': 'keywords', 'cloud': cloud, 'parent': link.get('parent'), 'title': check.get('title', ''),
                 'reason': reason}
     return None
@@ -299,8 +310,6 @@ def backfill_keywords(client, parent, path, row, save):
     report = linked_keyword_report(client, record, path, row, previous)
     existing = record.get('tags', [])
     current = {normal(value['tag']) for value in existing}
-    if report['status'] in {'extraction_failed', 'needs_text_recognition'} and current.intersection(row.get('keyword_manual_tags', [])):
-        report = {**report, 'status': 'tagged_manually'}
     removed = {normal(value['tag']) for value in previous.get('keywords', [])} - current
     keywords = [value['tag'] for value in report['keywords'] if normal(value['tag']) not in removed]
     tags = append_tags(existing, keywords)
@@ -311,8 +320,14 @@ def backfill_keywords(client, parent, path, row, save):
     reliable = {normal(value['tag']) for value in report['keywords']}
     cleanup = [value for key, value in cleanup_candidates(previous).items() if key not in reliable and key in current]
     updated = {**report, 'cleanup': cleanup}
-    if updated != previous or 'keyword_review' in row:
+    covered = bool(tags) and updated['status'] in KEYWORD_WARNING_REASONS
+    if (updated != previous or 'keyword_review' in row
+            or bool(row.get('keyword_has_zotero_tags')) != covered):
         row['keyword_check'] = updated
+        if covered:
+            row['keyword_has_zotero_tags'] = True
+        else:
+            row.pop('keyword_has_zotero_tags', None)
         row.pop('keyword_review', None)
         save()
     return row['keyword_check']

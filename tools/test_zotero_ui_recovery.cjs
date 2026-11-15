@@ -201,7 +201,9 @@ async function main() {
     const {ui, buttons, node} = viewFixture();
     const calls = [];
     ui.tab = 'sync-review';
-    ui.latest.links = [{cloud: 'first', view_key: 'PDF23456', parent: 'PARENT23'}];
+    ui.latest.links = [
+      {cloud: 'unrelated', view_key: 'OTHERPDF', parent: 'OTHERREF'},
+      {cloud: 'first', view_key: 'PDF23456', parent: 'PARENT23'}];
     ui.latest.status.result = {review: [
       {kind: 'keywords', cloud: 'first', title: 'Actual Zotero title', reason: 'Keyword warning', parent: 'PARENT23'},
       {kind: 'keywords', cloud: 'second', title: 'Second paper', reason: 'Keyword warning'}]};
@@ -209,13 +211,15 @@ async function main() {
     ui.reviewNavigationButton = (label, parent, type, keys) => ui.button(label, parent, () => calls.push([type, keys]));
     const root = node();
     ui.renderReview(root);
+    assert.equal(buttons.get('Open PDF in Zotero').length, 1);
+    assert.equal(buttons.has('Open reference already linked to reMarkable'), false);
     await buttons.get('Open PDF in Zotero')[0].click();
     await buttons.get('Recheck keywords')[0].click();
     await buttons.get('Recheck keyword warnings')[0].click();
-    await ui.recheckKeywordsAfterSave('PARENT23', ['Iodine']);
+    await ui.recheckKeywordsAfterSave('PARENT23');
     assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['pdf', ['PDF23456']],
       ['recheck_keyword_warnings', {cloud: 'first'}], ['recheck_keyword_warnings'],
-      ['recheck_keyword_warnings', {parent: 'PARENT23', confirmed_tags: ['Iodine']}, true]]);
+      ['recheck_keyword_warnings', {parent: 'PARENT23'}, true]]);
   }
   {
     const {ui, fields, buttons, node} = viewFixture();
@@ -341,14 +345,20 @@ async function main() {
   {
     const {ui} = fixture();
     let failSync;
+    const calls = [];
     ui.rpc = method => {
-      assert.equal(method, 'sync', 'No queued writes start after an unverified sync failure');
-      return new Promise((_resolve, reject) => { failSync = reject; });
+      calls.push(method);
+      if (method === 'sync') return new Promise((_resolve, reject) => { failSync = reject; });
+      assert.equal(method, 'recheck_keyword_warnings', 'Only the queued local keyword check survives a sync error');
+      return {reviews: [], keyword_recheck: {checked: 1, resolved: 1, unavailable: 0}};
     };
     const sync = assert.rejects(ui.action('sync'), /worker stopped/);
     const pending = assert.rejects(ui.action('dismiss_review', {identity: 'ref', digest: 'original'}), /could be checked/);
+    const keywordRecheck = ui.action('recheck_keyword_warnings');
+    assert.deepEqual(calls, ['sync'], 'The recheck waits for the sync worker');
     failSync(Error('worker stopped'));
-    await Promise.all([sync, pending]);
+    await Promise.all([sync, pending, keywordRecheck]);
+    assert.deepEqual(calls, ['sync', 'recheck_keyword_warnings']);
     assert.equal(ui.afterSync.length, 0);
   }
   {

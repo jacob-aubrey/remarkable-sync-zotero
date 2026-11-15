@@ -537,19 +537,17 @@ class Worker:
         finally:
             client.close()
 
-    def recheck_keyword_warnings(self, cloud='', parent='', confirmed_tags=None):
+    def recheck_keyword_warnings(self, cloud='', parent=''):
         """Refresh only existing keyword findings using local Zotero and PDF evidence."""
-        from .zotero_tagging import keyword_warning, linked_keyword_report, normal
-        from .zotero_tags import names
+        from .zotero_tagging import keyword_needs_recheck, keyword_warning, linked_keyword_report
 
-        if not isinstance(cloud, str) or not isinstance(parent, str) or (cloud and parent) or (confirmed_tags and not parent):
+        if not isinstance(cloud, str) or not isinstance(parent, str) or (cloud and parent):
             raise PilotError('Choose a linked paper or recheck all keyword warnings.')
-        confirmed = {normal(tag) for tag in names(confirmed_tags or [])}
         links = self.state.read('documents', {})
         checked = resolved = 0
-        candidates = [(key, row) for key, row in links.items() if not row.get('unavailable')
+        candidates = [(key, row) for key, row in links.items() if keyword_needs_recheck(row)
                       and (not cloud or key == cloud) and (not parent or row.get('parent') == parent)
-                      and (keyword_warning(key, row) or (parent and row.get('keyword_manual_tags')))]
+                      and (cloud or parent or keyword_warning(key, row))]
         if candidates:
             client = self.zotero()
             try:
@@ -558,18 +556,18 @@ class Worker:
                     record = client.get('item', row['parent'])
                     if not record or record.get('deleted') or record.get('itemType') in {'attachment', 'note', 'annotation'}:
                         continue
-                    baseline = row.get('baseline', '')
-                    original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
-                    current = {normal(tag['tag']) for tag in record.get('tags', [])}
-                    manual = current.intersection(confirmed | set(row.get('keyword_manual_tags', [])))
-                    try:
-                        report = linked_keyword_report(client, record, original, row)
-                    except ValueError:
-                        continue  # The file changed mid-read. Keep the previous warning for a retry.
-                    if manual and report['status'] in {'needs_text_recognition', 'extraction_failed'}:
-                        report['status'] = 'tagged_manually'
-                    row['keyword_manual_tags'] = sorted(manual)
-                    row['keyword_review'] = {'status': report['status'], 'title': report['title']}
+                    has_tags = bool(record.get('tags'))
+                    if has_tags:
+                        row['keyword_has_zotero_tags'] = True
+                    else:
+                        baseline = row.get('baseline', '')
+                        original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
+                        try:
+                            report = linked_keyword_report(client, record, original, row)
+                        except ValueError:
+                            continue  # The file changed mid-read. Keep the previous check for a retry.
+                        row['keyword_review'] = {'status': report['status'], 'title': record.get('title', '')}
+                        row.pop('keyword_has_zotero_tags', None)
                     checked += 1
                     resolved += int(had_warning and not keyword_warning(key, row))
                 if checked:
