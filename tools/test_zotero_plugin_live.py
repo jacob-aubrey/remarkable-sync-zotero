@@ -259,7 +259,7 @@ async function startup({rootURI}) {
             review.click();
             await waitFor(() => !ui.nameReviewLoading && contains(command.filename), 'Name review did not show the unlinked attachment');
             enter('UnknownJournal');
-            if (!contains('Zotero PDF filename · ' + command.filename)) throw Error('The attachment filename was not labeled');
+            await waitFor(() => contains('Zotero PDF filename · ' + command.filename), 'The attachment filename was not labeled');
             const reviewMode = doc.querySelector('[aria-label="Search fields"]');
             reviewMode.value = 'citation'; reviewMode.dispatchEvent(new ui.view.Event('change'));
           }
