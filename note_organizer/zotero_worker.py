@@ -1405,8 +1405,7 @@ class Worker:
                         self.review.reopen(previous['id'], digest, payload, applying=interrupted_changed)
                     self.review.offer("cloud", item.id, digest, payload)
         for row in self.review.rows():
-            if (row["kind"] in {"zotero", "inbox"} and row['status'] == 'pending'
-                    and row["payload"]["path"].lower().endswith(".pdf")):
+            if row["kind"] in {"zotero", "inbox"} and row["payload"]["path"].lower().endswith(".pdf"):
                 from .zotero_bulk import title_key
                 name = title_key(Path(row["payload"]["path"]).stem)
                 payload = {**row["payload"], "matches": [r for r in candidates if r["digest"] == row["digest"]],
