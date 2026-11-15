@@ -1,4 +1,5 @@
 """Local, evidence-labelled paper keywords and opt-in topic suggestions."""
+import hashlib
 import re
 import unicodedata
 from pathlib import Path
@@ -222,21 +223,84 @@ def keyword_report(path, vocabulary=()):
         return {'keywords': [], 'status': 'extraction_failed', 'detail': str(error)[:240], 'version': VERSION}
 
 
+def _pdf_digest(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def linked_keyword_report(client, record, original, link, previous=None):
+    """Prefer the verified original, then check the PDFs linked under the same Zotero reference."""
+    from .zotero_pilot import AuthorizationRequired, PilotError, TransportInterrupted
+
+    vocabulary = [value['tag'] for value in record.get('tags', [])]
+    report = {'keywords': [], 'status': 'extraction_failed', 'version': VERSION}
+    seen = set()
+
+    def check(path, digest):
+        if digest in seen:
+            return None
+        seen.add(digest)
+        result = keyword_report(path, vocabulary)
+        if _pdf_digest(path) != digest:
+            raise ValueError('The PDF changed while checking keywords. Try again after it finishes saving.')
+        return result
+
+    digest = ''
+    try:
+        digest = _pdf_digest(original)
+        # A successful original check can be reused. Negative checks must also
+        # consider the locally available Zotero PDFs, which may have gained OCR.
+        if digest == (link.get('baseline') or digest):
+            if (previous and previous.get('status') == 'found' and previous.get('version') == VERSION
+                    and previous.get('sha256') == digest and not previous.get('attachment')):
+                return {**previous, 'title': record.get('title', '')}
+            report = check(original, digest)
+    except OSError:
+        pass
+    attachment = ''
+    if report['status'] != 'found':
+        for key in dict.fromkeys(filter(None, (link.get('source_key'), link.get('view_key')))):
+            item = client.get('item', key)
+            if (not item or item.get('deleted') or item.get('parentItem') != record['key']
+                    or item.get('contentType') != 'application/pdf'):
+                continue
+            try:
+                path = client.file_path(key)
+                candidate = check(path, _pdf_digest(path))
+            except (AuthorizationRequired, TransportInterrupted):
+                raise
+            except (OSError, PilotError):
+                continue
+            if candidate and (candidate['status'] == 'found'
+                    or candidate['status'] == 'no_stated_keywords' and report['status'] != 'no_stated_keywords'
+                    or candidate['status'] == 'needs_text_recognition' and report['status'] == 'extraction_failed'):
+                report, attachment = candidate, key
+                if report['status'] == 'found':
+                    break
+    return {**report, 'sha256': digest, 'attachment': attachment, 'title': record.get('title', '')}
+
+
+def keyword_warning(cloud, link):
+    check = link.get('keyword_review', link.get('keyword_check', {}))
+    reason = {'extraction_failed': 'The linked PDFs could not be read for keywords. Open the PDF in Zotero, then recheck.',
+              'needs_text_recognition': 'No readable text was found in the linked PDFs. Add paper tags or make the PDF searchable, then recheck.'}.get(check.get('status'))
+    if reason and not link.get('unavailable'):
+        return {'kind': 'keywords', 'cloud': cloud, 'parent': link.get('parent'), 'title': check.get('title', ''),
+                'reason': reason}
+    return None
+
+
 def backfill_keywords(client, parent, path, row, save):
-    """Check an original once per extractor version; preserve manual removals."""
-    import hashlib
-    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    """Check the linked PDFs and preserve manual removals of automatic keywords."""
     previous = row.get('keyword_check', {})
-    if previous.get('version') == VERSION and previous.get('sha256') == digest and previous.get('status') != 'extraction_failed':
-        return previous
     record = client.get('item', parent)
     if not record or record.get('deleted'):
         raise ValueError('The paper is unavailable for its keyword check.')
-    report = keyword_report(path, [value['tag'] for value in record.get('tags', [])])
-    if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
-        raise ValueError('The original PDF changed while checking keywords.')
+    report = linked_keyword_report(client, record, path, row, previous)
     existing = record.get('tags', [])
     current = {normal(value['tag']) for value in existing}
+    if report['status'] in {'extraction_failed', 'needs_text_recognition'} and current.intersection(row.get('keyword_manual_tags', [])):
+        report = {**report, 'status': 'tagged_manually'}
     removed = {normal(value['tag']) for value in previous.get('keywords', [])} - current
     keywords = [value['tag'] for value in report['keywords'] if normal(value['tag']) not in removed]
     tags = append_tags(existing, keywords)
@@ -246,8 +310,11 @@ def backfill_keywords(client, parent, path, row, save):
         client.update(record)
     reliable = {normal(value['tag']) for value in report['keywords']}
     cleanup = [value for key, value in cleanup_candidates(previous).items() if key not in reliable and key in current]
-    row['keyword_check'] = {**report, 'sha256': digest, 'cleanup': cleanup}
-    save()
+    updated = {**report, 'cleanup': cleanup}
+    if updated != previous or 'keyword_review' in row:
+        row['keyword_check'] = updated
+        row.pop('keyword_review', None)
+        save()
     return row['keyword_check']
 
 

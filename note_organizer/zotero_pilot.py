@@ -421,6 +421,8 @@ class LocalZotero:
     def file_path(self, key):
         response = self.http.get(f"{self.endpoint}/users/0/items/{key}/file/view/url",
                                  headers={"Zotero-Server-ID": self.server_id}, timeout=ZOTERO_REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            raise FileNotFoundError("This Zotero attachment is unavailable on this computer.")
         response.raise_for_status()
         uri = urlsplit(response.text.strip())
         if uri.scheme != "file" or uri.netloc not in {"", "localhost"}:

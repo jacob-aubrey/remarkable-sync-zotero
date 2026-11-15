@@ -542,6 +542,10 @@ var NotableUI = {
   },
   receiveProgress(response) {
     if (response.quiet || this.inboxChecking) return;
+    if (Array.isArray(response.inbox_rows)) {
+      if (this.operation?.method === 'sync') this.receiveInboxProgress(response.inbox_rows);
+      return;
+    }
     if (this.operation?.method === 'check_inbox') {
       this.operation.updated = Date.now();
       return;
@@ -573,6 +577,27 @@ var NotableUI = {
       const focus = this.captureFocus();
       const content = this.view.document.querySelector('main');
       if (content) { content.replaceChildren(); this.renderLinks(content); this.disable(this.busy); this.restoreFocus(focus); }
+    }
+  },
+  receiveInboxProgress(rows) {
+    const current = this.latest?.reviews;
+    if (!current) return;
+    const matches = new Map(rows.filter(row => row.kind === 'reference').map(row => [row.id, row.intake_pdf]));
+    const reviews = current.filter(row => row.kind !== 'inbox').map(row => {
+      if (row.kind !== 'reference') return row;
+      const match = matches.get(row.id);
+      if (match) return {...row, intake_pdf: match};
+      if (!row.intake_pdf) return row;
+      const updated = {...row};
+      delete updated.intake_pdf;
+      return updated;
+    }).concat(rows.filter(row => row.kind === 'inbox'));
+    if (JSON.stringify(current) === JSON.stringify(reviews)) return;
+    this.latest.reviews = reviews;
+    this.badge();
+    if (['review', 'inbox'].includes(this.tab) && this.view && !this.view.closed) {
+      if (this.acquiringPDF || this.view.document.querySelector?.('dialog[open]')) this.inboxRenderPending = true;
+      else this.render();
     }
   },
   isQueueMessage(issue) { return /^Review (the filename|this new tablet document)/.test(issue.reason || ''); },
@@ -838,7 +863,7 @@ var NotableUI = {
     this.busy = true;
     const reviewChangeSerial = this.reviewChangeSerial || 0;
     const checkingInbox = method === 'check_inbox';
-    const localReviewAction = checkingInbox || ['recheck_review', 'attach_intake_pdf', 'confirm_folder_change', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source', 'create_destination', 'preview_keyword_cleanup', 'remove_reviewed_keywords',
+    const localReviewAction = checkingInbox || ['recheck_review', 'recheck_keyword_warnings', 'attach_intake_pdf', 'confirm_folder_change', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source', 'create_destination', 'preview_keyword_cleanup', 'remove_reviewed_keywords',
       'preview_filename_cleanup', 'queue_filename_cleanup', 'cancel_filename_cleanup', 'maintenance'].includes(method);
     const labels = {sync: 'Syncing with reMarkable', scan_library: 'Scanning your Windows library',
       suggest_paper_tags: 'Finding paper keywords and tag suggestions', save_paper_tags: 'Saving your paper-tag choices',
@@ -848,6 +873,7 @@ var NotableUI = {
       approve: 'Filing this paper', attach_intake_pdf: 'Attaching the ToSort PDF',
       confirm_folder_change: 'Checking the changed folder',
       recheck_review: 'Rechecking local Zotero evidence', check_inbox: 'Checking Zotero for new papers…',
+      recheck_keyword_warnings: 'Rechecking keyword warnings in Zotero',
       acknowledge_review_finding: 'Saving this library decision', reindex: 'Rebuilding the search index', folders: 'Loading folders',
       maintenance: 'Running the selected local library action', apply_tag_edit: 'Applying saved tag changes'};
     const detail = checkingInbox ? '' : 'Starting…';
@@ -897,6 +923,13 @@ var NotableUI = {
       else if (checkingInbox && result.inbox_issues?.length) this.message('Couldn’t finish checking Inbox. Try again.', true);
       else if (result.intake_attachment) this.message(result.intake_attachment.source_retained
         ? 'PDF attached in Zotero. The original is still in ToSort.' : 'PDF attached in Zotero.');
+      else if (result.keyword_recheck) {
+        const {checked, resolved, unavailable} = result.keyword_recheck;
+        if (params.parent && this.saveFeedback?.tab === this.tab) this.message(this.saveFeedback.value, false, true);
+        else this.message(checked || unavailable
+          ? `Checked ${checked} keyword ${checked === 1 ? 'warning' : 'warnings'}. ${resolved} cleared${unavailable ? `, ${unavailable} unavailable` : ''}.`
+          : 'There are no keyword warnings left to recheck.');
+      }
       else if (result.folder_change) {
         const messages = {keep: 'Folder pair disconnected.', mirror: 'Matching folder moved to Trash.', restore: 'Original folder restored.'};
         this.message(result.folder_change === 'confirmed' ? messages[result.folder_choice] || messages.keep
@@ -931,9 +964,11 @@ var NotableUI = {
       if (this.reviewUpgradeWaiting && this.view && !this.view.closed) {
         this.reviewUpgradeWaiting = false; this.prepareReviewGuidance();
       } else if (!localReviewAction && this.filingQueue.length && !this.drainingFilings) this.drainFilings().catch(error => this.message(error.message, true));
-      if (!this.drainingSyncDecisions) this.drainSyncDecisions();
-      if (!this.drainingTagEdits) this.drainTagEdits();
-      if (!this.drainingAfterSync) this.drainAfterSync();
+      if (method !== 'recheck_keyword_warnings') {
+        if (!this.drainingSyncDecisions) this.drainSyncDecisions();
+        if (!this.drainingTagEdits) this.drainTagEdits();
+        if (!this.drainingAfterSync) this.drainAfterSync();
+      }
     }
   },
   async refreshInbox() {
@@ -974,7 +1009,7 @@ var NotableUI = {
     if (this.pausing || this.stopped) throw Error('This action could not start while sync is pausing. Try again.');
     const request = JSON.parse(JSON.stringify(params));
     const connection = this.filingConnection(), evidence = this.actionEvidence(method, request);
-    const labels = {check_inbox: 'Check Inbox', recheck_review: 'Recheck Zotero', dismiss_review: 'Dismiss Inbox reference',
+    const labels = {check_inbox: 'Check Inbox', recheck_review: 'Recheck Zotero', recheck_keyword_warnings: 'Recheck keyword warnings', dismiss_review: 'Dismiss Inbox reference',
       attach_intake_pdf: 'Attach PDF from ToSort', confirm_folder_change: 'Apply folder decision',
       delete_decision: 'Apply deletion decision', local_delete_decision: 'Apply deletion decision', resolve_conflict: 'Resolve conflict',
       create_destination: 'Create folder', link: 'Update paper link', move_link: 'Rename or move paper',
@@ -1016,7 +1051,9 @@ var NotableUI = {
     const host = this.view?.document?.getElementById('notable-after-sync');
     if (!host || this.view.closed) return;
     host.hidden = !this.afterSync.length;
-    host.textContent = this.afterSync.length ? 'Waiting for the worker · ' + this.afterSync.map(job => job.label).join(' · ') : '';
+    host.textContent = this.afterSync.map(job => job.method === 'check_inbox' && this.latest?.config?.inbox
+      ? 'ToSort is monitored during sync. The full Inbox check will run when sync finishes.'
+      : `${job.label} will run when sync finishes.`).join(' ');
   },
   changeSyncDecisions(change) {
     this.syncDecisionWrite = (this.syncDecisionWrite || Promise.resolve()).catch(() => {}).then(async () => {
@@ -1122,8 +1159,12 @@ var NotableUI = {
           if (context.cloud === job.cloud && context.page_id === job.page_id && context.pdf_digest === job.pdf_digest) {
             const link = this.latest.links?.find(row => row.cloud === job.cloud);
             context.page_tags = link?.page_tags?.[job.page_id] || [];
+            this.confirmTagSave(context, 'Tags saved. They will reach reMarkable on the next sync.');
           }
         }
+        const added = job.paper.after.filter(tag => !job.paper.before.includes(tag));
+        const parent = this.latest.links?.find(row => row.cloud === job.cloud)?.parent || job.parent_key;
+        await this.recheckKeywordsAfterSave(parent, added);
       }
     } catch (error) { this.tagEditError = error.message; }
     finally {
@@ -1317,7 +1358,26 @@ var NotableUI = {
     }
     this.updateActivity();
   },
-  message(value, error = false) {
+  confirmSave(value) {
+    this.saveFeedback = {tab: this.tab, value};
+    this.message(value, false, true);
+  },
+  confirmTagSave(context, value) {
+    if (!value && this.saveFeedback?.value === context.saveStatus) this.saveFeedback = null;
+    context.saveStatus = value;
+    const status = this.tagEditor === context && this.view?.document?.getElementById('notable-tag-save-status');
+    if (status) status.textContent = value;
+    if (this.tagEditor === context && value) this.confirmSave(value);
+  },
+  async recheckKeywordsAfterSave(parent, added = []) {
+    const warnings = this.latest?.status?.result?.review || [];
+    if (!parent || !(this.latest?.links || []).some(link => link.parent === parent &&
+      (link.keyword_manual_tags?.length || warnings.some(issue => issue.kind === 'keywords' && issue.cloud === link.cloud)))) return;
+    try {
+      await this.action('recheck_keyword_warnings', {parent, confirmed_tags: added}, this.tab === 'sync-review');
+    } catch (_) { /* The action reports the recheck error separately from the confirmed save. */ }
+  },
+  message(value, error = false, success = false) {
     if (error) this.recordTransport('ui_error', {characters: String(value).length, details_in_rpc_error_when_safe: true});
     if (this.operation) { this.operation.detail = value; this.operation.updated = Date.now(); }
     if (!this.view || this.view.closed) return;
@@ -1327,7 +1387,7 @@ var NotableUI = {
       const failed = error || (persistent && (this.syncFailure || this.latest?.status?.state === 'needs_attention'));
       const folderNotice = persistent && this.latest?.folder_issues?.length;
       node.textContent = value; node.setAttribute('role', failed ? 'alert' : 'status');
-      node.className = failed ? 'message error' : folderNotice ? 'message attention' : 'message';
+      node.className = failed ? 'message error' : success ? 'message success' : folderNotice ? 'message attention' : 'message';
     }
     this.updateActivity();
   },
@@ -1492,6 +1552,8 @@ var NotableUI = {
       'Pair reMarkable': 'Save the supplied pairing code’s account connection for this plugin.',
       'Connect Zotero': 'Authorize the existing local Zotero API connection for this plugin.',
       'Save tags': 'Apply the displayed paper and page tags to the selected items.',
+      'Recheck keywords': 'Check this paper’s linked PDFs and current Zotero tags for this warning.',
+      'Recheck keyword warnings': 'Check the papers with keyword warnings using their local PDFs and Zotero tags.',
       'Add tag': 'Add the typed tag to this draft. Save or file the paper to apply it.',
       'Add to filing queue': 'Save this paper’s current choices for filing after the active operation finishes.',
       'Resume link': 'Resume this existing connection without creating another tablet document.',
@@ -1903,6 +1965,7 @@ var NotableUI = {
     return {panel, query, select, load: () => load().catch(error => { if (status.isConnected) status.textContent = error.message; })};
   },
   openTab(tab) {
+    this.saveFeedback = null;
     this.tabNavigationSerial = (this.tabNavigationSerial || 0) + 1;
     this.queueSelections ||= {};
     this.queueSelections[this.tab] = this.selected;
@@ -1944,8 +2007,9 @@ var NotableUI = {
     }
     const status = this.el('div', '', root, {class: 'workspace-status'});
     const failed = this.syncFailure || this.latest.status?.state === 'needs_attention';
-    const messageClass = failed ? 'message error' : this.latest.folder_issues?.length ? 'message attention' : 'message';
-    this.el('div', this.statusMessage(), status, {id: 'message', role: failed ? 'alert' : 'status', class: messageClass, tabindex: '0'});
+    const saved = !failed && this.saveFeedback?.tab === this.tab && this.saveFeedback.value;
+    const messageClass = failed ? 'message error' : saved ? 'message success' : this.latest.folder_issues?.length ? 'message attention' : 'message';
+    this.el('div', saved || this.statusMessage(), status, {id: 'message', role: failed ? 'alert' : 'status', class: messageClass, tabindex: '0'});
     if (this.latest.config.tablet_root) this.el('span', this.syncStatusMessage(), status, {id: 'notable-sync-status', class: 'hint', role: 'status'});
     if (this.latest.config.tablet_root) this.el('span', this.paperStatusMessage(), status, {id: 'notable-paper-status', class: 'hint', role: 'status'});
     const syncDetails = this.el('details', '', status, {id: 'notable-sync-details'});
@@ -2160,7 +2224,10 @@ var NotableUI = {
       this.el('h3', title, section);
       const list = this.tagSuggestions(section, kind, context.vocabulary);
       return this.renderTagEntry(section, {kind, values: draft[kind], inputValue: draft[kind + 'Input'],
-        list, onChange: (tags, text) => { draft[kind] = tags; draft[kind + 'Input'] = text; }});
+        list, onChange: (tags, text) => {
+          draft[kind] = tags; draft[kind + 'Input'] = text;
+          this.confirmTagSave(context, '');
+        }});
     };
     const paper = editor('Paper tags', 'paper'), page = editor('Page tags', 'page');
     this.paperTagPanel(card, {key: context.key});
@@ -2175,7 +2242,11 @@ var NotableUI = {
           page_id: context.page_id, pdf_digest: context.pdf_digest, title: `${context.title} — page ${context.page + 1}`,
           paper: {before: draft.baseline.paper, after: [...paper.tags]}, page: {before: draft.baseline.page, after: [...page.tags]}};
         const differs = ({before, after}) => before.length !== after.length || before.some(tag => !after.includes(tag));
-        if (!differs(job.paper) && !differs(job.page)) return;
+        if (!differs(job.paper) && !differs(job.page)) {
+          this.confirmTagSave(context, 'Tags are up to date.');
+          await this.recheckKeywordsAfterSave(context.parent_key);
+          return;
+        }
         draft.saving = true;
         try { await this.changeTagEdits(jobs => [...jobs, job]); }
         finally { draft.saving = false; }
@@ -2183,21 +2254,25 @@ var NotableUI = {
         this.rememberRecentTags(job.paper.after.filter(tag => !job.paper.before.includes(tag))
           .concat(job.page.after.filter(tag => !job.page.before.includes(tag))));
         this.refreshTagEditQueue();
-        this.message('Tag changes saved on this computer. They’ll be applied when the worker is free.');
+        this.confirmTagSave(context, 'Tag changes saved on this computer. They’ll be applied when the worker is free.');
         this.drainTagEdits();
         return;
       }
       const result = await this.action('set_page_tags', {key: context.key, page: context.page, page_id: context.page_id,
         tags: [...page.tags], paper_tags: [...paper.tags], token: draft.token}, false);
-      if (!result) return;
+      if (!result?.token) return;
       this.rememberRecentTags([...paper.tags].filter(tag => !context.paper_tags.includes(tag))
         .concat([...page.tags].filter(tag => !context.page_tags.includes(tag))));
-      this.tagDrafts.delete(draftKey); this.tagEditor = result; this.render(); this.message('Tags saved. They will reach reMarkable on the next sync.');
+      this.tagDrafts.delete(draftKey); this.tagEditor = result; this.render();
+      this.confirmTagSave(result, 'Tags saved. They will reach reMarkable on the next sync.');
+      await this.recheckKeywordsAfterSave(result.parent_key || result.reference?.key,
+        [...paper.tags].filter(tag => !context.paper_tags.includes(tag)));
     }, true);
     if (context.parent_key && context.pdf_digest) save.dataset.browse = 'true';
     const reference = context.parent_key || context.reference?.key;
     if (reference) this.button('Show Zotero tags', footer, () => this.showZoteroTags(reference), false, 'tag').dataset.browse = 'true';
     this.button('Close page editor', footer, close).dataset.browse = 'true';
+    this.el('p', context.saveStatus || '', card, {id: 'notable-tag-save-status', class: 'save-status', role: 'status'});
   },
   renderReferenceTagEditor(card, context, close) {
     const match = context.linkedCopy;
@@ -2225,7 +2300,10 @@ var NotableUI = {
     const draft = context.paperDraft;
     const editor = this.renderTagEntry(card, {kind: 'paper', values: draft.tags, inputValue: draft.input,
       list: this.tagSuggestions(card, 'paper'),
-      onChange: (tags, input) => Object.assign(draft, {tags, input})});
+      onChange: (tags, input) => {
+        Object.assign(draft, {tags, input});
+        this.confirmTagSave(context, '');
+      }});
     this.button('Save paper tags', card, async () => {
       if (draft.saving) return;
       editor.add();
@@ -2246,11 +2324,13 @@ var NotableUI = {
         draft.tags = [...context.paperTags];
         this.rememberRecentTags(added);
         if (this.tagEditor === context && this.tab === 'tags') this.render();
-        this.message('Paper tags saved to this Zotero reference.');
+        this.confirmTagSave(context, 'Paper tags saved to this Zotero reference.');
+        await this.recheckKeywordsAfterSave(context.reference.key, added);
       } finally { draft.saving = false; }
     }, true).dataset.browse = 'true';
     this.button('Show Zotero tags', card, () => this.showZoteroTags(context.reference.key), false, 'tag').dataset.browse = 'true';
     this.button('Close page editor', card, close).dataset.browse = 'true';
+    this.el('p', context.saveStatus || '', card, {id: 'notable-tag-save-status', class: 'save-status', role: 'status'});
   },
   tagSearchState() {
     return this.tagSearch ||= {query: '', scope: 'paper', match: 'all', tags: new Set(), limit: 25,
@@ -2707,7 +2787,7 @@ var NotableUI = {
       const target = await this.maintenanceFile('Save Zotero annotations', 'modeSave', '.md', 'Zotero annotations.md');
       if (!target) return;
       const result = await this.maintenanceCall('annotations', {key: row.view_key, target});
-      if (result) this.message(`${result.annotations} annotations saved to ${result.path}`);
+      if (result) this.confirmSave(`${result.annotations} annotations saved to ${result.path}`);
     });
     const output = this.el('div', '', panel);
     this.button('Preview tablet highlight groups', panel, async () => {
@@ -2723,7 +2803,7 @@ var NotableUI = {
         const value = await this.maintenanceCall('highlights', {identity: row.cloud, token: preview.token, ...options});
         if (value?.queued) {
           output.replaceChildren();
-          this.el('p', 'Highlight choices saved for the next sync.', output, {role: 'status'});
+          this.el('p', 'Highlight choices saved for the next sync.', output, {class: 'save-status', role: 'status'});
           this.schedule(1000);
         }
       };
@@ -2756,7 +2836,7 @@ var NotableUI = {
       const target = await this.maintenanceFile('Save plugin backup', 'modeSave', '.zip', 'reMarkable-Zotero-backup.zip');
       if (!target) return;
       const result = await this.maintenanceCall('backup', {target});
-      if (result) this.message('Verified plugin backup saved to ' + result.path);
+      if (result) this.confirmSave('Verified plugin backup saved to ' + result.path);
     });
     this.button('Restore backup into a new folder…', panel, async () => {
       const source = await this.maintenanceFile('Select plugin backup', 'modeOpen', '.zip');
@@ -2764,7 +2844,7 @@ var NotableUI = {
       const folder = await this.maintenanceFile('Choose a parent folder for the recovered plugin data', 'modeGetFolder');
       if (!folder) return;
       const result = await this.maintenanceCall('restore', {source, destination: PathUtils.join(folder, 'reMarkable-Zotero-restored-' + Date.now())});
-      if (result) this.message('Verified recovery saved to ' + result.path + '. See the plugin guide to switch to it.');
+      if (result) this.confirmSave('Verified recovery saved to ' + result.path + '. See the plugin guide to switch to it.');
     });
     const output = this.el('div', '', panel);
     this.button('Show recent sync activity', panel, async () => {
@@ -3247,7 +3327,34 @@ var NotableUI = {
       dialog.addEventListener('close', () => { const chosen = dialog.returnValue === 'dismiss'; dialog.remove(); resolve(chosen); }, {once: true});
       dialog.showModal(); cancel.focus();
     });
-    if (confirmed) await this.action('dismiss_review', {identity: row.id, digest: row.digest});
+    if (confirmed) await this.saveInboxDismissal(row);
+  },
+  async saveInboxDismissal(row) {
+    const params = {identity: row.id, digest: row.digest};
+    if (row.kind !== 'reference') {
+      const result = await this.action('dismiss_review', params);
+      if (result?.dismissed_review === row.id) this.confirmSave('Dismissed from Inbox.');
+      return;
+    }
+    const pending = this.pendingInboxDismissals ||= new Set();
+    if (pending.has(row.id)) return;
+    pending.add(row.id);
+    const connection = this.filingConnection();
+    this.message('Saving Inbox dismissal…');
+    try {
+      const result = await this.rpc('dismiss_reference', params);
+      if (result?.dismissed_review !== row.id) throw Error('The worker could not confirm the Inbox dismissal. Try again.');
+      if (this.stopped || this.filingConnection() !== connection) return;
+      this.latest.reviews = this.latest.reviews.filter(review => review.id !== row.id);
+      this.badge();
+      if (['review', 'inbox'].includes(this.tab) && this.view && !this.view.closed) {
+        if (this.acquiringPDF || this.view.document.querySelector?.('dialog[open]')) this.inboxRenderPending = true;
+        else this.render();
+      }
+      this.confirmSave('Reference dismissed from Inbox.');
+    } finally {
+      pending.delete(row.id);
+    }
   },
   renderReferenceIntake(row, detail, onStatus = () => {}) {
     this.el('h2', row.payload.title, detail);
@@ -3370,7 +3477,9 @@ var NotableUI = {
       separate.dataset.browse = 'true';
     }
     const pdfActions = this.el('div', '', parent, {class: 'reference-pdf-actions'});
-    if (hasSourceLink) this.el('p', 'Save the PDF to Downloads in your browser, then attach it here.', pdfActions, {class: 'hint'});
+    if (hasSourceLink) this.el('p', this.latest?.config?.inbox
+      ? 'Save the PDF to ToSort. Inbox checks for a match automatically. You can also attach the download here.'
+      : 'Save the PDF to Downloads in your browser, then attach it here.', pdfActions, {class: 'hint'});
     const acquire = async chooseFile => {
       if ((this.busy && this.operation?.method !== 'sync') || this.acquiringPDF || !pdfActions.isConnected) return;
       this.acquiringPDF = true; this.disable(true);
@@ -3577,12 +3686,20 @@ var NotableUI = {
       group.open = this.syncWarningsOpen !== false;
       group.addEventListener('toggle', () => { if (group.isConnected) this.syncWarningsOpen = group.open; });
       this.el('summary', `Sync warnings (${warnings.length})`, group);
+      if (warnings.filter(issue => issue.kind === 'keywords').length > 1) {
+        this.button('Recheck keyword warnings', group, () => this.action('recheck_keyword_warnings'), false, 'refresh-cw');
+      }
       for (const issue of warnings) {
         const link = (this.latest.links || []).find(row => row.cloud === issue.cloud || row.source_key === issue.attachment || row.view_key === issue.attachment);
         const card = this.el('section', '', group, {class: 'sync-decision-item'});
         const title = issue.title || link?.name || (issue.attachment ? 'Zotero attachment ' + issue.attachment : 'Sync warning');
         this.el('h3', issue.merge ? 'Zotero merge or attachment change: ' + title : title, card);
         this.el('p', issue.reason, card);
+        if (issue.kind === 'keywords') {
+          const pdf = link?.view_key || link?.source_key;
+          if (pdf) this.reviewNavigationButton('Open PDF in Zotero', card, 'pdf', [pdf]);
+          this.button('Recheck keywords', card, () => this.action('recheck_keyword_warnings', {cloud: issue.cloud}), false, 'refresh-cw');
+        }
         if (issue.merge) {
           if (issue.parent) this.reviewNavigationButton('Show surviving reference in Zotero', card, 'references', [issue.parent]);
           if (link) this.button('Check connection', card, () => this.previewLinkRepair(link.cloud)).dataset.browse = 'true';
@@ -4245,7 +4362,7 @@ var NotableUI = {
       const options = proposal.suggestions.map(row => {
         const input = this.checkbox(row.tag, output, draft.selected.has(row.tag));
         input.addEventListener('change', () => {
-          draft.dirty = true; draft.saved = false; save.disabled = false;
+          draft.dirty = true; draft.saved = false; save.disabled = false; status.textContent = '';
           input.checked ? draft.selected.add(row.tag) : draft.selected.delete(row.tag);
         });
         if (row.reason) this.el('p', row.reason, output, {class: 'hint'});
@@ -4253,11 +4370,18 @@ var NotableUI = {
         return [row.tag, input];
       });
       this.el('p', proposal.notice, output, {class: 'hint'});
+      const status = this.el('p', draft.saved ? draft.saveStatus : '', output, {class: 'save-status', role: 'status'});
       const save = this.button(scope.identity ? 'Use these tags when filing' : 'Add keywords and selected tags', output, async () => {
         try {
           const result = await this.action('save_paper_tags', {target: proposal.target, token: proposal.token,
             selected: options.filter(([, input]) => input.checked).map(([tag]) => tag)}, false);
-          if (result?.saved) {draft.saved = true; save.disabled = true; this.el('p', result.deferred_until_filing ? 'Tag choices saved. They will be added when this paper is filed.' : 'Paper tags saved. Linked tablet copies receive them on the next sync.', output, {role: 'status'});}
+          if (!result?.saved) return;
+          draft.saved = true;
+          save.disabled = true;
+          status.textContent = draft.saveStatus = result.deferred_until_filing
+            ? 'Tag choices saved. They will be added when this paper is filed.'
+            : 'Paper tags saved to Zotero. Linked copies will receive them on the next sync.';
+          await this.recheckKeywordsAfterSave(result.parent, result.added);
         } catch (error) {entry.state = 'failed'; entry.error = error.message; draft.saved = false; render();}
       }, true);
       save.disabled = !!draft.saved;
@@ -4786,10 +4910,11 @@ var NotableUI = {
     for (const field of [name, home]) { field.addEventListener('input', saveDraft); field.addEventListener('change', saveDraft); }
     edit.addEventListener('toggle', saveDraft);
     this.button('Save name & destination', edit, async () => {
-      await this.action('move_link', {identity: row.cloud, name: name.value, collection: home.value, revision: draft.revision ?? row.revision}, false);
+      const result = await this.action('move_link', {identity: row.cloud, name: name.value, collection: home.value, revision: draft.revision ?? row.revision}, false);
+      if (!result?.link_saved) return;
       this.linkDrafts.delete(key); this.render();
       this.schedule(1000);
-      this.message('Name and destination saved for the next sync.');
+      this.confirmSave('Name and destination saved for the next sync.');
     });
     const history = this.el('details', '', card); this.el('summary', 'Link & recovery history', history);
     this.el('p', 'Clean baseline and downloaded tablet sources are retained privately for recovery.', history);
@@ -4914,8 +5039,10 @@ var NotableUI = {
           const result = await this.action('preview_connection', this.setupDraft, false);
           this.folderPreview = result?.proposed && result?.token ? result : null; this.render(); return;
         }
-        await this.action('configure', {...this.setupDraft, confirmation: preview.token}, false);
+        const result = await this.action('configure', {...this.setupDraft, confirmation: preview.token}, false);
+        if (!result?.setup_saved) return;
         this.clearFolderEditor(); this.render();
+        this.confirmSave('Folder connection saved.');
       }, true);
     } else {
       this.button(this.changingFolder || (!connected && previous.length) ? 'Review folder change' : 'Save setup', main, async () => {
@@ -4924,7 +5051,10 @@ var NotableUI = {
           const result = await this.action('preview_connection', this.setupDraft, false);
           this.folderPreview = result?.proposed && result?.token ? result : null; this.render();
         } else {
-          await this.action('configure', this.setupDraft, false); this.clearFolderEditor(); this.schedule(5000); this.render();
+          const result = await this.action('configure', this.setupDraft, false);
+          if (!result?.setup_saved) return;
+          this.clearFolderEditor(); this.schedule(5000); this.render();
+          this.confirmSave('Setup saved.');
         }
       }, true);
     }

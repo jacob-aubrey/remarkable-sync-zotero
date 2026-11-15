@@ -28,9 +28,42 @@ class LocalIntakeTests(unittest.TestCase):
         write_intake_pdf(path, 'A Research Paper\nReferences\nDOI: 10.1000/cited')
         self.assertEqual(intake_pdf_doi(path), {})
         write_intake_pdf(path, 'A Research Paper\nDOI: 10.1000/ARTICLE\nReferences\nDOI: 10.1000/cited')
-        self.assertEqual(intake_pdf_doi(path), {'doi': '10.1000/article', 'source': 'first-page'})
+        self.assertEqual(intake_pdf_doi(path), {'doi': '10.1000/article', 'source': 'first-page',
+                         'title_keys': ['a research paper', 'a research paper doi 10 1000 article',
+                                        'a research paper doi 10 1000 article references']})
         write_intake_pdf(path, 'A Research Paper\nDOI: 10.1000/article', doi='10.1000/different')
         self.assertEqual(intake_pdf_doi(path), {})
+
+    def test_sync_discovers_a_new_download_and_matches_wrapped_printed_doi(self):
+        inbox = self.root / 'ToSort'
+        inbox.mkdir()
+        self.worker.config['inbox'] = str(inbox)
+        path = inbox / 'Download.pdf'
+        title = 'Adverse Reactions to Iodinated Contrast Media'
+        self.zot.items['PARENT23'] = {'key': 'PARENT23', 'itemType': 'journalArticle',
+                                     'title': title, 'DOI': '10.1055/s-0033-1348885', 'collections': []}
+        self.worker.scan_inbox(discover=True)
+        clock = [0]
+        snapshots = []
+        self.worker.inbox_progress = snapshots.append
+
+        def sync_papers(bridge, *, apply):
+            self.assertTrue(apply)
+            write_intake_pdf(path, title + '\nExample Author\nDOI http://dx.doi.org/\n10.1055/s-0033-1348885.')
+            clock[0] += 16
+            bridge.progress('Checking the next tablet paper…')
+            self.assertEqual(len(snapshots), 1)
+            reference = next(row for row in snapshots[0] if row['kind'] == 'reference')
+            self.assertEqual(reference['intake_pdf']['filename'], path.name)
+            self.assertEqual(reference['intake_pdf']['doi'], '10.1055/s-0033-1348885')
+            self.assertFalse(self.zot.children('PARENT23'))
+            return {'actions': [], 'review': []}
+
+        with patch('note_organizer.zotero_worker.time.monotonic', side_effect=lambda: clock[0]), \
+                patch.object(self.worker.review, 'observe_ready', return_value=True), \
+                patch('note_organizer.zotero_worker.Bridge.run', autospec=True, side_effect=sync_papers):
+            self.worker.sync()
+        self.assertTrue(path.is_file())
 
     def test_tosort_doi_suggestion_revalidates_and_attaches_exact_copy(self):
         inbox = self.root / 'ToSort'
@@ -105,7 +138,11 @@ class LocalIntakeTests(unittest.TestCase):
     def test_dismissal_survives_metadata_edits_but_pdf_still_enters_review(self):
         self.zot.items['PARENT23'] = {'key': 'PARENT23', 'itemType': 'webpage', 'title': 'Saved link', 'collections': []}
         row = self.worker.scan_inbox(discover=True)['reviews'][0]
-        self.worker.dismiss_review(row['id'], row['digest'])
+        with self.assertRaisesRegex(PilotError, 'reference changed'):
+            self.worker.dismiss_reference(row['id'], 'stale-digest')
+        saved = {'dismissed_review': row['id']}
+        self.assertEqual(self.worker.dismiss_reference(row['id'], row['digest']), saved)
+        self.assertEqual(self.worker.dismiss_reference(row['id'], row['digest']), saved)
         self.zot.items['PARENT23']['title'] = 'Updated title'
         self.assertEqual(self.worker.scan_inbox(discover=True)['reviews'], [])
         self.add_pdf()

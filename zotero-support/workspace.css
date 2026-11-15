@@ -44,6 +44,9 @@ button.danger { color: light-dark(#a12626, #ffb0b0); }
 button:disabled { opacity: .55; cursor: wait; }
 .message { margin: 12px 0 22px; min-height: 22px; color: light-dark(#526273, #b3becb); }
 .message.error { color: light-dark(#9f2929, #ffaaaa); }
+.message.success, .save-status { color: light-dark(#20603a, #a6ddb8); }
+.save-status { margin-block: 8px 0; font-weight: 600; }
+.save-status:empty { margin: 0; }
 .activity { display: flex; align-items: flex-start; gap: 16px; margin: 18px 0 24px; padding: 18px 20px; border: 1px solid light-dark(#5b92c2, #527da5); border-left: 5px solid #3988cf; border-radius: 7px; background: light-dark(#edf5ff, #182a3c); }
 .activity-content { flex: 1; min-width: 0; }
 .activity strong { display: block; font-size: 17px; }

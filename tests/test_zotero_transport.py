@@ -110,6 +110,43 @@ main(['--state', sys.argv[1]], worker_factory=LocalWorker)
             if expected == 'ready':
                 self.assertEqual(packets[-1]['result']['status']['message'], 'Existing status')
 
+    def test_reference_dismissal_returns_before_sync_finishes_on_the_same_writer(self):
+        program = '''
+from pathlib import Path
+import sys, threading, time
+from note_organizer.zotero_worker import main
+
+class SyncWorker:
+    def __init__(self, directory, port, resources=None):
+        self.directory = Path(directory)
+        self.stop = threading.Event()
+        self.writer = threading.get_ident()
+        self.dismissed = None
+
+    def dispatch(self, method, params):
+        deadline = time.monotonic() + 3
+        while not self.dismissed and time.monotonic() < deadline:
+            self.sync_checkpoint()
+            time.sleep(.01)
+        return {'complete': True}
+
+    def dismiss_reference(self, identity, digest):
+        assert threading.get_ident() == self.writer
+        self.dismissed = identity
+        return {'dismissed_review': identity}
+
+main(['--state', sys.argv[1]], worker_factory=SyncWorker)
+'''
+        requests = [{'id': 1, 'method': 'sync'}, {'id': 2, 'method': 'dismiss_reference',
+                     'params': {'identity': 'reference', 'digest': 'confirmed'}}]
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, '-c', program, directory],
+                                    input=''.join(json.dumps(row) + '\n' for row in requests),
+                                    capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([json.loads(line) for line in result.stdout.splitlines()], [
+            {'id': 2, 'result': {'dismissed_review': 'reference'}}, {'id': 1, 'result': {'complete': True}}])
+
     def test_long_request_emits_transport_heartbeat(self):
         program = '''
 from pathlib import Path

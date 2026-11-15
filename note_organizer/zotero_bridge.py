@@ -819,15 +819,11 @@ class Bridge:
                     row['page_map'] = [pid for pid, _ in page_map(json.loads(bundle[ck + '.content']), len(original_pdf))]
                 row['page_map_digest'] = digest
                 save()
-                # Existing links need keyword extraction too. Read the retained
-                # original, never the rendered view's synthetic export metadata.
-                from .zotero_tagging import backfill_keywords
+                from .zotero_tagging import backfill_keywords, keyword_warning
                 original = self.sources.path.parent / 'remarkable' / 'baselines' / (baseline + '.pdf')
-                check = backfill_keywords(self.zot, row['parent'], original, row, save)
-                if check['status'] == 'extraction_failed':
-                    reviews.append({'cloud': ck, 'reason': 'Keyword extraction failed: ' + check.get('detail', '')})
-                elif check['status'] == 'needs_text_recognition':
-                    reviews.append({'cloud': ck, 'reason': 'No readable keyword text was found. This PDF needs text recognition or manual tags.'})
+                backfill_keywords(self.zot, row['parent'], original, row, save)
+                if warning := keyword_warning(ck, row):
+                    reviews.append(warning)
                 self._tags(row['parent'], bundle, ck, row, save)
                 self.progress(f'Received tablet PDF {number} of {len(cloud_pdfs)}…')
         return {"mode": "apply" if apply else "plan", "actions": reports, "review": reviews,

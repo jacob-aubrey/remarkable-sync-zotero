@@ -42,6 +42,21 @@ class NamingTests(unittest.TestCase):
         self.worker.config['templates'] = {'journal_article': '{author_last}_{journal_abbreviation}_{year}'}
         self.assertEqual(self.worker._proposal(self.path)['filename'], 'Pourbaghi_ACS_Nano_Med_2026.pdf')
 
+    def test_guideline_suggestion_and_preview_keep_the_existing_filename_stem(self):
+        title = 'Vattay_et_al_European_Radiology_2023.pdf'
+        details = {'title': title, 'year': '2023', 'document_type': 'guideline_standard',
+                   'primary_creator': 'Vattay', 'review_reasons': []}
+        with patch('note_organizer.sorting.core_logic.get_basic_document_details', return_value=details):
+            proposal = self.worker._proposal(self.path)
+        self.assertEqual(proposal['filename'], title)
+        self.assertEqual(proposal['title'], title)
+        self.assertEqual(proposal['document_type'], 'guideline_standard')
+        from note_organizer.zotero_worker import file_sha
+        identity = self.worker.review.offer('zotero', 'SOURCE23', file_sha(self.path), {**proposal, 'path': str(self.path)})
+        self.assertEqual(self.worker.preview(identity, 'guideline_standard', title)['filename'], title)
+        self.assertEqual(self.worker.preview(identity, 'guideline_standard', title, template='{document_type}_{year}')['filename'],
+                         'Guideline_or_Standard_2023.pdf')
+
     def offer(self):
         with patch.object(self.worker.review, 'observe_ready', return_value=True):
             self.worker._offer('inbox', 'same-file', self.path, guidance_version=2, guidance_state='ready', findings=[])

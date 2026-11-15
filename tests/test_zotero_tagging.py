@@ -109,6 +109,57 @@ class TagWorkflowTests(unittest.TestCase):
     setUp = fixtures.WorkerTests.setUp
     add_pdf = fixtures.WorkerTests.add_pdf
 
+    def keyword_warning_link(self):
+        path = self.add_pdf()
+        with pymupdf.open() as scan:
+            scan.new_page()
+            data = scan.tobytes()
+        path.write_bytes(data)
+        digest = fixtures.file_sha(path)
+        original = self.worker.state.directory / 'sources' / 'remarkable' / 'baselines' / (digest + '.pdf')
+        original.parent.mkdir(parents=True, exist_ok=True)
+        original.write_bytes(data)
+        link = {'parent': 'PARENT23', 'view_key': 'SOURCE23', 'baseline': digest,
+                'keyword_check': {'status': 'needs_text_recognition', 'version': 4, 'sha256': digest}}
+        self.worker.state.write('documents', {'tablet': link, 'another-tablet': {**link, 'view_key': ''}})
+        return path, original
+
+    def test_recheck_uses_the_pdf_in_zotero_and_keeps_other_warnings(self):
+        path, original = self.keyword_warning_link()
+        self.worker.last = {'result': {'review': [{'cloud': 'tablet', 'reason': 'Unrelated device warning'}]}}
+        self.assertEqual(len(self.worker.status()['status']['result']['review']), 3)
+        path.unlink()
+        make_pdf(path)
+        writes = self.zot.writes
+        with patch.object(self.worker, 'cloud', side_effect=AssertionError('The local check must not access reMarkable')):
+            result = self.worker.dispatch('recheck_keyword_warnings', {'cloud': 'tablet'})
+        self.assertEqual(result['keyword_recheck'], {'checked': 1, 'resolved': 1, 'unavailable': 0})
+        self.assertEqual(self.zot.writes, writes)
+        reviews = result['status']['result']['review']
+        self.assertEqual([issue['cloud'] for issue in reviews], ['tablet', 'another-tablet'])
+        self.assertEqual(reviews[0]['reason'], 'Unrelated device warning')
+        self.assertIsNone(result['last_sync_at'])
+
+        links = self.worker.state.read('documents', {})
+        backfill_keywords(self.zot, 'PARENT23', original, links['tablet'],
+                          lambda: self.worker.state.write('documents', links))
+        self.assertEqual([tag['tag'] for tag in self.zot.items['PARENT23']['tags']], ['Spectral CT', 'nanoparticles'])
+        self.assertEqual(links['tablet']['keyword_check']['attachment'], 'SOURCE23')
+
+    def test_manual_tags_clear_unreadable_warnings_only_after_the_tags_exist(self):
+        self.keyword_warning_link()
+        parent = self.zot.items['PARENT23']
+        parent['tags'] = [{'tag': 'Read'}]
+        result = self.worker.recheck_keyword_warnings(parent='PARENT23', confirmed_tags=['Iodine'])
+        self.assertEqual(result['keyword_recheck']['resolved'], 0)
+        parent['tags'].append({'tag': 'Iodine'})
+        result = self.worker.recheck_keyword_warnings(parent='PARENT23', confirmed_tags=['Iodine'])
+        self.assertEqual(result['keyword_recheck']['resolved'], 2)
+        self.assertEqual(result['status'].get('result', {}).get('review', []), [])
+        parent['tags'].pop()
+        result = self.worker.recheck_keyword_warnings(parent='PARENT23')
+        self.assertEqual(len(result['status']['result']['review']), 2)
+
     def test_legacy_cleanup_previews_evidence_and_removes_only_selected_automatic_tags(self):
         self.add_pdf()
         record = self.zot.items['PARENT23']

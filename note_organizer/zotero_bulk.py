@@ -17,6 +17,7 @@ from .zotero_review import fingerprint, finding_acknowledgement_token
 
 
 EXTENSIONS = {".pdf", ".docx", ".pptx"}
+INTAKE_DOI_VERSION = 2
 
 
 def digest_file(path, algorithm="sha256"):
@@ -72,13 +73,21 @@ def intake_pdf_doi(path):
         except ElementTree.ParseError:
             pass
     front = re.split(r'^\s*(?:references|bibliography)\s*$', first, maxsplit=1, flags=re.I | re.M)[0]
+    front = re.sub(r'^([ \t]*(?:doi\b[ \t]*[:=]?[ \t]*)?https?://(?:dx\.)?doi\.org/)[ \t]*\n[ \t]*(?=10\.\d{4,9}/)',
+                   r'\1', front, flags=re.I | re.M)
     printed = {doi for line in front.splitlines()
-               if re.match(r'^\s*(?:doi\s*[:=]|https?://(?:dx\.)?doi\.org/)', line, re.I)
+               if re.match(r'^\s*(?:doi\b\s*[:=]?\s*(?=10\.|https?://)|https?://(?:dx\.)?doi\.org/)', line, re.I)
                for doi in extract_doi_candidates(line)}
     candidates = metadata | printed
     if len(candidates) != 1:
         return {}
-    return {'doi': next(iter(candidates)), 'source': 'metadata' if metadata else 'first-page'}
+    evidence = {'doi': next(iter(candidates)), 'source': 'metadata' if metadata else 'first-page'}
+    if not metadata:
+        # Keep the printed heading independently of the filing title heuristic,
+        # which can include the adjacent author line in the proposed title.
+        heading = [line.strip() for line in first.splitlines() if line.strip()][:3]
+        evidence['title_keys'] = [title_key(' '.join(heading[:i])) for i in range(1, len(heading) + 1)]
+    return evidence
 
 
 def references_by_doi(parents):
@@ -108,7 +117,8 @@ def intake_pdf_suggestions(rows):
         evidence = source['payload']['intake_doi']
         if evidence['source'] == 'first-page':
             title = title_key(payload.get('title', ''))
-            if len(title) < 12 or title != title_key(source['payload'].get('title', '')):
+            source_titles = set(evidence.get('title_keys', [])) | {title_key(source['payload'].get('title', ''))}
+            if len(title) < 12 or title not in source_titles:
                 continue  # A printed DOI can refer to a different work.
         matches[row['id']] = {'id': source['id'], 'digest': source['digest'], 'doi': doi,
                               'filename': Path(source['payload']['path']).name}

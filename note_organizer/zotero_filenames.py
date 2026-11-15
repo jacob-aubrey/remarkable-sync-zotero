@@ -31,6 +31,17 @@ def title_filename(title, suffix, *, supplement=False):
         return validate_document_filename('Paper_' + name, suffix)
 
 
+def proposed_filename(details, suffix, template=''):
+    """Keep the guideline classification out of default Zotero filenames."""
+    if not template and details.get('document_type') == 'guideline_standard':
+        name = title_filename(details.get('title', ''), suffix)
+        if name:
+            return name
+        return 'Paper' + suffix
+    return build_proposed_filename(details, suffix, filename_format='custom' if template else 'smart',
+                                   custom_template=template)
+
+
 def citation_filename(record, templates, *, supplement=False):
     title = record.get('title', '')
     creators = [c.get('name') or ' '.join(filter(None, (c.get('firstName'), c.get('lastName'))))

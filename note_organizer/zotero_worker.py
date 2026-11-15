@@ -266,6 +266,8 @@ class Worker:
                      'message': 'Sync paused. Click Sync now when ready.' if self.config.get('sync_paused') else ''}
         self.collections = []
         self.progress = lambda message: None
+        self.inbox_progress = lambda rows: None
+        self.sync_checkpoint = lambda: None
         self.trace = OperationTrace(self.directory / "sync-trace.jsonl")
         self.review.trace = self.state.trace = self.trace.event
         self.file_digests = {}
@@ -352,23 +354,30 @@ class Worker:
 
     def status(self):
         from .sorting.core_logic import DOCUMENT_TYPE_LABELS
-        from .zotero_bulk import intake_pdf_suggestions
+        from .zotero_tagging import keyword_warning
         config = {k: v for k, v in self.config.items() if k != "server_id"}
         pending_reviews = self.review.rows(inbox_order=True)
         folder_blocks = self.state.read('folder_blocks', {})
         blocked_tablet = set(folder_blocks.get('tablet', []))
         pending_reviews = [row for row in pending_reviews if row['kind'] != 'cloud'
                            or row['payload'].get('tablet_parent') not in blocked_tablet]
-        suggestions = intake_pdf_suggestions(pending_reviews) if config.get('inbox') else {}
-        for row in pending_reviews:
-            if row['id'] in suggestions:
-                row['intake_pdf'] = suggestions[row['id']]
+        self._add_intake_matches(pending_reviews)
         paper_reviews = [row for row in pending_reviews if row['status'] == 'pending' and row['kind'] in PAPER_REVIEW_KINDS]
         review_guidance = {'version': REVIEW_GUIDANCE_VERSION,
             'needs_upgrade': [row['id'] for row in paper_reviews if not review_guidance_ready(row['payload'])],
             'ready': sum(review_guidance_ready(row['payload']) and row['payload']['guidance_state'] == 'ready' for row in paper_reviews),
             'repair': sum(review_guidance_ready(row['payload']) and row['payload']['guidance_state'] == 'repair' for row in paper_reviews)}
         documents = self.state.read('documents', {})
+        status = self.last
+        last_result = status.get('result', {})
+        warnings = [issue for cloud, link in documents.items() if (issue := keyword_warning(cloud, link))]
+        last_issues = last_result.get('review', [])
+        if warnings or any(issue.get('kind') == 'keywords' for issue in last_issues):
+            issues = [issue for issue in last_issues if issue.get('kind') != 'keywords'] + warnings
+            status = {**status, 'result': {**last_result, 'review': issues}}
+            if not issues and status.get('message') == 'Sync finished — some links need attention':
+                status.update(message='Sync finished', state='needs_review' if pending_reviews or self.review.deletions()
+                              or self.review.local_deletions() else 'ready')
         available = {key: row for key, row in documents.items() if not row.get('unavailable')}
         linked_sources = {row.get('source_key') for row in documents.values()}
         waiting = {row['approval'].get('source') or row['kind'] + ':' + row['identity']
@@ -382,7 +391,7 @@ class Worker:
         if staged:
             suspended = self.review.suspended_documents()
             waiting.update(source for identity, source in staged.items() if identity not in suspended)
-        return {"config": config, "status": self.last, "last_sync_at": self.state.read("last_sync_at"),
+        return {"config": config, "status": status, "last_sync_at": self.state.read("last_sync_at"),
                 "reviews": pending_reviews, "review_guidance": review_guidance,
                 "linked_original_matches": self.state.read("linked_original_matches", []),
                 "deletions": self.review.deletions(), "local_deletions": self.review.local_deletions(), "types": DOCUMENT_TYPE_LABELS,
@@ -391,7 +400,7 @@ class Worker:
                 "cleanup_pending": len(self.review.cleanups()), "bulk": self.bulk.read(),
                 'filing_summary': {'approved_waiting_sync': len(waiting), 'linked': len(available),
                                    'pdfs_received': sum(bool(row.get('revision')) for row in available.values())},
-                "links": [{"cloud": key, **row, **self.review.link_control(key)} for key, row in self.state.read("documents", {}).items()],
+                "links": [{"cloud": key, **row, **self.review.link_control(key)} for key, row in documents.items()],
                 'connection': {'linked_papers': len(available),
                   'previous': [{**{key: row.get(key, '') for key in ('zotero_root', 'tablet_root', 'zotero_path', 'tablet_path')},
                                 'linked_papers': len(connections.values(self.directory, row)['documents'])}
@@ -510,19 +519,65 @@ class Worker:
             source = self._paper_target(client, proposal['identity'], proposal['key'])
             if any(source[field] != proposal[field] for field in ('path', 'digest', 'parent', 'tags')):
                 raise PilotError('The paper or its tags changed. Check its suggestions again before saving.')
+            added = []
             if not proposal['identity']:
                 record = client.get('item', source['parent'])
-                updated = append_tags(record.get('tags', []), [row['tag'] for row in proposal['keywords']], selected)
-                if updated != record.get('tags', []):
+                existing = record.get('tags', [])
+                updated = append_tags(existing, [row['tag'] for row in proposal['keywords']], selected)
+                if updated != existing:
                     record['tags'] = updated
                     client.authorize(); client.update(record)
+                    added = [row['tag'] for row in updated[len(existing):]]
             proposal['selected'] = selected
             proposal['saved'] = True
             plans[target] = proposal
             self._save_tag_plans(plans)
-            return {'saved': True, 'deferred_until_filing': bool(proposal['identity'])}
+            return {'saved': True, 'deferred_until_filing': bool(proposal['identity']),
+                    'parent': source['parent'], 'added': added}
         finally:
             client.close()
+
+    def recheck_keyword_warnings(self, cloud='', parent='', confirmed_tags=None):
+        """Refresh only existing keyword findings using local Zotero and PDF evidence."""
+        from .zotero_tagging import keyword_warning, linked_keyword_report, normal
+        from .zotero_tags import names
+
+        if not isinstance(cloud, str) or not isinstance(parent, str) or (cloud and parent) or (confirmed_tags and not parent):
+            raise PilotError('Choose a linked paper or recheck all keyword warnings.')
+        confirmed = {normal(tag) for tag in names(confirmed_tags or [])}
+        links = self.state.read('documents', {})
+        checked = resolved = 0
+        candidates = [(key, row) for key, row in links.items() if not row.get('unavailable')
+                      and (not cloud or key == cloud) and (not parent or row.get('parent') == parent)
+                      and (keyword_warning(key, row) or (parent and row.get('keyword_manual_tags')))]
+        if candidates:
+            client = self.zotero()
+            try:
+                for key, row in candidates:
+                    had_warning = bool(keyword_warning(key, row))
+                    record = client.get('item', row['parent'])
+                    if not record or record.get('deleted') or record.get('itemType') in {'attachment', 'note', 'annotation'}:
+                        continue
+                    baseline = row.get('baseline', '')
+                    original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
+                    current = {normal(tag['tag']) for tag in record.get('tags', [])}
+                    manual = current.intersection(confirmed | set(row.get('keyword_manual_tags', [])))
+                    try:
+                        report = linked_keyword_report(client, record, original, row)
+                    except ValueError:
+                        continue  # The file changed mid-read. Keep the previous warning for a retry.
+                    if manual and report['status'] in {'needs_text_recognition', 'extraction_failed'}:
+                        report['status'] = 'tagged_manually'
+                    row['keyword_manual_tags'] = sorted(manual)
+                    row['keyword_review'] = {'status': report['status'], 'title': report['title']}
+                    checked += 1
+                    resolved += int(had_warning and not keyword_warning(key, row))
+                if checked:
+                    self.state.write('documents', links)
+            finally:
+                client.close()
+        return {**self.status(), 'keyword_recheck': {'checked': checked, 'resolved': resolved,
+                                                     'unavailable': len(candidates) - checked}}
 
     def _keyword_cleanup_rows(self, record, reports):
         from .zotero_tagging import cleanup_candidates, fragment_reason, keyword_without_markup, normal
@@ -864,7 +919,7 @@ class Worker:
             atomic_write(self.directory / 'config.json', json.dumps(proposed, ensure_ascii=False).encode())
             self.config = proposed
             self.last = {'state': 'paused' if proposed.get('sync_paused') else 'ready', 'message': 'Preferences saved.'}
-            return self.status()
+            return {**self.status(), 'setup_saved': True}
         plan = self._setup_plan(values)
         if plan['changed'] and (self.config.get('tablet_root') or self.config.get('connection_history')):
             if confirmation != plan['token']:
@@ -878,7 +933,7 @@ class Worker:
         self.config, self.connection_dir, self.review, self.state = proposed, directory, review, state
         self.last = ({'state': 'paused', 'message': 'Setup saved. Check your folders, then click Sync now when ready.'}
                      if proposed.get('sync_paused') else {'state': 'ready', 'message': 'Setup saved. Automatic sync is on.'})
-        return self.status()
+        return {**self.status(), 'setup_saved': True}
 
     def preview_disconnect(self):
         self.pause_sync()
@@ -897,11 +952,11 @@ class Worker:
         return self.status()
 
     def _naming_signature(self):
-        return fingerprint({'revision': 4, 'templates': self.config.get('templates', {})})
+        return fingerprint({'revision': 5, 'templates': self.config.get('templates', {})})
 
     def _proposal(self, path, metadata=None):
-        from .sorting.core_logic import get_basic_document_details, build_proposed_filename, sanitize_filename_part, validate_document_filename
-        from .zotero_filenames import PLACEHOLDER, title_filename
+        from .sorting.core_logic import get_basic_document_details, sanitize_filename_part, validate_document_filename
+        from .zotero_filenames import PLACEHOLDER, proposed_filename, title_filename
         details = get_basic_document_details(path)
         extracted_title = details.get('title', '')
         metadata = metadata or {}
@@ -948,9 +1003,11 @@ class Worker:
             warnings.append(warning)
         details.update(review_reasons=warnings, needs_review=bool(warnings), missing_citation_fields=missing)
         template = self.config.get("templates", {}).get(details["document_type"], "")
-        name = build_proposed_filename(details, path.suffix, filename_format="custom" if template else "smart", custom_template=template)
-        if not template and (any(part in name for part in ('UnknownJournal', 'UnknownYear', 'UnknownAuthor'))
-                             or details.get("primary_creator", "").casefold() in {"", "unknown", "unknown author"}):
+        name = proposed_filename(details, path.suffix, template)
+        missing_citation = (any(part in name for part in ('UnknownJournal', 'UnknownYear', 'UnknownAuthor'))
+                            or details.get("primary_creator", "").casefold() in {"", "unknown", "unknown author"})
+        if not template and (missing_citation if details['document_type'] != 'guideline_standard'
+                             else name == 'Paper' + path.suffix):
             name = path.name  # A readable paper does not need a perfect citation to keep a useful filename.
             if re.fullmatch(r'[0-9a-f]{64}', path.stem, re.I):
                 # Cloud downloads use content hashes privately, never as the
@@ -1001,7 +1058,7 @@ class Worker:
             if kind == 'zotero':
                 raise PilotError('Open the attachment in Zotero to finish the download or check whether the file is readable.')
             return
-        from .zotero_bulk import intake_pdf_doi, observed_digest
+        from .zotero_bulk import INTAKE_DOI_VERSION, intake_pdf_doi, observed_digest
         digest = observed_digest(path, self.file_digests)
         if kind == 'inbox':
             self.review.supersede_inbox(path, identity)
@@ -1009,12 +1066,12 @@ class Worker:
         intake_pdf = kind == 'inbox' and path.suffix.lower() == '.pdf'
         signature = citation_signature(metadata)
         same_pending_source = (old and old['status'] == 'pending'
-            and old['payload'].get('proposal_revision') == 2 and review_guidance_ready(old['payload'])
+            and old['payload'].get('proposal_revision') == 2 and (kind == 'inbox' or review_guidance_ready(old['payload']))
             and old['payload'].get('metadata_signature') == signature
             and old['payload'].get('naming_signature') == self._naming_signature()
             and old['payload'].get('parent', '') == (metadata or {}).get('key', '')
             and old['payload'].get('path') == str(path)
-            and (not intake_pdf or 'intake_doi' in old['payload'])
+            and (not intake_pdf or old['payload'].get('intake_doi_version') == INTAKE_DOI_VERSION)
             and not any(old['payload'].get(key) for key in
                         ('unavailable', 'local_recheck_error', 'tablet_evidence_stale')))
         if old and old['digest'] == digest and (old['status'] in {'approved', 'applying', 'ignored', 'attached'} or same_pending_source):
@@ -1023,6 +1080,7 @@ class Worker:
                    'proposal_revision': 2,
                    'source_collections': (metadata or {}).get('collections', []) if kind == 'zotero' else [], **extra}
         if intake_pdf:
+            payload['intake_doi_version'] = INTAKE_DOI_VERSION
             payload['intake_doi'] = {}
             root = self.config.get('inbox')
             if (root and not payload.get('details', {}).get('is_supplementary_material')
@@ -1038,10 +1096,16 @@ class Worker:
         payload["review_token"] = fingerprint(payload)
         self.review.offer(kind, identity, digest, payload)
 
-    def scan_inbox(self, *, catalog=False, discover=False):
-        """Discover settled downloads without opening remote clients."""
+    def _add_intake_matches(self, rows):
+        from .zotero_bulk import intake_pdf_suggestions
+        if self.config.get('inbox'):
+            suggestions = intake_pdf_suggestions(rows)
+            for row in rows:
+                if row['id'] in suggestions:
+                    row['intake_pdf'] = suggestions[row['id']]
+
+    def _scan_downloads(self):
         issues = []
-        native_files_settling = False
         inbox = self.config.get("inbox")
         if inbox:
             from .inbox import file_signature
@@ -1060,6 +1124,12 @@ class Worker:
                         self._offer('inbox', identity, path)
                     except (OSError, ValueError, PilotError) as error:
                         issues.append({'cloud': '', 'title': path.name, 'reason': f'Could not check this intake paper: {error}'})
+        return issues
+
+    def scan_inbox(self, *, catalog=False, discover=False):
+        """Discover settled downloads without opening remote clients."""
+        issues = self._scan_downloads()
+        native_files_settling = False
         if discover:
             client = self.zotero()
             try:
@@ -1725,7 +1795,16 @@ class Worker:
 
     def dismiss_review(self, identity, digest):
         self.review.dismiss(identity, digest)
-        return self.status()
+        return {**self.status(), 'dismissed_review': identity}
+
+    def dismiss_reference(self, identity, digest):
+        """Dismiss a pending Inbox reference without touching its Zotero item."""
+        row = self.review.row(identity)
+        if not row or row['kind'] != 'reference' or row['digest'] != digest:
+            raise PilotError('This reference changed. Check its current Inbox entry.')
+        if row['status'] != 'ignored':
+            self.review.dismiss(identity, digest)
+        return {'dismissed_review': identity}
 
     def confirm_folder_change(self, issue, choice='keep', zotero_plan=None):
         """Resolve the exact live folder pair the user reviewed."""
@@ -1925,6 +2004,28 @@ class Worker:
         if started_trace:
             self.trace.start("sync")
         self.trace.event("stage", name="opening_connections")
+        progress = self.progress
+        next_intake_check = time.monotonic() + 15
+        last_intake = None
+
+        def sync_progress(message):
+            nonlocal next_intake_check, last_intake
+            progress(message)
+            self.sync_checkpoint()
+            now = time.monotonic()
+            if not self.config.get('inbox') or now < next_intake_check or self.stop.is_set():
+                return
+            next_intake_check = now + 15
+            # Use the sync worker between steps so Inbox continues to discover
+            # downloads without a second process writing its review database.
+            self._scan_downloads()
+            intake = [row for row in self.review.rows(inbox_order=True) if row['kind'] in {'inbox', 'reference'}]
+            self._add_intake_matches(intake)
+            if intake != last_intake:
+                last_intake = intake
+                self.inbox_progress(intake)
+
+        self.progress = sync_progress
         client = None
         try:
             # Handwriting recognition is optional and must not prevent the
@@ -1999,14 +2100,15 @@ class Worker:
                              reviews=len(result.get("review", [])), partial_indexes=partial_indexes)
             return self.status()
         finally:
+            self.progress = progress
             if client is not None:
                 client.close()
             if started_trace and self.trace.operation:
                 self.trace.finish("completed" if self.last.get("state") in {"ready", "needs_review"} else "stopped")
 
     def preview(self, identity, document_type, title, template=None, citation=None):
-        from .sorting.core_logic import _normalize_year, build_proposed_filename, validate_filename_template
-        from .zotero_filenames import PLACEHOLDER, title_filename
+        from .sorting.core_logic import _normalize_year, validate_filename_template
+        from .zotero_filenames import PLACEHOLDER, proposed_filename, title_filename
         row = self.review.row(identity)
         if not row:
             raise PilotError("Select a document in the review queue.")
@@ -2029,8 +2131,7 @@ class Worker:
         template = self.config.get("templates", {}).get(document_type, "") if template is None else template
         if template:
             validate_filename_template(template)
-        name = build_proposed_filename(details, Path(row["payload"]["path"]).suffix,
-                 filename_format="custom" if template else "smart", custom_template=template)
+        name = proposed_filename(details, Path(row["payload"]["path"]).suffix, template)
         if not template and PLACEHOLDER.search(name):
             original_type = row['payload'].get('document_type') or row['payload']['details'].get('document_type')
             original_title = row['payload'].get('title') or row['payload']['details'].get('title')
@@ -2759,7 +2860,7 @@ class Worker:
                 raise PilotError("The desktop filename changed. Sync before editing this link.")
             Bridge(client, self.cloud(), self.state, self.config["zotero_root"], self.config["tablet_root"]).set_desktop_document(row, name, collection, maps)
             self.review.link_control(identity, event={"action": "rename or move requested", "name": name})
-            return self.status()
+            return {**self.status(), 'link_saved': True}
         finally:
             client.close()
 
@@ -3122,7 +3223,8 @@ class Worker:
     def dispatch(self, method, params):
         allowed = {"status", "connect", "pair", "folders", "configure", "preview_connection", "preview_disconnect", "disconnect_folder", "pause_sync", "sync", "preview", "approve", "delete_decision", "resolve_conflict", "link", "reindex", "local_delete_decision", "move_link", "scan_library", "import_library", "approve_routine", "tag_context", "set_page_tags", "tag_search", "combine_tag_copies", "remove_unavailable_page_tags"}
         allowed.update({'create_destination', 'scan_inbox', 'paper_tag_candidates', 'suggest_paper_tags', 'save_paper_tags', 'preview_keyword_cleanup', 'remove_reviewed_keywords', 'preview_filename_cleanup', 'queue_filename_cleanup', 'cancel_filename_cleanup', 'retry_bulk', 'dismiss_review', 'runtime_health', 'recheck_review', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source'})
-        allowed.update({'maintenance', 'undo_filename_cleanup', 'attach_intake_pdf', 'confirm_folder_change', 'apply_tag_edit'})
+        allowed.update({'maintenance', 'undo_filename_cleanup', 'attach_intake_pdf', 'confirm_folder_change', 'apply_tag_edit',
+                        'recheck_keyword_warnings'})
         if method not in allowed:
             raise PilotError("Unsupported plugin request.")
         if method not in {'status', 'pause_sync', 'preview_disconnect', 'runtime_health', 'scan_inbox'}:
@@ -3262,6 +3364,8 @@ def _serve(args, worker_factory):
         except ModuleNotFoundError:
             pass
     pending = queue.Queue()
+    dismissals = queue.Queue()
+    dismissal_ready = object()
     shutdown_requested = threading.Event()
     def read():
         for line in sys.stdin:
@@ -3269,7 +3373,10 @@ def _serve(args, worker_factory):
                 request = json.loads(line)
                 if not isinstance(request, dict):
                     raise ValueError('Request must be an object')
-                if request.get("method") in {"cancel", "shutdown", "pause_sync"}:
+                if request.get('method') == 'dismiss_reference':
+                    dismissals.put(request)
+                    pending.put(dismissal_ready)
+                elif request.get("method") in {"cancel", "shutdown", "pause_sync"}:
                     worker.trace.event('control_requested', method=request['method'], request_id=request.get('id'))
                     worker.stop.set()
                     if request["method"] == "shutdown":
@@ -3295,6 +3402,24 @@ def _serve(args, worker_factory):
     def send(packet):
         with packet_lock:
             write_packet(transport, packet)
+
+    def finish_dismissals():
+        # These requests only change pending reference review rows. Both the
+        # idle loop and sync checkpoints apply them on the existing writer.
+        while True:
+            try:
+                request = dismissals.get_nowait()
+            except queue.Empty:
+                return
+            response = {'id': request.get('id')}
+            try:
+                response['result'] = worker.dismiss_reference(**request.get('params', {}))
+            except Exception as error:
+                message = str(error) if isinstance(error, PilotError) else 'The reference could not be dismissed. Try again.'
+                response['error'] = {'message': message, 'type': type(error).__name__}
+            worker.trace.event('inbox_dismissal', request_id=response['id'], saved='result' in response)
+            send(response)
+
     last_links = None
     quiet_request = False
     def progress(message):
@@ -3315,10 +3440,15 @@ def _serve(args, worker_factory):
                 last_links = signature
         send(packet)
     worker.progress = progress
+    worker.inbox_progress = lambda rows: send({'event': 'progress', 'inbox_rows': rows})
+    worker.sync_checkpoint = finish_dismissals
     while True:
         request = pending.get()
         if request is None:
             break
+        if request is dismissal_ready:
+            finish_dismissals()
+            continue
         response = {"id": request.get("id")}
         method = str(request.get("method", ""))
         quiet_request = (method == 'suggest_paper_tags' and isinstance(request.get('params'), dict)

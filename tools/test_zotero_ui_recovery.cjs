@@ -191,10 +191,31 @@ async function main() {
     ui.renderLinks(node());
     assert.equal(fields.get('PDF name').value, 'My draft.pdf');
     assert.equal(fields.get('Linked folders for this paper (Zotero → reMarkable)').value, 'new-home');
-    let payload; ui.action = async (_method, params) => { payload = params; }; ui.render = () => {};
+    let payload; ui.action = async (_method, params) => { payload = params; return {link_saved: true}; }; ui.render = () => {};
     await buttons.get('Save name & destination').at(-1).click();
     assert.equal(payload.revision, 'original-revision', 'Unsaved moves retain their reviewed revision for backend conflict checks');
     assert.equal(ui.linkDrafts.size, 0);
+    assert.match(ui.saveFeedback.value, /saved for the next sync/);
+  }
+  {
+    const {ui, buttons, node} = viewFixture();
+    const calls = [];
+    ui.tab = 'sync-review';
+    ui.latest.links = [{cloud: 'first', view_key: 'PDF23456', parent: 'PARENT23'}];
+    ui.latest.status.result = {review: [
+      {kind: 'keywords', cloud: 'first', title: 'Actual Zotero title', reason: 'Keyword warning', parent: 'PARENT23'},
+      {kind: 'keywords', cloud: 'second', title: 'Second paper', reason: 'Keyword warning'}]};
+    ui.action = async (...args) => calls.push(args);
+    ui.reviewNavigationButton = (label, parent, type, keys) => ui.button(label, parent, () => calls.push([type, keys]));
+    const root = node();
+    ui.renderReview(root);
+    await buttons.get('Open PDF in Zotero')[0].click();
+    await buttons.get('Recheck keywords')[0].click();
+    await buttons.get('Recheck keyword warnings')[0].click();
+    await ui.recheckKeywordsAfterSave('PARENT23', ['Iodine']);
+    assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['pdf', ['PDF23456']],
+      ['recheck_keyword_warnings', {cloud: 'first'}], ['recheck_keyword_warnings'],
+      ['recheck_keyword_warnings', {parent: 'PARENT23', confirmed_tags: ['Iodine']}, true]]);
   }
   {
     const {ui, fields, buttons, node} = viewFixture();

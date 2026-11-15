@@ -95,6 +95,33 @@ async function main() {
   ui.receiveProgress({message: 'Importing paper 2 of 3'});
   ui.receiveProgress({message: 'Still working...'});
   assert.equal(syncStep.textContent, 'Importing paper 2 of 3', 'A heartbeat keeps the meaningful step visible');
+  const renderIdle = ui.render;
+  ui.render = () => {assert.equal(ui.operation.method, 'sync'); renders++;};
+  ui.latest.reviews = [{id: 'reference', kind: 'reference'}, {id: 'decision', kind: 'conflict'}];
+  const liveInbox = {event: 'progress', inbox_rows: [
+    {id: 'reference', kind: 'reference', intake_pdf: {id: 'download'}}, {id: 'download', kind: 'inbox'}]};
+  const preDownload = renders;
+  ui.receiveProgress(liveInbox);
+  ui.receiveProgress(liveInbox);
+  assert.equal(renders, preDownload + 1, 'A download refreshes Inbox during sync, with no redundant render');
+  assert.equal(ui.latest.reviews[0].intake_pdf.id, 'download');
+  assert.equal(ui.latest.reviews[1].id, 'decision', 'Download discovery preserves unrelated review rows');
+  assert.equal(ui.latest.reviews[2].id, 'download');
+  assert.equal(syncStep.textContent, 'Importing paper 2 of 3', 'Inbox discovery leaves the sync step visible');
+  const reference = ui.latest.reviews[0], messagesBeforeDismissal = messages;
+  ui.rpc = (method, params) => {
+    assert.equal(method, 'dismiss_reference');
+    assert.equal(params.identity, reference.id);
+    return new Promise(resolve => {finish = resolve;});
+  };
+  const dismissal = ui.saveInboxDismissal(reference);
+  assert.equal(messages, messagesBeforeDismissal + 1, 'A confirmed dismissal immediately shows that it is being saved');
+  assert.equal(ui.latest.reviews[0].id, reference.id, 'Keep the reference visible while saving');
+  finish({dismissed_review: reference.id});
+  await dismissal;
+  assert.equal(ui.latest.reviews.some(row => row.id === reference.id), false, 'A saved dismissal updates Inbox during sync');
+  assert.match(ui.saveFeedback.value, /dismissed from Inbox/);
+  ui.render = renderIdle;
   syncDetails.open = true;
   ui.busy = false; ui.operation = null; ui.updateActivity();
   assert.equal(syncDetails.hidden, true);
