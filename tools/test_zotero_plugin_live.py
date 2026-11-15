@@ -74,7 +74,9 @@ async function startup({rootURI}) {
               throw Error('The native items tree did not show the last completed reMarkable sync.');
             }
             const cell = column.renderCell(0, 'synced', column, false, win.document);
-            if (cell.textContent !== '✓' || !cell.title.includes('last check')) throw Error('Sync status icon or tooltip is missing.');
+            if (cell.textContent !== '✓' || cell.getAttribute('role') !== 'img' || !cell.title.includes('last check')) {
+              throw Error('Sync status icon or accessible tooltip is missing.');
+            }
             if (!ui.helperLaunch || ui.busy) throw Error('The test needs an idle, initialized primary helper.');
             ui.operation = {method: 'sync', detail: 'Simulated long transfer', started: Date.now(), updated: Date.now()};
             ui.busy = true;
@@ -1915,7 +1917,8 @@ def maintenance_checks(client, root, checked):
                     'keyword_check': {'status': 'needs_text_recognition', 'title': title}}
     state.write('documents', links)
     try:
-        command(root, 'sync_column_and_keyword_recheck', paper=parent, cloud=cloud)
+        with state.lock():
+            command(root, 'sync_column_and_keyword_recheck', paper=parent, cloud=cloud)
         checked('native_status_column_and_packaged_keyword_recheck_during_simulated_sync')
         checked('native_workspace_closes_with_last_library_window')
     finally:
