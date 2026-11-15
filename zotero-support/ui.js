@@ -189,9 +189,9 @@ var NotableUI = {
     if (this.latest) this.badge();
   },
   detach(window) {
-    window.document?.getElementById('notable-open')?.remove();
     this.windows.delete(window);
     if (![...this.windows].some(other => !other.closed) && this.view && !this.view.closed) this.view.close();
+    if (!window.closed) window.document?.getElementById('notable-open')?.remove();
   },
   async stop() {
     this.stopped = true;

@@ -10,7 +10,7 @@ var NotableSyncColumn = {
   register(pluginID) {
     this.key = Zotero.ItemTreeManager.registerColumn({
       pluginID, dataKey: 'remarkable-sync-status', label: 'reMarkable', enabledTreeIDs: ['main'],
-      width: '100px', staticWidth: true, zoteroPersist: ['width', 'hidden', 'sortDirection'],
+      width: '100', staticWidth: true, zoteroPersist: ['width', 'hidden', 'sortDirection'],
       dataProvider: item => item.libraryID === Zotero.Libraries.userLibraryID && item.isRegularItem() && !item.deleted
         ? this.byPaper.get(item.key) || '' : '',
       renderCell: (_index, data, column, _first, doc) => {
@@ -20,6 +20,7 @@ var NotableSyncColumn = {
         if (state) {
           cell.textContent = state[0];
           cell.title = state[1];
+          cell.setAttribute('role', 'img');
           cell.setAttribute('aria-label', state[1]);
         }
         cell.style.textAlign = 'center';
