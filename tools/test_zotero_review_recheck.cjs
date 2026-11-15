@@ -152,6 +152,42 @@ async function main() {
       assert.equal(ui.filingQueue.length, 0); assert.equal(writes.length, 0);
     }
   }
-  console.log('PASS: local-only recheck UI, queued-write isolation, native-change freshness, scoped overlap groups, retained drafts, merge notice, and scroll/detail context');
+  {
+    const {ui} = fixture();
+    ui.helperLaunch = {};
+    ui.operation = {method: 'sync', detail: 'Transferring'};
+    ui.busy = true;
+    ui.latest.review_revision = 2;
+    ui.latest.status = {state: 'needs_attention', result: {review: [{cloud: 'warning'}]}};
+    const syncStatus = ui.latest.status;
+    let finish;
+    ui.rpc = () => {throw Error('Read-only check waited for the transfer worker');};
+    ui.readLocalReply = (mode, request) => {
+      assert.equal(mode, '--local-check');
+      assert.equal(request.method, 'recheck_review');
+      return new Promise(resolve => {finish = resolve;});
+    };
+    const stale = structuredClone(ui.latest);
+    const checking = ui.action('recheck_review', {identities: ['a']}, false);
+    finish({reviews: [paper('new')], review_revision: 3, review_recheck: {checked: 1, retry_ids: []}});
+    await checking;
+    assert.equal(ui.busy, true);
+    assert.equal(ui.operation.detail, 'Transferring');
+    assert.equal(ui.latest.status, syncStatus, 'Local scans preserve the sync status and warnings');
+    ui.adoptStatus(stale, true);
+    assert.equal(ui.latest.reviews[0].id, 'new', 'An older sync result must keep the just-checked review');
+    assert.equal(ui.latest.review_revision, 3);
+  }
+  {
+    const {ui} = fixture();
+    ui.latest.reviews = [{id: 'dismissed'}, {id: 'visible'}];
+    ui.latest.review_revision = 2;
+    ui.inboxDismissals = new Map([['dismissed', 4]]);
+    ui.adoptStatus({...ui.latest, review_revision: 3});
+    assert.deepEqual(plain(ui.latest.reviews), [{id: 'visible'}], 'A scan cannot restore an already dismissed reference');
+    ui.adoptStatus({...ui.latest, review_revision: 4});
+    assert.equal(ui.inboxDismissals.size, 0);
+  }
+  console.log('PASS: local-only rechecks, concurrent sync, latest review snapshots, dismissal ordering, queued-write isolation, freshness, and drafts');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

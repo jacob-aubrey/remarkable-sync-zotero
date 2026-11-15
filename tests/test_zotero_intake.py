@@ -140,7 +140,7 @@ class LocalIntakeTests(unittest.TestCase):
         row = self.worker.scan_inbox(discover=True)['reviews'][0]
         with self.assertRaisesRegex(PilotError, 'reference changed'):
             self.worker.dismiss_reference(row['id'], 'stale-digest')
-        saved = {'dismissed_review': row['id']}
+        saved = {'dismissed_review': row['id'], 'review_revision': self.worker.review.revision() + 1}
         self.assertEqual(self.worker.dismiss_reference(row['id'], row['digest']), saved)
         self.assertEqual(self.worker.dismiss_reference(row['id'], row['digest']), saved)
         self.zot.items['PARENT23']['title'] = 'Updated title'

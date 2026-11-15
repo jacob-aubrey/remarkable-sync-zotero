@@ -278,6 +278,55 @@ class ReviewRecheckTests(unittest.TestCase):
                 self.worker.recheck_review(identity=row['id'])
         self.assertEqual(self.worker.review.row(row['id']), row)
 
+    def test_background_recheck_updates_other_papers_with_sync_lock_held(self):
+        removed, _, _ = self.deleted_source()
+        current, _ = self.paper(key='SOURCE24', parent='PARENT24')
+        removed = self.worker.review.row(removed['id'])
+        self.native.catalog['parents']['PARENT24']['title'] = 'Corrected title about nanoparticle imaging'
+        side = Worker(self.worker.directory, zotero_factory=lambda: self.native, recover_pause=False,
+                      cloud_factory=lambda: self.fail('Local check contacted reMarkable'))
+        with self.worker.state.lock():
+            result = side.local_check('recheck_review', {})
+            self.assertEqual(result['review_recheck']['checked_ids'], [current['id']])
+            self.assertEqual(result['review_recheck']['retry_ids'], [removed['id']])
+            self.assertTrue(side.review_retirement_deferred)
+            self.assertEqual(self.worker.review.row(removed['id']), removed)
+            self.assertIn('Corrected title', self.worker.review.row(current['id'])['payload']['title'])
+        self.worker.recheck_review(identity=removed['id'])
+        self.assertEqual(self.worker.review.row(removed['id'])['status'], 'resolved')
+
+    def test_late_recheck_preserves_newer_review_and_applying_journal(self):
+        row, _ = self.paper()
+        side = Worker(self.worker.directory, zotero_factory=lambda: self.native, recover_pause=False)
+        local_policy = side.refresh_review_policy
+        approval = {'source': row['identity'], 'step': 'publishing'}
+
+        def start_filing(*args, **kwargs):
+            self.worker.review.begin(row['id'], row['digest'], approval)
+            return local_policy(*args, **kwargs)
+
+        with patch.object(side, 'refresh_review_policy', side_effect=start_filing):
+            self.native.catalog['parents'][row['payload']['parent']]['title'] = 'A newer title'
+            result = side.local_check('recheck_review', {})
+        self.assertEqual(result['review_recheck']['retry_ids'], [row['id']])
+        self.assertEqual(result['reviews'][0]['approval'], approval)
+        self.assertEqual(result['reviews'][0]['payload'], row['payload'])
+        self.assertEqual(result['reviews'][0]['status'], 'applying')
+
+    def test_old_reference_catalog_cannot_retire_or_reopen_a_newer_inbox_row(self):
+        store = self.worker.review
+        store.reconcile_references({'PARENT23': {'title': 'Original'}}, store.reference_rows())
+        original = store.reference_rows()
+        store.reconcile_references({'PARENT23': {'title': 'Newer'}}, original)
+        store.reconcile_references({}, original)
+        [row] = store.rows()
+        self.assertEqual(row['payload']['title'], 'Newer')
+        dismissed = store.dismiss(row['id'], row['digest'])
+        self.assertTrue(store.reconcile_references({'PARENT23': {'title': 'Old'}}, original))
+        rows, revision = store.rows(with_revision=True)
+        self.assertEqual(rows, [])
+        self.assertEqual(revision, dismissed)
+
     def test_deleted_source_owned_by_archived_connection_is_not_retired(self):
         from note_organizer.zotero_bridge import BridgeState
         row, _, _ = self.deleted_source()

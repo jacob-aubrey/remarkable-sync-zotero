@@ -16,6 +16,16 @@ def fingerprint(value):
 
 
 ACKNOWLEDGE_LIBRARY_FINDINGS = frozenset({'possible_duplicate_references', 'repeated_pdf_content'})
+UNCONDITIONAL = object()
+
+
+def _saved_review(row):
+    return (row['digest'], row['status'], json.loads(row['payload']), json.loads(row['approval'])) if row else None
+
+
+def _matches_review(saved, expected):
+    evidence = (expected['digest'], expected['status'], expected['payload'], expected['approval']) if expected else None
+    return _saved_review(saved) == evidence
 
 
 def finding_acknowledgement_token(code, evidence):
@@ -72,6 +82,13 @@ class ReviewStore(Ledger):
             db.execute("CREATE TABLE IF NOT EXISTS local_deletions (id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL, action TEXT NOT NULL DEFAULT '')")
             db.execute("CREATE TABLE IF NOT EXISTS intake_cleanup (identity TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS review_finding_acknowledgements (fingerprint TEXT PRIMARY KEY, code TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS review_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)")
+            db.execute("INSERT OR IGNORE INTO review_revision VALUES(1,0)")
+            for event in ('INSERT', 'UPDATE', 'DELETE'):
+                db.execute(f'''CREATE TRIGGER IF NOT EXISTS review_revision_{event.lower()}
+                    AFTER {event} ON review_queue BEGIN
+                        UPDATE review_revision SET revision=revision+1 WHERE id=1;
+                    END''')
 
     def acknowledgement_tokens(self):
         """Read only scoped arrangements; a different fingerprint reopens review."""
@@ -223,15 +240,17 @@ class ReviewStore(Ledger):
     def observe_ready(self, identity, signature, *, now=None, settle=2):
         now = time.time() if now is None else now
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
             row = db.execute("SELECT signature,first_seen FROM observations WHERE identity=?", (identity,)).fetchone()
             if row and row[0] == signature:
                 return now - row[1] >= settle
             db.execute("INSERT OR REPLACE INTO observations VALUES(?,?,?)", (identity, signature, now))
         return False
 
-    def offer(self, kind, identity, digest, payload):
+    def offer(self, kind, identity, digest, payload, *, expected=UNCONDITIONAL):
         with self.connect() as db:
-            return self._offer(db, kind, identity, digest, payload)
+            db.execute('BEGIN IMMEDIATE')
+            return self._offer(db, kind, identity, digest, payload, expected=expected)
 
     def retire_conflict(self, identity):
         with self.connect() as db:
@@ -239,10 +258,12 @@ class ReviewStore(Ledger):
                        (identity,))
 
     @staticmethod
-    def _offer(db, kind, identity, digest, payload):
+    def _offer(db, kind, identity, digest, payload, *, expected=UNCONDITIONAL):
         key = fingerprint([kind, identity])[:24]
         encoded = json.dumps(payload)
-        old = db.execute("SELECT digest,status,payload FROM review_queue WHERE id=?", (key,)).fetchone()
+        old = db.execute("SELECT digest,status,payload,approval FROM review_queue WHERE id=?", (key,)).fetchone()
+        if expected is not UNCONDITIONAL and not _matches_review(old, expected):
+            return None
         if old and old[0] == digest:
             if old[1] in {"approved", "ignored", "attached"} or (old[1] in {"pending", "applying"} and old[2] == encoded):
                 return key
@@ -252,7 +273,7 @@ class ReviewStore(Ledger):
                    (key, kind, identity, digest, encoded))
         return key
 
-    def rows(self, *, pending_only=True, inbox_order=False):
+    def rows(self, *, pending_only=True, inbox_order=False, with_revision=False):
         columns = 'r.*'
         source = 'review_queue AS r'
         if inbox_order:
@@ -262,8 +283,12 @@ class ReviewStore(Ledger):
                        " AND ref.identity=json_extract(r.payload, '$.parent')")
         pending = " WHERE r.status IN ('pending','applying')" if pending_only else ''
         with self.connect() as db:
+            if with_revision:
+                db.execute('BEGIN')
+                revision = db.execute("SELECT revision FROM review_revision WHERE id=1").fetchone()[0]
             rows = db.execute(f'SELECT {columns} FROM {source}{pending} ORDER BY r.rowid').fetchall()
-        return [{**dict(row), "payload": json.loads(row["payload"]), "approval": json.loads(row["approval"])} for row in rows]
+        decoded = [{**dict(row), "payload": json.loads(row["payload"]), "approval": json.loads(row["approval"])} for row in rows]
+        return (decoded, revision) if with_revision else decoded
 
     def reopen(self, identity, expected_digest, payload, *, applying=False):
         """Require a fresh decision when new evidence invalidates old consent."""
@@ -273,10 +298,16 @@ class ReviewStore(Ledger):
 
     def dismiss(self, identity, digest):
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT digest,status FROM review_queue WHERE id=?', (identity,)).fetchone()
             if not row or row['digest'] != digest or row['status'] != 'pending':
                 raise PilotError('Only a current pending review can be dismissed. Finish or recover an active filing first.')
             db.execute("UPDATE review_queue SET status='ignored' WHERE id=?", (identity,))
+            return db.execute("SELECT revision FROM review_revision WHERE id=1").fetchone()[0]
+
+    def revision(self):
+        with self.connect() as db:
+            return db.execute("SELECT revision FROM review_revision WHERE id=1").fetchone()[0]
 
     def finish_intake_attachment(self, identity, digest, cleanup):
         """Retire the ToSort review and record its verified cleanup together."""
@@ -294,31 +325,60 @@ class ReviewStore(Ledger):
                 payload = {**json.loads(row['payload']), 'unavailable': reason, 'routine': False}
                 db.execute('UPDATE review_queue SET payload=? WHERE id=?', (json.dumps(payload), identity))
 
-    def supersede_inbox(self, path, current_identity):
+    def supersede_inbox(self, path, current_identity, signature):
         """Keep history, but offer only the current instance of an intake path."""
+        from .inbox import file_signature
+        normalized = str(path.resolve()).casefold()
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if file_signature(path) != signature:
+                return False
             rows = db.execute("SELECT id,identity,payload FROM review_queue WHERE kind='inbox' AND status='pending'").fetchall()
             for row in rows:
-                if row['identity'] != current_identity and Path(json.loads(row['payload']).get('path', '')).resolve() == Path(path).resolve():
+                if row['identity'] != current_identity and json.loads(row['payload']).get('path', '').casefold() == normalized:
                     db.execute("UPDATE review_queue SET status='superseded' WHERE id=?", (row['id'],))
+            return True
 
-    def reconcile_references(self, references):
+    def reference_rows(self):
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM review_queue WHERE kind='reference'").fetchall()
+        return {row['identity']: {**dict(row), 'payload': json.loads(row['payload']),
+                                 'approval': json.loads(row['approval'])} for row in rows}
+
+    def reconcile_references(self, references, observed):
         """Publish one complete local pass while retaining dismissed history."""
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            skipped = False
             for key, payload in references.items():
-                self._offer(db, 'reference', key, fingerprint(['reference', key]), payload)
-            rows = db.execute("SELECT id,identity FROM review_queue WHERE kind='reference' AND status='pending'").fetchall()
-            db.executemany("UPDATE review_queue SET status='superseded' WHERE id=? AND status='pending'",
-                           [(row['id'],) for row in rows if row['identity'] not in references])
+                saved = self._offer(db, 'reference', key, fingerprint(['reference', key]), payload, expected=observed.get(key))
+                skipped |= saved is None
+            db.executemany("""UPDATE review_queue SET status='superseded' WHERE id=? AND status='pending'
+                           AND digest=? AND payload=?""",
+                           [(row['id'], row['digest'], json.dumps(row['payload'])) for key, row in observed.items()
+                            if key not in references and row['status'] == 'pending'])
+            return skipped
 
     def retire_missing_inbox(self, current_paths):
         """Retain vanished inputs as history instead of presenting dead approvals."""
         present = {str(Path(path).resolve()).casefold() for path in current_paths}
         with self.connect() as db:
-            rows = db.execute("SELECT id,payload FROM review_queue WHERE kind='inbox' AND status='pending'").fetchall()
-            for row in rows:
-                if str(Path(json.loads(row['payload'])['path']).resolve()).casefold() not in present:
-                    db.execute("UPDATE review_queue SET status='unavailable' WHERE id=?", (row['id'],))
+            rows = db.execute("SELECT id,payload,digest FROM review_queue WHERE kind='inbox' AND status='pending'").fetchall()
+        missing = []
+        for row in rows:
+            path = Path(json.loads(row['payload'])['path'])
+            if str(path).casefold() in present:
+                continue
+            try:
+                path.stat()
+            except FileNotFoundError:
+                missing.append((row['id'], row['digest'], row['payload']))
+            except OSError:
+                continue
+        if missing:
+            with self.connect() as db:
+                db.executemany("""UPDATE review_queue SET status='unavailable' WHERE id=? AND status='pending'
+                               AND digest=? AND payload=?""", missing)
 
     def complete_counterpart(self, kind, identity, digest, payload, approval):
         """Commit a verified substep atomically, including an already-finished retry.
@@ -340,10 +400,12 @@ class ReviewStore(Ledger):
             row = db.execute("SELECT * FROM review_queue WHERE id=?", (identity,)).fetchone()
         return {**dict(row), "payload": json.loads(row["payload"]), "approval": json.loads(row["approval"])} if row else None
 
-    def begin(self, identity, expected_digest, approval):
+    def begin(self, identity, expected_digest, approval, *, expected=UNCONDITIONAL):
         with self.connect() as db:
-            row = db.execute("SELECT digest,status,approval FROM review_queue WHERE id=?", (identity,)).fetchone()
-            if not row or row[0] != expected_digest or row[1] not in {"pending", "applying"}:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT digest,status,payload,approval FROM review_queue WHERE id=?", (identity,)).fetchone()
+            if (not row or row['digest'] != expected_digest or row['status'] not in {"pending", "applying"}
+                    or (expected is not UNCONDITIONAL and not _matches_review(row, expected))):
                 raise PilotError("This review changed. Refresh it before approving.")
             if row['status'] == 'applying':
                 previous = json.loads(row['approval'])

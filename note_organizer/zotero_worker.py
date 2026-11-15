@@ -23,7 +23,7 @@ import uuid
 from .remarkable_cloud import CloudClient, CloudError, TokenVault, atomic_write
 from .zotero_bridge import (Bridge, BridgeState, descendants, folder_blocked_papers, sync_collections,
                             sync_folder_scope, zotero_folder_inventory)
-from .zotero_pilot import AuthorizationRequired, LocalZotero, PilotError, TransportInterrupted, stable_key
+from .zotero_pilot import AuthorizationRequired, LocalZotero, PilotBusy, PilotError, TransportInterrupted, stable_key
 from .zotero_review import (ReviewStore, fingerprint, cloud_change_intent,
                             cloud_change_done)
 from . import zotero_connections as connections
@@ -265,6 +265,8 @@ class Worker:
         self._open_connection()
         self.zotero_factory, self.cloud_factory = zotero_factory, cloud_factory
         self.cloud_client = None
+        self.background_check = False
+        self.review_retirement_deferred = False
         self.last = {'state': 'setup_required' if not self.config.get('tablet_root') else 'paused' if self.config.get('sync_paused') else 'ready',
                      'message': 'Sync paused. Click Sync now when ready.' if self.config.get('sync_paused') else ''}
         self.collections = []
@@ -359,7 +361,7 @@ class Worker:
         from .sorting.core_logic import DOCUMENT_TYPE_LABELS
         from .zotero_tagging import keyword_warning
         config = {k: v for k, v in self.config.items() if k != "server_id"}
-        pending_reviews = self.review.rows(inbox_order=True)
+        pending_reviews, review_revision = self.review.rows(inbox_order=True, with_revision=True)
         folder_blocks = self.state.read('folder_blocks', {})
         blocked_tablet = set(folder_blocks.get('tablet', []))
         pending_reviews = [row for row in pending_reviews if row['kind'] != 'cloud'
@@ -396,7 +398,7 @@ class Worker:
             suspended = self.review.suspended_documents()
             waiting.update(source for identity, source in staged.items() if identity not in suspended)
         return {"config": config, "status": status, "last_sync_at": self.state.read("last_sync_at"),
-                "reviews": pending_reviews, "review_guidance": review_guidance,
+                "reviews": pending_reviews, "review_guidance": review_guidance, "review_revision": review_revision,
                 "linked_original_matches": self.state.read("linked_original_matches", []),
                 "deletions": self.review.deletions(), "local_deletions": self.review.local_deletions(), "types": DOCUMENT_TYPE_LABELS,
                 "collections": self.collections, "mappings": self.state.read("folders", {}),
@@ -1085,10 +1087,16 @@ class Worker:
                                     'checked_at': now()},
                 'naming_signature': self._naming_signature()}
 
-    def _offer(self, kind, identity, path, *, metadata=None, **extra):
+    def _offer(self, kind, identity, path, *, metadata=None, file_evidence=None, **extra):
         """Queue settled content, or signal a later check for a changing file."""
         from .inbox import _complete_document, file_signature
-        if not self.review.observe_ready(kind + ":" + identity, file_signature(path)):
+        old = self.review.row(fingerprint([kind, identity])[:24])
+        if self.background_check and old and old['status'] == 'applying':
+            return  # A foreground filing owns its recovery journal.
+        observed_file = file_signature(path)
+        if file_evidence is not None and file_evidence != observed_file:
+            return 'settling'
+        if not self.review.observe_ready(kind + ":" + identity, observed_file):
             return 'settling'
         if not _complete_document(path):
             if kind == 'zotero':
@@ -1096,9 +1104,6 @@ class Worker:
             return
         from .zotero_bulk import INTAKE_DOI_VERSION, intake_pdf_doi, observed_digest
         digest = observed_digest(path, self.file_digests)
-        if kind == 'inbox':
-            self.review.supersede_inbox(path, identity)
-        old = self.review.row(fingerprint([kind, identity])[:24])
         intake_pdf = kind == 'inbox' and path.suffix.lower() == '.pdf'
         signature = citation_signature(metadata)
         same_pending_source = (old and old['status'] == 'pending'
@@ -1130,7 +1135,10 @@ class Worker:
             elif old['payload'].get('previous_proposal'):
                 payload['previous_proposal'] = old['payload']['previous_proposal']
         payload["review_token"] = fingerprint(payload)
-        self.review.offer(kind, identity, digest, payload)
+        if file_signature(path) != observed_file:
+            return 'settling'
+        if self.review.offer(kind, identity, digest, payload, expected=old) is None:
+            return 'settling'
 
     def _add_intake_matches(self, rows):
         from .zotero_bulk import intake_pdf_suggestions
@@ -1155,9 +1163,10 @@ class Worker:
                 self.review.retire_missing_inbox(paths)
                 for path in paths:
                     try:
-                        identity = str(path.resolve()) + '|' + fingerprint(file_signature(path))[:16]
-                        self.review.supersede_inbox(path, identity)
-                        self._offer('inbox', identity, path)
+                        signature = file_signature(path)
+                        identity = str(path.resolve()) + '|' + fingerprint(signature)[:16]
+                        if self.review.supersede_inbox(path, identity, signature):
+                            self._offer('inbox', identity, path, file_evidence=signature)
                     except (OSError, ValueError, PilotError) as error:
                         issues.append({'cloud': '', 'title': path.name, 'reason': f'Could not check this intake paper: {error}'})
         return issues
@@ -1181,7 +1190,8 @@ class Worker:
                 client.close()
         if catalog:
             self.catalog_issues.extend(issues)
-        return {**self.status(), 'inbox_issues': issues, 'native_files_settling': native_files_settling}
+        return {**self.status(), 'inbox_issues': issues, 'native_files_settling': native_files_settling,
+                'review_retirement_deferred': self.review_retirement_deferred}
 
     def _native_pdf_matches(self, catalog):
         """Current, unmanaged originals only; cached review matches are not evidence."""
@@ -1221,6 +1231,7 @@ class Worker:
 
     def _catalog_local(self, client, *, local=False):
         from .zotero_bulk import doi_key, references_by_doi
+        observed_references = self.review.reference_rows()
         native = client.review_action("catalog")
         documents = self.state.read("documents", {})
         excluded = connections.exclusions(self.directory, self.config)
@@ -1301,7 +1312,14 @@ class Worker:
                     references[key]['intake_doi'] = doi
             if pdf_state == 'preparing' and len(pdf_keys) == 1:
                 references[key]['preparing_attachment'] = pdf_keys[0]
-        self.review.reconcile_references(references)
+        # A link can appear while a catalog is being inspected. Recheck
+        # discovery for changed ownership and withhold newly managed references.
+        latest_documents = self.state.read('documents', {})
+        latest_linked_parents = {row.get('parent') for row in latest_documents.values()} | excluded['parents']
+        files_settling |= latest_linked_parents != linked_parents
+        files_settling |= self.review.reconcile_references(
+            {key: payload for key, payload in references.items() if key not in latest_linked_parents},
+            observed_references)
         return {**native, 'files_settling': files_settling, 'collections': collections}
 
     def _catalog(self, client, cloud):
@@ -1387,13 +1405,14 @@ class Worker:
                         self.review.reopen(previous['id'], digest, payload, applying=interrupted_changed)
                     self.review.offer("cloud", item.id, digest, payload)
         for row in self.review.rows():
-            if row["kind"] in {"zotero", "inbox"} and row["payload"]["path"].lower().endswith(".pdf"):
+            if (row["kind"] in {"zotero", "inbox"} and row['status'] == 'pending'
+                    and row["payload"]["path"].lower().endswith(".pdf")):
                 from .zotero_bulk import title_key
                 name = title_key(Path(row["payload"]["path"]).stem)
                 payload = {**row["payload"], "matches": [r for r in candidates if r["digest"] == row["digest"]],
                            "possible_tablet_matches": [r["title"] for r in candidates if r["digest"] != row["digest"]
                                                        and name == title_key(Path(r["title"]).stem)]}
-                self.review.offer(row["kind"], row["identity"], row["digest"], payload)
+                self.review.offer(row["kind"], row["identity"], row["digest"], payload, expected=row)
         for identity, link in documents.items():
             if identity in held_papers:
                 continue  # A folder change is not evidence of an individual paper deletion.
@@ -1457,13 +1476,15 @@ class Worker:
                 self.review.retire_conflict(identity)
         return native
 
-    def refresh_review_policy(self, client, catalog=None, *, rows=None, cancelled=None):
+    def refresh_review_policy(self, client, catalog=None, *, rows=None, cancelled=None, expected=None):
         from .zotero_bulk import review_policy
         rows = self.review.rows() if rows is None else rows
+        expected = {row['id']: row for row in rows} if expected is None else expected
         rows = [row for row in rows if row['kind'] != 'reference']
         rows = [{**row, 'payload': review_policy_payload(row)} if row['status'] != 'applying' else row for row in rows]
         catalog = client.review_action("catalog") if catalog is None else catalog
         native_matches = self._native_pdf_matches(catalog) if any(row['kind'] == 'cloud' and row['status'] == 'pending' for row in rows) else {}
+        skipped = []
         for row in rows:
             if row['kind'] == 'cloud' and row['status'] == 'pending':
                 row['payload'] = {**row['payload'], 'matches': native_matches.get(row['digest'], [])}
@@ -1501,7 +1522,9 @@ class Worker:
                 parent = catalog.get('parents', {}).get(payload.get('parent'), {})
                 payload['source_collections'] = parent.get('collections', [])
             payload["review_token"] = fingerprint({k: v for k, v in payload.items() if k != "review_token"})
-            self.review.offer(row["kind"], row["identity"], row["digest"], payload)
+            if self.review.offer(row["kind"], row["identity"], row["digest"], payload, expected=expected[row['id']]) is None:
+                skipped.append(row['id'])
+        return skipped
 
     @staticmethod
     def _review_repair_references(row, catalog):
@@ -1603,12 +1626,14 @@ class Worker:
         records = {entry['data']['key']: entry['data'] for entry in catalog['attachments'] if not entry['data'].get('deleted')}
         pdf_states = self._unchecked_pdf_states(catalog)
         changed = []
+        expected = {}
         for row in self.review.rows():
             if row['kind'] != 'zotero' or row['status'] != 'pending':
                 continue
             if not local and self.stop.is_set():
                 raise InterruptedError('Sync stopped')
             key = row['identity']
+            expected[row['id']] = row
             record = records.get(key)
             if record:
                 parent = record.get('parentItem')
@@ -1618,8 +1643,11 @@ class Worker:
                     except (AuthorizationRequired, TransportInterrupted):
                         raise
                     except (OSError, PilotError) as error:
-                        self.catalog_issues.append({'cloud': '', 'attachment': key,
-                            'title': row['payload'].get('title', 'Saved Zotero attachment'), 'reason': str(error)})
+                        if self.background_check and isinstance(error, PilotBusy):
+                            self.review_retirement_deferred = True
+                        else:
+                            self.catalog_issues.append({'cloud': '', 'attachment': key,
+                                'title': row['payload'].get('title', 'Saved Zotero attachment'), 'reason': str(error)})
                     continue
                 if key in managed or 'Notable pilot:' in record.get('note', ''):
                     source_checks[key] = ('managed', MANAGED_INBOX_SOURCE)
@@ -1642,13 +1670,17 @@ class Worker:
                     raise
                 except (OSError, PilotError) as error:
                     # Keep the saved row when ownership or native evidence changed mid-check.
-                    self.catalog_issues.append({'cloud': '', 'attachment': row['identity'],
-                        'title': row['payload'].get('title', 'Saved Zotero attachment'), 'reason': str(error)})
+                    if self.background_check and isinstance(error, PilotBusy):
+                        self.review_retirement_deferred = True
+                    else:
+                        self.catalog_issues.append({'cloud': '', 'attachment': row['identity'],
+                            'title': row['payload'].get('title', 'Saved Zotero attachment'), 'reason': str(error)})
                 continue
             if any(row['payload'].get(field) != value for field, value in evidence.items()):
                 changed.append({**row, 'payload': {**row['payload'], **evidence}})
         if changed:
-            self.refresh_review_policy(client, catalog, rows=changed, cancelled=(lambda: False) if local else None)
+            self.refresh_review_policy(client, catalog, rows=changed, expected=expected,
+                                       cancelled=(lambda: False) if local else None)
 
     def recheck_review(self, identity='', identities=None):
         """Recheck saved reviews against local Zotero/files, without a sync.
@@ -1676,10 +1708,11 @@ class Worker:
             rows = [row for row in rows if row['id'] in selected]
             if {row['id'] for row in rows} != selected:
                 raise PilotError('This case changed. Open its current items before rechecking.')
-        before = {row['id']: (row['digest'], row['payload'], row['status']) for row in rows}
+        before = {row['id']: row.copy() for row in rows}
         pending = [row for row in rows if row['status'] == 'pending' and row['kind'] in PAPER_REVIEW_KINDS]
         summary = {'checked_at': time.time(), 'checked': 0, 'checked_ids': [], 'changed_ids': [],
-                   'unavailable_ids': [], 'resolved_ids': [], 'preserved_applying': sum(row['status'] == 'applying' for row in rows),
+                   'unavailable_ids': [], 'resolved_ids': [], 'retry_ids': [],
+                   'preserved_applying': sum(row['status'] == 'applying' for row in rows),
                    'skipped_conflicts': sum(row['status'] == 'pending' and row['kind'] == 'conflict' for row in rows),
                    'cloud_checked': False}
         if not pending:
@@ -1770,20 +1803,36 @@ class Worker:
                     payload['local_recheck_error'] = str(error)
                 row['payload'] = payload
             for row in retire_candidates:
-                self._resolve_trashed_source_review(client, row)
-                summary['resolved_ids'].append(row['id'])
-            active = [row for row in pending if row['id'] not in summary['resolved_ids']]
+                try:
+                    self._resolve_trashed_source_review(client, row)
+                except (AuthorizationRequired, TransportInterrupted):
+                    raise
+                except PilotBusy:
+                    if not self.background_check:
+                        raise
+                    self.review_retirement_deferred = True
+                    summary['retry_ids'].append(row['id'])
+                except PilotError:
+                    if not self.background_check:
+                        raise
+                    summary['retry_ids'].append(row['id'])
+                else:
+                    summary['resolved_ids'].append(row['id'])
+            retiring = {row['id'] for row in retire_candidates}
+            active = [row for row in pending if row['id'] not in retiring]
             if active:
-                self.refresh_review_policy(client, catalog, rows=active)
+                summary['retry_ids'].extend(self.refresh_review_policy(client, catalog, rows=active, expected=before))
             self.collections = collections
             for row in pending:
+                if row['id'] in summary['retry_ids']:
+                    continue
                 saved = self.review.row(row['id'])
                 summary['checked_ids'].append(row['id'])
-                if (saved['digest'], saved['payload'], saved['status']) != before[row['id']]:
+                if saved != before[row['id']]:
                     summary['changed_ids'].append(row['id'])
                 if saved['status'] == 'pending' and saved['payload'].get('local_recheck_error'):
                     summary['unavailable_ids'].append(row['id'])
-            summary['checked'] = len(pending)
+            summary['checked'] = len(summary['checked_ids'])
             self.review_recheck = summary
             return {**self.status(), 'review_recheck': summary}
         finally:
@@ -1841,9 +1890,8 @@ class Worker:
         row = self.review.row(identity)
         if not row or row['kind'] != 'reference' or row['digest'] != digest:
             raise PilotError('This reference changed. Check its current Inbox entry.')
-        if row['status'] != 'ignored':
-            self.review.dismiss(identity, digest)
-        return {'dismissed_review': identity}
+        revision = self.review.revision() if row['status'] == 'ignored' else self.review.dismiss(identity, digest)
+        return {'dismissed_review': identity, 'review_revision': revision}
 
     def confirm_folder_change(self, issue, choice='keep', zotero_plan=None):
         """Resolve the exact live folder pair the user reviewed."""
@@ -2025,7 +2073,7 @@ class Worker:
                      "message": f"Filing paused: {completed} filed; {remaining} remaining." if self.stop.is_set() else f"Filed {completed} papers together; {held} held for review. Sync transfers approved papers."}
         return self.status()
 
-    def sync(self, automatic=False, verify=False):
+    def sync(self, automatic=False, verify=False, monitor_inbox=True):
         if not self.config.get("tablet_root"):
             return self.status()
         if self.pause_pending.is_set():
@@ -2053,7 +2101,7 @@ class Worker:
             progress(message)
             self.sync_checkpoint()
             now = time.monotonic()
-            if not self.config.get('inbox') or now < next_intake_check or self.stop.is_set():
+            if not monitor_inbox or not self.config.get('inbox') or now < next_intake_check or self.stop.is_set():
                 return
             next_intake_check = now + 15
             # Use the sync worker between steps so Inbox continues to discover
@@ -2341,7 +2389,7 @@ class Worker:
                     raise PilotError("The Zotero citation changed during review. Sync to refresh it before filing.")
                 if row["status"] == "applying" and source_reference.get("title") not in {row["payload"].get("title"), title}:
                     raise PilotError("The reference title changed while filing was interrupted. Review it before retrying.")
-            self.review.begin(identity, digest, approval)
+            self.review.begin(identity, digest, approval, expected=row)
             if not reference:
                 details = row["payload"]["details"]
                 metadata = {"key": parent, "itemType": TYPE_MAP.get(document_type, "document"),
@@ -3334,6 +3382,19 @@ class Worker:
             self._begin_operation()
         return getattr(self, method)(**params)
 
+    def local_check(self, method, params):
+        """Only scan local evidence and save review rows or previews in this process."""
+        self.background_check = True
+        if method == 'maintenance' and params == {'action': 'names'}:
+            return self.maintenance(**params)
+        if method == 'check_inbox':
+            checked = self.recheck_review()
+            return {**self.scan_inbox(**params), 'review_recheck': checked['review_recheck']}
+        if method in {'scan_inbox', 'recheck_review', 'paper_tag_candidates', 'suggest_paper_tags',
+                      'preview_filename_cleanup', 'preview_keyword_cleanup', 'scan_library'}:
+            return getattr(self, method)(**params)
+        raise PilotError('Unsupported local check.')
+
     def maintenance(self, action, **params):
         from . import zotero_maintenance as maintenance
         from . import zotero_state_backup as backup
@@ -3409,14 +3470,16 @@ def main(argv=None, *, worker_factory=Worker):
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--port", type=int, default=23119)
     parser.add_argument("--debug-stacks", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument('--keyword-recheck', action='store_true', help=argparse.SUPPRESS)
+    side_process = parser.add_mutually_exclusive_group()
+    side_process.add_argument('--keyword-recheck', action='store_true', help=argparse.SUPPRESS)
+    side_process.add_argument('--local-check', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     # Gecko sends UTF-8 JSON. The console code page must not reinterpret titles,
     # user-entered tags or filenames arriving through the private stdin pipe.
     if hasattr(sys.stdin, 'reconfigure'):
         sys.stdin.reconfigure(encoding='utf-8')
-    if args.keyword_recheck:
-        return _serve_keyword_recheck(args, worker_factory)
+    if args.keyword_recheck or args.local_check:
+        return _serve_local_check(args, worker_factory)
     if args.debug_stacks:
         args.state.mkdir(parents=True, exist_ok=True)
     diagnostics = (_periodic_stack_diagnostics(args.state / 'test-worker-stack.log')
@@ -3436,7 +3499,7 @@ def _transport_logging():
 
 
 @_transport_logging()
-def _serve_keyword_recheck(args, worker_factory):
+def _serve_local_check(args, worker_factory):
     import pymupdf
 
     transport = sys.stdout
@@ -3446,10 +3509,21 @@ def _serve_keyword_recheck(args, worker_factory):
         with redirect_stdout(sys.stderr):
             request = json.loads(sys.stdin.readline())
             worker = worker_factory(args.state, args.port, recover_pause=False)
-            result = worker.check_local_keywords(**request)
+            if args.keyword_recheck:
+                result = worker.check_local_keywords(**request)
+            else:
+                worker.progress = lambda detail: write_packet(transport, {'progress': detail})
+                result = worker.local_check(**request)
+                if request['method'] == 'scan_library':
+                    result = {'bulk': result['bulk']}
+                elif 'reviews' in result:
+                    result = {key: result[key] for key in ('reviews', 'review_guidance', 'review_revision',
+                              'review_recheck', 'inbox_issues', 'native_files_settling') if key in result}
+                    result['review_retirement_deferred'] = worker.review_retirement_deferred
         write_packet(transport, {'result': result})
     except Exception as error:
-        message = str(error) if isinstance(error, PilotError) else 'The local keyword recheck could not finish. Try again.'
+        action = 'keyword recheck' if args.keyword_recheck else 'check'
+        message = str(error) if isinstance(error, PilotError) else f'The local {action} could not finish. Try again.'
         write_packet(transport, {'error': message})
 
 

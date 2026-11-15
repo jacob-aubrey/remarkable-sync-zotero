@@ -217,7 +217,7 @@ var NotableUI = {
     // and finish its child before replacement can create another writer.
     if (this.launching) { try { await this.launching; } catch (_) {} }
     if (this.process) await this.closeProcess(this.process, true, 'plugin_shutdown');
-    if (this.keywordProcess) await this.keywordProcess.kill().catch(() => {});
+    await Promise.all([...(this.localProcesses || [])].map(process => process.kill().catch(() => {})));
     for (const value of this.pending.values()) { clearTimeout(value.timer); value.reject(new Error(this.shortName + ' stopped')); }
     this.pending.clear();
     if (Zotero.Notable === this) delete Zotero.Notable;
@@ -419,40 +419,166 @@ var NotableUI = {
     }
   },
   async refresh() {
-    this.latest = await this.rpc('status'); this.refreshCollectionNames(); this.badge(); return this.latest;
+    this.adoptStatus(await this.rpc('status')); this.refreshCollectionNames(); this.badge(); return this.latest;
   },
-  async readKeywordReply(params) {
+  async readLocalReply(mode, request, progress = () => {}) {
     if (!this.helperLaunch && this.launching) await this.launching;
     if (this.stopped) throw Error(this.shortName + ' is closed.');
     const {Subprocess} = ChromeUtils.importESModule('resource://gre/modules/Subprocess.sys.mjs');
     const options = this.helperLaunch;
-    if (!options) throw Error('Wait for the sync helper to start, then recheck.');
-    const process = await Subprocess.call({...options, arguments: [...options.arguments, '--keyword-recheck']});
-    this.keywordProcess = process;
-    let timer, exited = false;
+    if (!options) throw Error('Wait for the sync helper to start, then try again.');
+    const keyword = mode === '--keyword-recheck';
+    const process = await Subprocess.call({...options, arguments: [...options.arguments, mode]});
+    (this.localProcesses ||= new Set()).add(process);
+    let timer, rejectDeadline, exited = false;
+    const deadline = new Promise((_, reject) => { rejectDeadline = reject; });
+    const resetDeadline = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => rejectDeadline(Error('The local check stopped responding. Try again.')),
+        keyword ? 120000 : 600000);
+    };
+    resetDeadline();
     const reply = async () => {
-      await process.stdin.write(JSON.stringify(params) + '\n');
+      await process.stdin.write(JSON.stringify(request) + '\n');
       await process.stdin.close();
-      let output = '';
-      for (let chunk; (chunk = await process.stdout.readString());) output += chunk;
+      let output = '', packet;
+      for (let chunk; (chunk = await process.stdout.readString());) {
+        output += chunk;
+        for (let end; (end = output.indexOf('\n')) >= 0;) {
+          const line = JSON.parse(output.slice(0, end));
+          output = output.slice(end + 1);
+          if (line.progress) { resetDeadline(); progress(line.progress); }
+          else packet = line;
+        }
+      }
       const {exitCode} = await process.wait();
       exited = true;
-      if (exitCode || !output) throw Error('The local keyword helper closed before finishing. Try again.');
-      const packet = JSON.parse(output);
+      if (exitCode || !packet) throw Error('The local helper closed before finishing. Try again.');
       if (packet.error) throw Error(packet.error);
       return packet.result;
     };
     try {
       if (this.stopped) throw Error(this.shortName + ' is closed.');
       (async () => { while (await process.stderr.readString()) {} })().catch(() => {});
-      return await Promise.race([reply(), new Promise((_, reject) => {
-        timer = setTimeout(() => reject(Error('The local keyword recheck timed out. Try again.')), 120000);
-      })]);
+      return await Promise.race([reply(), deadline]);
     } finally {
       clearTimeout(timer);
-      if (!exited && this.keywordProcess === process) await process.kill().catch(() => {});
-      if (this.keywordProcess === process) this.keywordProcess = null;
+      if (!exited) await process.kill().catch(() => {});
+      this.localProcesses.delete(process);
     }
+  },
+  readKeywordReply(params) { return this.readLocalReply('--keyword-recheck', params); },
+  canCheckDuringSync() {
+    return this.operation?.method === 'sync' && !!(this.helperLaunch || this.launching);
+  },
+  reviewSnapshot(result) {
+    let reviews = result.reviews;
+    if (reviews && this.inboxDismissals?.size) {
+      for (const [id, revision] of this.inboxDismissals) {
+        if (result.review_revision >= revision) this.inboxDismissals.delete(id);
+      }
+      reviews = reviews.filter(row => !this.inboxDismissals.has(row.id));
+    }
+    return {reviews, review_guidance: result.review_guidance, review_revision: result.review_revision};
+  },
+  adoptStatus(result, syncing = false) {
+    const current = this.latest;
+    const sameConnection = current?.config?.connection_id === result.config?.connection_id
+      && current?.config?.zotero_root === result.config?.zotero_root
+      && current?.config?.tablet_root === result.config?.tablet_root;
+    if (sameConnection && (current?.review_revision ?? -1) > (result.review_revision ?? -1)) {
+      Object.assign(result, this.reviewSnapshot(current));
+    } else if (sameConnection && result.reviews) {
+      Object.assign(result, this.reviewSnapshot(result));
+    }
+    if (syncing && sameConnection && this.localBulkPlan) result.bulk = this.localBulkPlan;
+    this.latest = result;
+  },
+  async checkDuringSync(method, params, {render = false, quiet = false} = {}) {
+    const reviews = ['check_inbox', 'scan_inbox', 'recheck_review'].includes(method);
+    const group = reviews ? 'reviews' : method;
+    const signature = JSON.stringify([method, params]);
+    const jobs = this.localCheckJobs ||= new Map();
+    while (jobs.has(group)) {
+      const running = jobs.get(group);
+      if (running.signature === signature) return running.result;
+      await running.result.catch(() => {});
+    }
+    if (this.stopped) return;
+    const connection = this.filingConnection(), reviewChangeSerial = this.reviewChangeSerial || 0;
+    const job = {signature};
+    jobs.set(group, job);
+    if (params.discover) this.zoteroInboxDirty = false;
+    if (method === 'check_inbox' || method === 'scan_inbox') {
+      if (this.latest.config.inbox) this.lastInboxFolderCheck = Date.now();
+    }
+    if (!quiet) {
+      job.activity = {
+        check_inbox: 'Checking Inbox…', recheck_review: 'Rechecking Zotero…',
+        preview_filename_cleanup: 'Checking linked filenames…', preview_keyword_cleanup: 'Checking automatic tags…',
+        paper_tag_candidates: 'Finding papers…', maintenance: 'Checking paper names…',
+        scan_library: 'Scanning your Windows folder…',
+      }[method];
+      this.refreshLocalCheckActivity();
+    }
+    const inboxBefore = method === 'check_inbox' && !quiet ? this.inboxRows() : null;
+    job.result = (async () => {
+      try {
+        const result = await this.readLocalReply('--local-check', {method, params}, detail => {
+          if (!quiet && method === 'scan_library') { job.activity = detail; this.refreshLocalCheckActivity(); }
+        });
+        if (this.stopped || connection !== this.filingConnection()) return;
+        if (method === 'scan_library') this.latest.bulk = this.localBulkPlan = result.bulk;
+        this.reviewRetirementPending ||= !!result.review_retirement_deferred;
+        let changed = false;
+        const displayRevision = this.latest.review_revision ?? -1;
+        if (reviews && result.review_revision >= displayRevision) {
+          if (result.review_revision > displayRevision) {
+            const snapshot = this.reviewSnapshot(result);
+            changed = JSON.stringify(this.latest.reviews) !== JSON.stringify(snapshot.reviews);
+            Object.assign(this.latest, snapshot);
+          }
+          if (result.review_recheck) {
+            this.reviewRecheck = result.review_recheck;
+            if (reviewChangeSerial === (this.reviewChangeSerial || 0)) {
+              this.reviewStale = !!result.review_recheck.retry_ids?.length;
+            }
+          }
+          this.badge();
+        }
+        if (method === 'check_inbox' || method === 'scan_inbox') {
+          if (params.discover) {
+            this.lastZoteroInboxCheck = Date.now();
+            this.zoteroInboxDirty ||= !!result.native_files_settling;
+          }
+          if (this.latest.config.inbox) this.lastInboxFolderCheck = Date.now();
+          if (method === 'check_inbox') this.lastInboxRecheck = Date.now();
+        }
+        if ((render || (changed && ['review', 'inbox', 'library', 'sync-review'].includes(this.tab)))
+            && this.view && !this.view.closed) {
+          if (this.acquiringPDF || this.view.document.querySelector?.('dialog[open]')) this.inboxRenderPending = true;
+          else this.render();
+        }
+        if (inboxBefore) {
+          this.message(result.inbox_issues?.length ? 'Couldn’t finish checking Inbox. Try again.' : this.inboxCheckResult(inboxBefore),
+            !!result.inbox_issues?.length);
+        }
+        return result;
+      } catch (error) {
+        if (params.discover) this.zoteroInboxDirty = true;
+        throw error;
+      } finally {
+        jobs.delete(group);
+        this.refreshLocalCheckActivity();
+      }
+    })();
+    return job.result;
+  },
+  refreshLocalCheckActivity() {
+    const node = this.view?.document?.getElementById('notable-local-check-activity');
+    if (!node || this.view.closed) return;
+    node.textContent = [...(this.localCheckJobs?.values() || [])].map(job => job.activity).filter(Boolean).join(' · ');
+    node.hidden = !node.textContent;
   },
   async recheckKeywordsDuringSync(params, render) {
     if (this.keywordTask) {
@@ -519,7 +645,7 @@ var NotableUI = {
     if (!legacy.length || this.stopped) { this.reviewUpgrade = null; return; }
     if (this.reviewUpgradePromise) return this.reviewUpgradePromise;
     if (this.reviewUpgrade?.state === 'failed' && !retry) return;
-    if (this.busy) {
+    if (this.busy && !this.canCheckDuringSync()) {
       this.reviewUpgrade = {state: 'waiting', count: legacy.length}; this.reviewUpgradeWaiting = true; return;
     }
     this.reviewUpgrade = {state: 'loading', count: legacy.length};
@@ -755,19 +881,26 @@ var NotableUI = {
     }, 3000);
   },
   async checkInbox() {
-    if (this.stopped || this.busy || this.inboxChecking || this.paperTagChecking || this.pausing || this.changingFolder
+    const background = this.canCheckDuringSync();
+    if (this.stopped || (this.busy && !background) || this.inboxChecking || this.localCheckJobs?.has('reviews')
+      || (!background && this.paperTagChecking && !this.paperTagBackground) || this.pausing || this.changingFolder
       || this.drainingFilings || this.setupDirty || this.acquiringPDF || !(this.latest?.config?.inbox || this.latest?.config?.tablet_root)) return;
-    if (this.view?.document?.querySelector?.('dialog[open]')) return;
+    if (!background && this.view?.document?.querySelector?.('dialog[open]')) return;
     const now = Date.now();
     const interval = 300000;
     this.lastInboxRecheck ??= now;
-    const full = now - this.lastInboxRecheck >= interval;
+    const full = now - this.lastInboxRecheck >= interval || (!background && this.reviewRetirementPending);
     // A file can finish downloading without an item notification. Keep a
     // periodic fallback, but avoid rebuilding the Zotero catalog on idle ticks.
     const discover = !!this.latest.config.tablet_root
       && (this.zoteroInboxDirty !== false || now - (this.lastZoteroInboxCheck || 0) >= 300000);
     const scanFolder = !!this.latest.config.inbox && now - (this.lastInboxFolderCheck || 0) >= 15000;
     if (!full && !discover && !scanFolder) return;
+    if (background) {
+      try { await this.checkDuringSync(full ? 'check_inbox' : 'scan_inbox', {discover}, {quiet: true}); }
+      catch (_) {} // Retried on a later Inbox tick.
+      return;
+    }
     if (this.latest.config.inbox) this.lastInboxFolderCheck = now;
     this.inboxChecking = true;
     this.busy = true;
@@ -778,12 +911,13 @@ var NotableUI = {
       this.inboxRequest = full ? this.refreshInbox() : this.rpc('scan_inbox', {discover});
       const result = await this.inboxRequest;
       if (this.stopped) return;
+      if (full) this.reviewRetirementPending = false;
       if (discover) {
         this.lastZoteroInboxCheck = Date.now();
         if (result.native_files_settling) this.zoteroInboxDirty = true;
       }
       changed = JSON.stringify(this.latest?.reviews) !== JSON.stringify(result.reviews);
-      this.latest = result;
+      this.adoptStatus(result);
       if (result.review_recheck) this.reviewRecheck = result.review_recheck;
       this.refreshCollectionNames();
       this.badge();
@@ -822,7 +956,7 @@ var NotableUI = {
     this.timer = timer;
   },
   automaticAllowed() {
-    return !this.stopped && !this.busy && !this.paperTagChecking && !this.acquiringPDF && !this.drainingFilings
+    return !this.stopped && !this.busy && (!this.paperTagChecking || this.paperTagBackground) && !this.acquiringPDF && !this.drainingFilings
       && (!this.filingQueue.length || this.filingQueuePaused) && !this.drainingTagEdits
       && (!this.tagEdits.length || this.tagEditError) && !this.afterSync.length && !this.drainingAfterSync
       && !this.drainingSyncDecisions && !this.syncDecisions.some(job => !job.error) && this.canSync()
@@ -854,7 +988,7 @@ var NotableUI = {
     if (this.latest?.config) this.latest.config.sync_paused = true;
     this.disable(this.busy); this.badge();
     try {
-      this.latest = await this.rpc('pause_sync'); this.badge();
+      this.adoptStatus(await this.rpc('pause_sync')); this.badge();
       if (this.view && !this.view.closed) this.render();
     } catch (error) { this.message(error.message, true); throw error; }
     finally {
@@ -948,10 +1082,20 @@ var NotableUI = {
     }
   },
   async action(method, params = {}, render = true) {
-    if (method === 'recheck_keyword_warnings' && this.operation?.method === 'sync' && (this.helperLaunch || this.launching)) {
-      return this.recheckKeywordsDuringSync(params, render);
+    if (this.canCheckDuringSync()) {
+      if (method === 'recheck_keyword_warnings') return this.recheckKeywordsDuringSync(params, render);
+      if (method === 'check_inbox') {
+        const discover = !!this.latest.config.tablet_root;
+        return this.checkDuringSync(method, {discover}, {render});
+      }
+      if (['recheck_review', 'preview_filename_cleanup', 'preview_keyword_cleanup', 'paper_tag_candidates', 'scan_library'].includes(method)
+          || (method === 'maintenance' && params.action === 'names' && Object.keys(params).length === 1)) {
+        return this.checkDuringSync(method, params, {render});
+      }
     }
-    if (this.paperTagChecking) { try { await this.paperTagRequest; } catch (_) {} }
+    if (this.paperTagChecking && (!this.paperTagBackground || method === 'save_paper_tags')) {
+      try { await this.paperTagRequest; } catch (_) {}
+    }
     if (this.inboxChecking) { try { await this.inboxRequest; } catch (_) {} }
     const syncing = method === 'sync';
     if (syncing && (params.automatic ? !this.automaticAllowed() : !this.canSync())) return;
@@ -962,6 +1106,18 @@ var NotableUI = {
     if (this.busy) {
       if (!syncing && this.operation?.method === 'sync') return this.deferUntilAfterSync(method, params, render);
       return;
+    }
+    if (['scan_library', 'import_library', 'retry_bulk'].includes(method)) {
+      const scan = this.localCheckJobs?.get('scan_library');
+      if (scan) { await scan.result.catch(() => {}); return this.action(method, params, render); }
+      this.localBulkPlan = null;
+    }
+    if (['connect', 'configure', 'disconnect_folder'].includes(method) || (method === 'maintenance' && params.action === 'restore')) {
+      const checks = [...(this.localCheckJobs?.values() || [])];
+      if (checks.length) {
+        await Promise.allSettled(checks.map(check => check.result));
+        return this.action(method, params, render);
+      }
     }
     clearTimeout(this.timer);
     this.timer = null;
@@ -992,8 +1148,9 @@ var NotableUI = {
       const previousSyncFailure = this.syncFailure;
       const connection = this.filingConnection();
       const previousInbox = checkingInbox ? this.inboxRows() : null;
-      const result = checkingInbox ? await this.refreshInbox() : await this.rpc(method, params);
-      this.latest = result.reviews ? result : await this.rpc('status');
+      const result = checkingInbox ? await this.refreshInbox()
+        : await this.rpc(method, syncing && (this.helperLaunch || this.launching) ? {...params, monitor_inbox: false} : params);
+      this.adoptStatus(result.reviews ? result : await this.rpc('status'), syncing);
       if (result.intake_attachment) {
         const {reference, key} = result.intake_attachment;
         if (this.inboxReferenceSelection?.id === reference) this.inboxReferenceSelection.attachment = key;
@@ -1009,9 +1166,12 @@ var NotableUI = {
       this.refreshCollectionNames();
       if (result.review_recheck) {
         this.reviewRecheck = result.review_recheck;
-        if (reviewChangeSerial === (this.reviewChangeSerial || 0)) this.reviewStale = false;
-      } else if (method === 'sync' && reviewChangeSerial === (this.reviewChangeSerial || 0)) this.reviewStale = false;
+        if (reviewChangeSerial === (this.reviewChangeSerial || 0)) this.reviewStale = !!result.review_recheck.retry_ids?.length;
+      } else if (method === 'sync' && !this.reviewRecheck?.retry_ids?.length
+          && reviewChangeSerial === (this.reviewChangeSerial || 0)) this.reviewStale = false;
       if (connection !== this.filingConnection()) {
+        this.localBulkPlan = null;
+        this.inboxDismissals?.clear();
         this.reviewDrafts.clear(); this.tagDrafts.clear(); this.linkDrafts.clear(); this.batchCollection = null; this.selected = null;
         this.tagEditor = null;
         this.inboxReferenceSelection = null;
@@ -2139,6 +2299,8 @@ var NotableUI = {
     this.el('p', '', root, {id: 'notable-after-sync', class: 'hint', role: 'status'});
     this.el('p', '', root, {id: 'notable-keyword-activity', class: 'hint', role: 'status'});
     this.refreshKeywordActivity();
+    this.el('p', '', root, {id: 'notable-local-check-activity', class: 'hint', role: 'status'});
+    this.refreshLocalCheckActivity();
     this.refreshAfterSync();
     this.el('div', '', root, {id: 'notable-tag-edits', 'aria-live': 'polite'});
     this.refreshTagEditQueue();
@@ -3473,6 +3635,9 @@ var NotableUI = {
       const result = await this.rpc('dismiss_reference', params);
       if (result?.dismissed_review !== row.id) throw Error('The worker could not confirm the Inbox dismissal. Try again.');
       if (this.stopped || this.filingConnection() !== connection) return;
+      if (Number.isInteger(result.review_revision) && result.review_revision > (this.latest.review_revision ?? -1)) {
+        (this.inboxDismissals ||= new Map()).set(row.id, result.review_revision);
+      }
       this.latest.reviews = this.latest.reviews.filter(review => review.id !== row.id);
       this.badge();
       if (['review', 'inbox'].includes(this.tab) && this.view && !this.view.closed) {
@@ -4441,16 +4606,19 @@ var NotableUI = {
   },
   async preparePaperTags() {
     if (this.stopped || !this.view || this.view.closed) return;
-    if (this.busy || this.inboxChecking || this.paperTagChecking || this.drainingFilings || this.pausing || this.changingFolder) {
+    const background = this.canCheckDuringSync();
+    if ((this.busy && !background) || this.inboxChecking || this.paperTagChecking || this.drainingFilings || this.pausing || this.changingFolder) {
       this.schedulePaperTags(); return;
     }
     const entry = [...(this.paperTagCache?.values() || [])].find(entry => entry.state === 'waiting'
       && [...entry.outputs].some(output => output.isConnected !== false));
     if (!entry) return;
     const notify = () => {for (const listener of [...entry.listeners]) listener();};
-    entry.state = 'loading'; this.paperTagChecking = true; notify();
+    entry.state = 'loading'; this.paperTagChecking = true; this.paperTagBackground = background; notify();
     try {
-      this.paperTagRequest = this.rpc('suggest_paper_tags', {...entry.scope, quiet: true});
+      const params = {...entry.scope, quiet: true};
+      this.paperTagRequest = background ? this.checkDuringSync('suggest_paper_tags', params, {quiet: true})
+        : this.rpc('suggest_paper_tags', params);
       const result = await this.paperTagRequest;
       if (this.stopped) return;
       if (!result?.proposal) throw Error('The paper suggestions were not returned.');
@@ -4459,7 +4627,7 @@ var NotableUI = {
       entry.draft.token = result.proposal.token;
       if (!entry.draft.dirty) entry.draft.selected = new Set(result.proposal.selected || []);
     } catch (error) {entry.state = 'failed'; entry.error = error.message;}
-    finally {this.paperTagChecking = false; notify(); this.schedulePaperTags();}
+    finally {this.paperTagChecking = false; this.paperTagBackground = false; notify(); this.schedulePaperTags();}
   },
   paperTagPanel(parent, scope) {
     const entry = this.paperTagEntry(scope), draft = entry.draft;

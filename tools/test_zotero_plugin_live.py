@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -101,6 +102,62 @@ async function startup({rootURI}) {
             ui.open();
             for (let i = 0; i < 100 && !ui.view?.document.querySelector('#app h1'); i++) await Zotero.Promise.delay(50);
             if (!ui.view?.document.querySelector('#app h1')) throw Error('The closed workspace could not be opened again.');
+          } else if (command.action === 'local_checks_during_sync') {
+            // Reload the synthetic paired-folder and ToSort settings.
+            await ui.closeProcess(ui.process, true, 'synthetic_fixture');
+            await ui.refresh();
+            if (!ui.helperLaunch || ui.busy) throw Error('The test needs an idle, initialized primary helper.');
+            const previousTags = ui.paperTagCache;
+            ui.operation = {method: 'sync', detail: 'Simulated long transfer', started: Date.now(), updated: Date.now()};
+            ui.busy = true;
+            try {
+              ui.zoteroInboxDirty = true;
+              await ui.checkInbox();
+              if (!ui.latest.reviews.some(row => row.kind === 'reference' && row.identity === command.reference)) {
+                throw Error('Automatic discovery did not update Inbox during sync.');
+              }
+              await Zotero.Promise.delay(2100);
+              const inbox = await ui.action('check_inbox', {}, false);
+              if (!inbox.reviews.some(row => row.kind === 'inbox' && row.payload.path.endsWith(command.inboxFile))) {
+                throw Error('Check Inbox did not find the new ToSort download during sync.');
+              }
+              const recheck = await ui.action('recheck_review', {}, false);
+              if (!recheck.review_recheck.checked_ids.some(id => inbox.reviews.some(row => row.id === id
+                  && row.kind === 'inbox' && row.payload.path.endsWith(command.inboxFile)))) {
+                throw Error('Recheck Zotero did not verify the new review during sync.');
+              }
+              for (const method of ['preview_filename_cleanup', 'preview_keyword_cleanup']) {
+                if (!Array.isArray((await ui.action(method, {}, false)).papers)) {
+                  throw Error(method + ' did not finish during sync.');
+                }
+              }
+              if (!Array.isArray((await ui.action('maintenance', {action: 'names'}, false)).matches)) {
+                throw Error('The name review did not finish during sync.');
+              }
+              const found = await ui.action('paper_tag_candidates', {query: command.paperTitle}, false);
+              if (!found.candidates.some(row => row.key === command.attachment)) {
+                throw Error('The paper finder did not finish during sync.');
+              }
+              ui.paperTagCache = new Map();
+              const tags = ui.paperTagEntry({key: command.attachment});
+              tags.outputs.add({isConnected: true});
+              await ui.preparePaperTags();
+              if (tags.state !== 'ready' || tags.proposal?.key !== command.attachment) {
+                throw Error('Automatic tag suggestions did not finish during sync. ' + (tags.error || ''));
+              }
+              const scan = await ui.action('scan_library', {root: command.sourceFolder, collection: command.collection, lookup: false}, false);
+              if (scan.bulk.rows.length !== 1 || ui.latest.bulk?.id !== scan.bulk.id || ui.operation?.method !== 'sync' || ui.afterSync.length) {
+                throw Error('The import folder scan did not finish during sync.');
+              }
+            } finally {
+              ui.paperTagCache = previousTags;
+              ui.busy = false;
+              ui.operation = null;
+            }
+            await ui.refresh();
+            if (!ui.latest.reviews.some(row => row.identity === command.reference) || !ui.latest.bulk?.rows.length) {
+              throw Error('The background results were lost when the primary helper refreshed.');
+            }
           } else if (command.action === 'preferences') {
             const pane = Zotero.PreferencePanes.pluginPanes.find(entry => entry.pluginID === ui.id);
             if (pane?.rawLabel !== ui.shortName) throw Error('reMarkable Sync settings entry is missing');
@@ -1910,7 +1967,8 @@ def maintenance_checks(client, root, checked):
     checked('packaged_plugin_backup_verifies_and_restores_paused_without_credentials')
     assert isinstance(rpc('timeline')['events'], list)
     checked('packaged_sync_timeline_uses_safe_event_labels')
-    state = Worker(root / 'profile/notable').state
+    worker = Worker(root / 'profile/notable')
+    state = worker.state
     links = state.read('documents', {})
     cloud = 'keyword-column-fixture'
     links[cloud] = {'parent': parent, 'view_key': indexed, 'revision': 'test-received', 'name': title,
@@ -1925,6 +1983,21 @@ def maintenance_checks(client, root, checked):
         links = state.read('documents', {})
         links.pop(cloud, None)
         state.write('documents', links)
+    inbox = root / 'ToSort'
+    inbox.mkdir()
+    inbox_file = 'Local Inbox discovery fixture.pdf'
+    shutil.copyfile(pdf_path, inbox / inbox_file)
+    source_folder = root / 'Folder scan fixture'
+    source_folder.mkdir()
+    shutil.copyfile(pdf_path, source_folder / 'Folder scan paper.pdf')
+    reference = 'LSCR2345'
+    client.create('item', {'key': reference, 'itemType': 'journalArticle', 'title': 'Unread local discovery fixture'})
+    worker.config.update(zotero_root='SYNC2345', tablet_root='smoke-tablet', inbox=str(inbox), sync_paused=True)
+    worker.save()
+    with state.lock():
+        command(root, 'local_checks_during_sync', reference=reference, inboxFile=inbox_file, paperTitle=title,
+                attachment=indexed, sourceFolder=str(source_folder), collection=worker.config['zotero_root'])
+    checked('packaged_inbox_review_previews_tag_suggestions_and_folder_scan_finish_during_sync')
 
 
 def main():
@@ -1952,7 +2025,6 @@ def main():
     profile, data, extension = (root / name for name in ['profile', 'zotero-data', 'test-extension'])
     for path in [profile / 'extensions', data, extension]: path.mkdir(parents=True, exist_ok=True)
     if args.existing_fixture:
-        import shutil
         prior = args.existing_fixture.resolve(strict=True)
         record = json.loads((prior / 'test-extension/config.json').read_text())
         if Path(record['data']).resolve() != prior / 'zotero-data' or not (prior / 'done').exists():
@@ -1967,7 +2039,6 @@ def main():
         'applications': {'zotero': {'id': test_id, 'strict_min_version': '10.0', 'strict_max_version': '10.*', 'update_url': 'https://example.invalid/updates.json'}}}), encoding='utf-8')
     (profile / 'extensions' / test_id).write_text(str(extension), encoding='utf-8')
     if args.xpi:
-        import shutil
         shutil.copyfile(args.xpi.resolve(strict=True), profile / 'extensions/notable-companion@local.invalid.xpi')
     else:
         build(profile / 'extensions/notable-companion@local.invalid.xpi', args.runtime)

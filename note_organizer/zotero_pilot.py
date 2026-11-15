@@ -24,6 +24,10 @@ class PilotError(RuntimeError):
     pass
 
 
+class PilotBusy(PilotError):
+    """Another operation owns the ledger's long-running operation lock."""
+
+
 class TransportInterrupted(PilotError):
     """A connection interruption is resumable, not a defective paper."""
     pass
@@ -153,7 +157,7 @@ class Ledger:
             db.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError:
             db.close()
-            raise PilotError("This pilot state directory is already in use.") from None
+            raise PilotBusy("This pilot state directory is already in use.") from None
         try:
             yield
         finally:
