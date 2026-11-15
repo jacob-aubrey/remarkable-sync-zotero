@@ -91,6 +91,14 @@ async function startup({rootURI}) {
             if (ui.syncWarnings().some(warning => warning.cloud === command.cloud && warning.kind === 'keywords')) {
               throw Error('The keyword check was lost when the primary helper refreshed.');
             }
+            const workspace = ui.view;
+            if (!workspace || workspace.closed) throw Error('The test needs an open workspace.');
+            ui.detach(win);
+            for (let i = 0; i < 40 && !workspace.closed; i++) await Zotero.Promise.delay(50);
+            if (!workspace.closed) throw Error('Closing the last library window did not close the workspace.');
+            ui.open();
+            for (let i = 0; i < 100 && !ui.view?.document.querySelector('#app h1'); i++) await Zotero.Promise.delay(50);
+            if (!ui.view?.document.querySelector('#app h1')) throw Error('The closed workspace could not be opened again.');
           } else if (command.action === 'preferences') {
             const pane = Zotero.PreferencePanes.pluginPanes.find(entry => entry.pluginID === ui.id);
             if (pane?.rawLabel !== ui.shortName) throw Error('reMarkable Sync settings entry is missing');
@@ -1864,19 +1872,6 @@ def maintenance_checks(client, root, checked):
         pdf.new_page().insert_text((40, 40), 'fixtureembedding')
         pdf.save(pdf_path)
     indexed = command(root, 'index_search_fixture', parent=parent, path=str(pdf_path))['attachment']
-    state = Worker(root / 'profile/notable').state
-    links = state.read('documents', {})
-    cloud = 'keyword-column-fixture'
-    links[cloud] = {'parent': parent, 'view_key': indexed, 'revision': 'test-received', 'name': title,
-                    'keyword_check': {'status': 'needs_text_recognition', 'title': title}}
-    state.write('documents', links)
-    try:
-        command(root, 'sync_column_and_keyword_recheck', paper=parent, cloud=cloud)
-        checked('native_status_column_and_packaged_keyword_recheck_during_simulated_sync')
-    finally:
-        links = state.read('documents', {})
-        links.pop(cloud, None)
-        state.write('documents', links)
     command(root, 'paper_search_ui', parent=parent, title=title, filename=filename, unread=unread, unreadTitle=unread_title)
     checked('native_paper_search_matches_citations_tags_notes_pdf_text_and_filenames')
     checked('native_read_and_unread_filter_use_the_exact_zotero_tag_and_refresh_after_edits')
@@ -1913,6 +1908,20 @@ def maintenance_checks(client, root, checked):
     checked('packaged_plugin_backup_verifies_and_restores_paused_without_credentials')
     assert isinstance(rpc('timeline')['events'], list)
     checked('packaged_sync_timeline_uses_safe_event_labels')
+    state = Worker(root / 'profile/notable').state
+    links = state.read('documents', {})
+    cloud = 'keyword-column-fixture'
+    links[cloud] = {'parent': parent, 'view_key': indexed, 'revision': 'test-received', 'name': title,
+                    'keyword_check': {'status': 'needs_text_recognition', 'title': title}}
+    state.write('documents', links)
+    try:
+        command(root, 'sync_column_and_keyword_recheck', paper=parent, cloud=cloud)
+        checked('native_status_column_and_packaged_keyword_recheck_during_simulated_sync')
+        checked('native_workspace_closes_with_last_library_window')
+    finally:
+        links = state.read('documents', {})
+        links.pop(cloud, None)
+        state.write('documents', links)
 
 
 def main():
