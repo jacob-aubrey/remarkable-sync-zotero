@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import re
+import time
 from types import SimpleNamespace
 import uuid
 from zipfile import BadZipFile
@@ -27,6 +28,8 @@ class BridgeState(Ledger):
         super().__init__(directory)
         with self.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS bridge_values (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute('''CREATE TABLE IF NOT EXISTS keyword_rechecks (
+                cloud TEXT PRIMARY KEY, evidence TEXT NOT NULL, checked_at INTEGER NOT NULL, value TEXT NOT NULL)''')
 
     def read(self, key, default=None):
         with self.connect() as db:
@@ -36,6 +39,47 @@ class BridgeState(Ledger):
     def write(self, key, value):
         with self.connect() as db:
             db.execute("INSERT OR REPLACE INTO bridge_values VALUES(?,?)", (key, json.dumps(value)))
+
+    def documents_with_keyword_reviews(self):
+        from .zotero_tagging import KEYWORD_REVIEW_FIELDS, keyword_snapshot
+
+        with self.connect() as db:
+            db.execute('BEGIN')
+            saved = db.execute("SELECT value FROM bridge_values WHERE key='documents'").fetchone()
+            documents = json.loads(saved[0]) if saved else {}
+            reviews = {row['cloud']: row for row in db.execute('SELECT * FROM keyword_rechecks')}
+        for cloud, link in documents.items():
+            link['keyword_snapshot'] = keyword_snapshot(link)
+            review = reviews.get(cloud)
+            if review and review['evidence'] == link['keyword_snapshot']:
+                for field in KEYWORD_REVIEW_FIELDS:
+                    link.pop(field, None)
+                link.update(json.loads(review['value']), keyword_rechecked_at=str(review['checked_at']))
+        return documents
+
+    def save_keyword_reviews(self, outcomes, started):
+        from .zotero_tagging import KEYWORD_REVIEW_FIELDS, keyword_snapshot, keyword_warning
+
+        updates = []
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            saved = db.execute("SELECT value FROM bridge_values WHERE key='documents'").fetchone()
+            documents = json.loads(saved[0]) if saved else {}
+            for cloud, before, after in outcomes:
+                link = documents.get(cloud)
+                evidence = before['keyword_snapshot']
+                if not link or not evidence or keyword_snapshot(link) != evidence:
+                    continue
+                fields = {field: after[field] for field in KEYWORD_REVIEW_FIELDS if field in after}
+                cursor = db.execute('''INSERT INTO keyword_rechecks VALUES(?,?,?,?)
+                    ON CONFLICT(cloud) DO UPDATE SET evidence=excluded.evidence,
+                    checked_at=excluded.checked_at, value=excluded.value
+                    WHERE excluded.checked_at > keyword_rechecks.checked_at''',
+                    (cloud, evidence, started, json.dumps(fields)))
+                if cursor.rowcount:
+                    updates.append({'cloud': cloud, 'evidence': evidence, 'checked_at': str(started),
+                                    'fields': fields, 'warning': keyword_warning(cloud, after)})
+        return updates
 
 
 def descendants(records, root, key, parent, unavailable=()):
@@ -831,11 +875,15 @@ class Bridge:
                     row['page_map'] = [pid for pid, _ in page_map(json.loads(bundle[ck + '.content']), len(original_pdf))]
                 row['page_map_digest'] = digest
                 save()
-                from .zotero_tagging import backfill_keywords, keyword_warning
+                from .zotero_tagging import backfill_keywords, keyword_needs_recheck, keyword_warning
                 original = self.sources.path.parent / 'remarkable' / 'baselines' / (baseline + '.pdf')
                 backfill_keywords(self.zot, row['parent'], original, row, save)
                 try:
                     self._tags(row['parent'], bundle, ck, row, save)
+                    if keyword_needs_recheck(row):
+                        # A finished sync has newer evidence even if its warning text is identical.
+                        row['keyword_epoch'] = str(time.time_ns())
+                        save()
                 finally:
                     if warning := keyword_warning(ck, row):
                         reviews.append(warning)

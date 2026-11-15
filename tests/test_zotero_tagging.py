@@ -174,12 +174,12 @@ class TagWorkflowTests(unittest.TestCase):
         result = self.worker.recheck_keyword_warnings(cloud='tablet')
         self.assertEqual(result['keyword_recheck'], {'checked': 1, 'resolved': 1, 'unavailable': 0})
         self.assertEqual([row['cloud'] for row in result['status']['result']['review']], ['another-tablet'])
-        self.assertTrue(self.worker.state.read('documents')['tablet']['keyword_parent_unavailable'])
+        self.assertTrue(self.worker.state.documents_with_keyword_reviews()['tablet']['keyword_parent_unavailable'])
 
         parent.pop('deleted')
         result = self.worker.recheck_keyword_warnings()
         self.assertEqual({row['cloud'] for row in result['status']['result']['review']}, {'tablet', 'another-tablet'})
-        self.assertNotIn('keyword_parent_unavailable', self.worker.state.read('documents')['tablet'])
+        self.assertNotIn('keyword_parent_unavailable', self.worker.state.documents_with_keyword_reviews()['tablet'])
 
     def test_recheck_keeps_warning_if_attachment_is_reparented_during_extraction(self):
         path, _ = self.keyword_warning_link()
@@ -231,12 +231,41 @@ class TagWorkflowTests(unittest.TestCase):
         self.assertEqual(saved['another-tablet']['name'], 'Changed outside recheck')
         self.assertNotIn('keyword_review', saved['tablet'])
 
-    def test_recheck_waits_for_bridge_ledger_writer(self):
+    def test_recheck_finishes_while_sync_holds_its_lock_and_saves_other_papers(self):
         self.keyword_warning_link()
-        with self.worker.state.lock(), patch.object(self.worker, 'zotero') as client:
-            with self.assertRaisesRegex(PilotError, 'already in use'):
-                self.worker.recheck_keyword_warnings()
-        client.assert_not_called()
+        state = self.worker.state
+        original = state.read('documents')
+        self.zot.items['PARENT23']['tags'] = [{'tag': 'Already tagged'}]
+        with state.lock():
+            result = self.worker.recheck_keyword_warnings(cloud='tablet')
+            self.assertEqual(result['keyword_recheck'], {'checked': 1, 'resolved': 1, 'unavailable': 0})
+            self.assertEqual(original, state.read('documents'))
+            original['another-tablet']['name'] = 'Newer sync name'
+            state.write('documents', original)
+        links = state.documents_with_keyword_reviews()
+        self.assertTrue(links['tablet']['keyword_has_zotero_tags'])
+        self.assertEqual(links['another-tablet']['name'], 'Newer sync name')
+        self.assertEqual([row['cloud'] for row in self.worker.status()['status']['result']['review']], ['another-tablet'])
+        original['tablet']['keyword_epoch'] = 'newer collected sync evidence'
+        state.write('documents', original)
+        self.assertNotIn('keyword_has_zotero_tags', state.documents_with_keyword_reviews()['tablet'])
+
+    def test_recheck_retries_only_the_paper_with_newer_sync_evidence(self):
+        self.keyword_warning_link()
+        calls = []
+
+        def advance_revision(client, record, original, row):
+            calls.append(row.get('view_key'))
+            if len(calls) == 1:
+                current = self.worker.state.read('documents')
+                current['tablet']['revision'] = 'Published during recheck'
+                self.worker.state.write('documents', current)
+            return linked_keyword_report(client, record, original, row)
+
+        with patch('note_organizer.zotero_tagging.linked_keyword_report', side_effect=advance_revision):
+            result = self.worker.recheck_keyword_warnings()
+        self.assertEqual(calls, ['SOURCE23', '', 'SOURCE23'])
+        self.assertEqual(result['keyword_recheck'], {'checked': 2, 'resolved': 0, 'unavailable': 0})
 
     def test_legacy_cleanup_previews_evidence_and_removes_only_selected_automatic_tags(self):
         self.add_pdf()

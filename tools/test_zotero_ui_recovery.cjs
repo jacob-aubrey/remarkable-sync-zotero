@@ -450,6 +450,79 @@ async function main() {
     assert.equal(ui.afterSync.length, 0);
   }
   {
+    const {ui} = fixture();
+    const warning = {kind: 'keywords', cloud: 'paper', reason: 'No readable text'};
+    const other = {kind: 'conflict', cloud: 'paper', reason: 'Independent warning'};
+    ui.latest.links = [{cloud: 'paper', keyword_snapshot: 'same-revision'}];
+    ui.latest.status = {result: {review: [warning, other]}};
+    const original = JSON.parse(JSON.stringify(ui.latest));
+    ui.badge = () => ui.applyKeywordUpdates();
+    ui.helperLaunch = {};
+    let finishSync;
+    ui.rpc = method => {
+      assert.equal(method, 'sync');
+      return new Promise(resolve => { finishSync = resolve; });
+    };
+    ui.readKeywordReply = async params => {
+      assert.equal(params.cloud, 'paper');
+      return {keyword_recheck: {checked: 1, resolved: 1, unavailable: 0}, keyword_updates: [
+        {cloud: 'paper', evidence: 'same-revision', checked_at: '10', fields: {keyword_has_zotero_tags: true}, warning: null},
+      ]};
+    };
+    const sync = ui.action('sync');
+    const check = await ui.action('recheck_keyword_warnings', {cloud: 'paper'});
+    assert.equal(check.keyword_recheck.resolved, 1);
+    assert.equal(ui.operation.method, 'sync', 'The local recheck finishes before the transfer');
+    assert.equal(ui.afterSync.length, 0);
+    assert.deepEqual(JSON.parse(JSON.stringify(ui.latest.status.result.review)), [other]);
+    finishSync(original);
+    await sync;
+    assert.equal(ui.latest.links[0].keyword_has_zotero_tags, true, 'A late status response cannot bring the old warning back');
+    ui.latest.links[0] = {cloud: 'paper', keyword_snapshot: 'new-revision'};
+    ui.badge();
+    assert.equal(ui.latest.links[0].keyword_has_zotero_tags, undefined, 'A new link revision cannot inherit stale keyword evidence');
+  }
+  {
+    const {ui} = fixture();
+    const document = {getElementById: () => null};
+    const first = {document, closed: true}, second = {document, closed: false};
+    ui.windows = new Set([first, second]);
+    ui.view = {closed: false, close() { this.closed = true; }};
+    ui.detach(first);
+    assert.equal(ui.view.closed, false, 'An open library window can still host the workspace');
+    ui.detach(second);
+    assert.equal(ui.view.closed, true, 'Closing the last library window closes the workspace');
+  }
+  {
+    let registration, refreshes = 0;
+    const {context} = fixture({Zotero: {Libraries: {userLibraryID: 1}, ItemTreeManager: {
+      registerColumn: option => { registration = option; return 'custom-column'; },
+      refreshColumns: () => refreshes++, unregisterColumn: key => assert.equal(key, 'custom-column'),
+    }}});
+    vm.runInContext(fs.readFileSync('zotero-support/sync-column.js', 'utf8'), context);
+    const column = context.NotableSyncColumn;
+    column.register('plugin');
+    const links = [
+      {parent: 'MATCH', cloud: 'received', view_key: 'PDF', revision: '1'},
+      {parent: 'WAIT', cloud: 'waiting'},
+      {parent: 'PAUSE', cloud: 'paused', paused: true},
+      {parent: 'MATCH', cloud: 'conflicted', view_key: 'PDF2', revision: '1'},
+    ];
+    const status = {links, reviews: [{kind: 'conflict', payload: {type: 'paper', cloud: 'conflicted'}}]};
+    column.update(status);
+    column.update(status);
+    const value = (key, libraryID = 1, isRegularItem = () => true) => registration.dataProvider({key, libraryID, isRegularItem});
+    assert.equal(value('MATCH'), 'attention');
+    assert.equal(value('WAIT'), 'pending');
+    assert.equal(value('PAUSE'), 'paused');
+    assert.equal(value('MATCH', 2), '');
+    assert.equal(value('MATCH', 1, () => false), '');
+    assert.equal(refreshes, 1, 'Unchanged state does not refresh the native tree');
+    column.update({links});
+    assert.equal(value('MATCH'), 'synced');
+    column.unregister();
+  }
+  {
     let releaseLaunch, exited = false, kills = 0; const writes = [];
     const child = {stdin: {write: async text => { writes.push(JSON.parse(text)); exited = true; }},
       stderr: {readString: () => new Promise(() => {})}, stdout: {readString: () => new Promise(() => {})},

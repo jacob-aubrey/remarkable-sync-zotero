@@ -301,6 +301,18 @@ KEYWORD_WARNING_REASONS = {
     'extraction_failed': 'The linked PDFs could not be read for keywords. Open the PDF in Zotero, then recheck.',
     'needs_text_recognition': 'No readable text was found in the linked PDFs. Add paper tags or make the PDF searchable, then recheck.',
 }
+KEYWORD_REVIEW_FIELDS = ('keyword_review', 'keyword_has_zotero_tags', 'keyword_parent_unavailable')
+
+
+def keyword_snapshot(link):
+    """Bind a local recheck to the exact sync evidence it inspected."""
+    from .zotero_review import fingerprint
+
+    if not keyword_needs_recheck(link):
+        return None
+    fields = ('parent', 'source_key', 'view_key', 'baseline', 'revision', 'keyword_check',
+              'keyword_epoch', 'repair_history', *KEYWORD_REVIEW_FIELDS)
+    return fingerprint([link.get(field) for field in fields])
 
 
 def keyword_needs_recheck(link):

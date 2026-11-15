@@ -8,6 +8,7 @@ var notablePreferredAttachments;
 var notableChrome;
 var NotableUI;
 var NotableReadingStatus;
+var NotableSyncColumn;
 
 async function startup({id, rootURI}) {
   await Zotero.initializationPromise;
@@ -97,7 +98,9 @@ async function startup({id, rootURI}) {
   Services.scriptloader.loadSubScript(rootURI + 'folder-chooser.js', globalThis);
   Services.scriptloader.loadSubScript(rootURI + 'ui.js', globalThis);
   Services.scriptloader.loadSubScript(rootURI + 'reading-status.js', globalThis);
+  Services.scriptloader.loadSubScript(rootURI + 'sync-column.js', globalThis);
   Services.scriptloader.loadSubScript(rootURI + 'annotation-jump.js', globalThis);
+  NotableSyncColumn.register(id);
   await NotableUI.start(rootURI);
   await Zotero.PreferencePanes.register({
     pluginID: id,
@@ -112,6 +115,7 @@ async function startup({id, rootURI}) {
 async function shutdown() {
   globalThis.NotableAnnotationJump?.unregister();
   NotableReadingStatus?.unregister();
+  NotableSyncColumn?.unregister();
   if (NotableUI) await NotableUI.stop();
   for (const [path, endpoint] of Object.entries(notableEndpoints)) {
     if (Zotero.Server.Endpoints[path] === endpoint) delete Zotero.Server.Endpoints[path];

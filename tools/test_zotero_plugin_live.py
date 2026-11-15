@@ -65,6 +65,32 @@ async function startup({rootURI}) {
               if (ui.view?.document.querySelector('[role="alert"]')) break;
               await Zotero.Promise.delay(100);
             }
+          } else if (command.action === 'sync_column_and_keyword_recheck') {
+            await ui.refresh();
+            const win = Zotero.getMainWindow();
+            const column = win.ZoteroPane.itemsView.getColumns().find(entry => entry.dataKey.endsWith('remarkable-sync-status'));
+            const paper = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, command.paper);
+            if (!column || column.label !== 'reMarkable' || column.dataProvider(paper, column.dataKey) !== 'synced') {
+              throw Error('The native items tree did not show the last completed reMarkable sync.');
+            }
+            const cell = column.renderCell(0, 'synced', column, false, win.document);
+            if (cell.textContent !== '✓' || !cell.title.includes('last check')) throw Error('Sync status icon or tooltip is missing.');
+            if (!ui.helperLaunch || ui.busy) throw Error('The test needs an idle, initialized primary helper.');
+            ui.operation = {method: 'sync', detail: 'Simulated long transfer', started: Date.now(), updated: Date.now()};
+            ui.busy = true;
+            try {
+              const result = await ui.action('recheck_keyword_warnings', {cloud: command.cloud}, false);
+              if (result?.keyword_recheck.resolved !== 1 || ui.operation?.method !== 'sync' || ui.afterSync.length) {
+                throw Error('The packaged keyword helper did not clear the warning during sync. ' + (ui.keywordActivity || ''));
+              }
+              if (ui.syncWarnings().some(warning => warning.cloud === command.cloud && warning.kind === 'keywords')) {
+                throw Error('The cleared warning is still visible during sync.');
+              }
+            } finally { ui.busy = false; ui.operation = null; }
+            await ui.refresh();
+            if (ui.syncWarnings().some(warning => warning.cloud === command.cloud && warning.kind === 'keywords')) {
+              throw Error('The keyword check was lost when the primary helper refreshed.');
+            }
           } else if (command.action === 'preferences') {
             const pane = Zotero.PreferencePanes.pluginPanes.find(entry => entry.pluginID === ui.id);
             if (pane?.rawLabel !== ui.shortName) throw Error('reMarkable Sync settings entry is missing');
@@ -1838,6 +1864,19 @@ def maintenance_checks(client, root, checked):
         pdf.new_page().insert_text((40, 40), 'fixtureembedding')
         pdf.save(pdf_path)
     indexed = command(root, 'index_search_fixture', parent=parent, path=str(pdf_path))['attachment']
+    state = Worker(root / 'profile/notable').state
+    links = state.read('documents', {})
+    cloud = 'keyword-column-fixture'
+    links[cloud] = {'parent': parent, 'view_key': indexed, 'revision': 'test-received', 'name': title,
+                    'keyword_check': {'status': 'needs_text_recognition', 'title': title}}
+    state.write('documents', links)
+    try:
+        command(root, 'sync_column_and_keyword_recheck', paper=parent, cloud=cloud)
+        checked('native_status_column_and_packaged_keyword_recheck_during_simulated_sync')
+    finally:
+        links = state.read('documents', {})
+        links.pop(cloud, None)
+        state.write('documents', links)
     command(root, 'paper_search_ui', parent=parent, title=title, filename=filename, unread=unread, unreadTitle=unread_title)
     checked('native_paper_search_matches_citations_tags_notes_pdf_text_and_filenames')
     checked('native_read_and_unread_filter_use_the_exact_zotero_tag_and_refresh_after_edits')

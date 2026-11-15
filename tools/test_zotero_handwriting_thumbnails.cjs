@@ -45,6 +45,7 @@ async function main() {
     notableRegisterLibraryEndpoint() {},
     NotableUI: {start: async () => {}},
     NotableReadingStatus: {register() {}},
+    NotableSyncColumn: {register() {}},
     NotableAnnotationJump: {register() {}}
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../zotero-support/bootstrap.js'), 'utf8'), context);

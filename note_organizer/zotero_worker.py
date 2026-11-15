@@ -237,16 +237,19 @@ class OperationTrace:
 
 def progress_links(worker):
     """Small live connection updates without polling the serialized API."""
+    from .zotero_tagging import keyword_snapshot
+
     state = getattr(worker, 'state', None)
     if state is None:
         return None
     fields = ('name', 'parent', 'collection', 'revision', 'view_key', 'desktop_annotations_preserved')
-    return [{'cloud': key, 'unavailable': bool(row.get('unavailable')), **{field: row[field] for field in fields if field in row}}
+    return [{'cloud': key, 'unavailable': bool(row.get('unavailable')), 'keyword_snapshot': keyword_snapshot(row),
+             **{field: row[field] for field in fields if field in row}}
             for key, row in state.read('documents', {}).items()]
 
 
 class Worker:
-    def __init__(self, directory, port=23119, *, resources=None, zotero_factory=None, cloud_factory=None):
+    def __init__(self, directory, port=23119, *, resources=None, zotero_factory=None, cloud_factory=None, recover_pause=True):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.resources = Path(resources or Path(__file__).resolve().parents[1])
@@ -255,7 +258,7 @@ class Worker:
         path = self.directory / "config.json"
         self.config = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         pause_marker = self.directory / 'pause-requested.json'
-        if pause_marker.exists():
+        if recover_pause and pause_marker.exists():
             self.config['sync_paused'] = True
             self.save()
             pause_marker.unlink()
@@ -367,7 +370,7 @@ class Worker:
             'needs_upgrade': [row['id'] for row in paper_reviews if not review_guidance_ready(row['payload'])],
             'ready': sum(review_guidance_ready(row['payload']) and row['payload']['guidance_state'] == 'ready' for row in paper_reviews),
             'repair': sum(review_guidance_ready(row['payload']) and row['payload']['guidance_state'] == 'repair' for row in paper_reviews)}
-        documents = self.state.read('documents', {})
+        documents = self.state.documents_with_keyword_reviews()
         status = self.last
         last_result = status.get('result', {})
         warnings = [issue for cloud, link in documents.items() if (issue := keyword_warning(cloud, link))]
@@ -540,82 +543,77 @@ class Worker:
 
     def recheck_keyword_warnings(self, cloud='', parent=''):
         """Refresh only existing keyword findings using local Zotero and PDF evidence."""
-        from .zotero_tagging import keyword_needs_recheck, keyword_warning, linked_keyword_report
+        result = self.check_local_keywords(cloud, parent)
+        return {**self.status(), 'keyword_recheck': result['keyword_recheck']}
+
+    def check_local_keywords(self, cloud='', parent=''):
+        from .zotero_tagging import keyword_warning, linked_keyword_report
 
         if not isinstance(cloud, str) or not isinstance(parent, str) or (cloud and parent):
             raise PilotError('Choose a linked paper or recheck all keyword warnings.')
-        checked = resolved = 0
-        keyword_fields = ('keyword_review', 'keyword_has_zotero_tags', 'keyword_parent_unavailable')
-        evidence_fields = ('parent', 'source_key', 'view_key', 'baseline', 'revision', 'unavailable', 'keyword_check', *keyword_fields)
-        with self.state.lock():
-            links = self.state.read('documents', {})
-            candidates = [(key, row) for key, row in links.items() if keyword_needs_recheck(row)
-                          and (not cloud or key == cloud) and (not parent or row['parent'] == parent)]
-            if candidates:
-                client = self.zotero()
-                outcomes = []
+        started = time.time_ns()
+        state = self.state
+        links = state.documents_with_keyword_reviews()
+        candidates = [(key, row) for key, row in links.items() if row['keyword_snapshot']
+                      and (not cloud or key == cloud) and (not parent or row['parent'] == parent)]
+        if not candidates:
+            return {'keyword_updates': [], 'keyword_recheck': {'checked': 0, 'resolved': 0, 'unavailable': 0}}
+        client = self.zotero()
 
-                def current_reference(key):
-                    record = client.get('item', key)
-                    if record and (record.get('key') != key or record.get('itemType') in {'attachment', 'note', 'annotation'}):
-                        raise ValueError('The Zotero reference no longer matches the keyword check.')
-                    return record
+        def current_reference(key):
+            record = client.get('item', key)
+            if record and (record.get('key') != key or record.get('itemType') in {'attachment', 'note', 'annotation'}):
+                raise ValueError('The Zotero reference no longer matches the keyword check.')
+            return record
 
-                try:
-                    for key, row in candidates:
-                        if self.stop.is_set():
-                            raise InterruptedError('Keyword recheck stopped')
-                        reference = row['parent']
-                        try:
-                            record = current_reference(reference)
-                            if record and not record.get('deleted') and not record.get('tags'):
-                                baseline = row.get('baseline', '')
-                                original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
-                                report = linked_keyword_report(client, record, original, row)
-                                # An edit, deletion, or merge in Zotero can occur during extraction.
-                                record = current_reference(reference)
-                        except ValueError:
-                            continue  # Keep the previous check for a retry if Zotero evidence changed.
-                        updated = row.copy()
-                        if not record or record.get('deleted'):
-                            updated['keyword_parent_unavailable'] = True
-                        else:
-                            updated.pop('keyword_parent_unavailable', None)
-                            if record.get('tags'):
-                                updated['keyword_has_zotero_tags'] = True
-                            else:
-                                updated.pop('keyword_has_zotero_tags', None)
-                                updated['keyword_review'] = {'status': report['status'], 'title': record.get('title', '')}
-                        outcomes.append((key, row, updated))
-                finally:
-                    client.close()
+        def check(rows):
+            outcomes = []
+            for key, row in rows:
                 if self.stop.is_set():
                     raise InterruptedError('Keyword recheck stopped')
-                if outcomes:
-                    # Sync holds the bridge lock, and native merge repair can commit across a
-                    # local recheck. Apply only the keyword fields to the still-matching link.
-                    with self.state.connect() as db:
-                        db.execute('BEGIN IMMEDIATE')
-                        saved = db.execute("SELECT value FROM bridge_values WHERE key='documents'").fetchone()
-                        latest = json.loads(saved[0]) if saved else {}
-                        changed = False
-                        for key, before, updated in outcomes:
-                            current = latest.get(key)
-                            if current is None or any(current.get(field) != before.get(field) for field in evidence_fields):
-                                continue
-                            if updated != before:
-                                for field in keyword_fields:
-                                    if field in updated:
-                                        current[field] = updated[field]
-                                    else:
-                                        current.pop(field, None)
-                                changed = True
-                            checked += 1
-                            resolved += int(bool(keyword_warning(key, before)) and not keyword_warning(key, current))
-                        if changed:
-                            db.execute("UPDATE bridge_values SET value=? WHERE key='documents'", (json.dumps(latest),))
-        return {**self.status(), 'keyword_recheck': {'checked': checked, 'resolved': resolved,
-                                                     'unavailable': len(candidates) - checked}}
+                reference = row['parent']
+                try:
+                    record = current_reference(reference)
+                    if record and not record.get('deleted') and not record.get('tags'):
+                        baseline = row.get('baseline', '')
+                        original = state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
+                        report = linked_keyword_report(client, record, original, row)
+                        # Zotero can change while the PDF is being read.
+                        record = current_reference(reference)
+                except ValueError:
+                    continue
+                updated = row.copy()
+                if not record or record.get('deleted'):
+                    updated['keyword_parent_unavailable'] = True
+                else:
+                    updated.pop('keyword_parent_unavailable', None)
+                    if record.get('tags'):
+                        updated['keyword_has_zotero_tags'] = True
+                    else:
+                        updated.pop('keyword_has_zotero_tags', None)
+                        updated['keyword_review'] = {'status': report['status'], 'title': record.get('title', '')}
+                outcomes.append((key, row, updated))
+            if self.stop.is_set():
+                raise InterruptedError('Keyword recheck stopped')
+            return state.save_keyword_reviews(outcomes, started) if outcomes else []
+
+        try:
+            updates = check(candidates)
+            if len(updates) != len(candidates):
+                saved = {row['cloud'] for row in updates}
+                newer = state.documents_with_keyword_reviews()
+                # Recheck a changed revision of the same paper once. A relink
+                # to a different item needs a new user request or another sync.
+                retry = [(key, newer[key]) for key, row in candidates if key not in saved and key in newer
+                         and newer[key]['keyword_snapshot'] and newer[key]['keyword_snapshot'] != row['keyword_snapshot']
+                         and all(newer[key].get(field) == row.get(field) for field in ('parent', 'source_key', 'view_key'))]
+                if retry:
+                    updates += check(retry)
+        finally:
+            client.close()
+        resolved = sum(bool(keyword_warning(row['cloud'], links[row['cloud']])) and not row['warning'] for row in updates)
+        return {'keyword_updates': updates, 'keyword_recheck': {'checked': len(updates), 'resolved': resolved,
+                                                                'unavailable': len(candidates) - len(updates)}}
 
     def _keyword_cleanup_rows(self, record, reports):
         from .zotero_tagging import cleanup_candidates, fragment_reason, keyword_without_markup, normal
@@ -3411,11 +3409,14 @@ def main(argv=None, *, worker_factory=Worker):
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--port", type=int, default=23119)
     parser.add_argument("--debug-stacks", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument('--keyword-recheck', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     # Gecko sends UTF-8 JSON. The console code page must not reinterpret titles,
     # user-entered tags or filenames arriving through the private stdin pipe.
     if hasattr(sys.stdin, 'reconfigure'):
         sys.stdin.reconfigure(encoding='utf-8')
+    if args.keyword_recheck:
+        return _serve_keyword_recheck(args, worker_factory)
     if args.debug_stacks:
         args.state.mkdir(parents=True, exist_ok=True)
     diagnostics = (_periodic_stack_diagnostics(args.state / 'test-worker-stack.log')
@@ -3432,6 +3433,24 @@ def _transport_logging():
         yield
     finally:
         logging.disable(previous)
+
+
+@_transport_logging()
+def _serve_keyword_recheck(args, worker_factory):
+    import pymupdf
+
+    transport = sys.stdout
+    pymupdf.set_messages(stream=sys.stderr)
+    pymupdf.set_log(stream=sys.stderr)
+    try:
+        with redirect_stdout(sys.stderr):
+            request = json.loads(sys.stdin.readline())
+            worker = worker_factory(args.state, args.port, recover_pause=False)
+            result = worker.check_local_keywords(**request)
+        write_packet(transport, {'result': result})
+    except Exception as error:
+        message = str(error) if isinstance(error, PilotError) else 'The local keyword recheck could not finish. Try again.'
+        write_packet(transport, {'error': message})
 
 
 @_transport_logging()

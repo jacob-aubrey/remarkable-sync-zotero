@@ -188,7 +188,11 @@ var NotableUI = {
     toolbar.appendChild(button); this.windows.add(window);
     if (this.latest) this.badge();
   },
-  detach(window) { window.document.getElementById('notable-open')?.remove(); this.windows.delete(window); },
+  detach(window) {
+    window.document?.getElementById('notable-open')?.remove();
+    this.windows.delete(window);
+    if (![...this.windows].some(other => !other.closed) && this.view && !this.view.closed) this.view.close();
+  },
   async stop() {
     this.stopped = true;
     this.cancelAfterSync('The plugin closed before this action could start.');
@@ -213,6 +217,7 @@ var NotableUI = {
     // and finish its child before replacement can create another writer.
     if (this.launching) { try { await this.launching; } catch (_) {} }
     if (this.process) await this.closeProcess(this.process, true, 'plugin_shutdown');
+    if (this.keywordProcess) await this.keywordProcess.kill().catch(() => {});
     for (const value of this.pending.values()) { clearTimeout(value.timer); value.reject(new Error(this.shortName + ' stopped')); }
     this.pending.clear();
     if (Zotero.Notable === this) delete Zotero.Notable;
@@ -299,8 +304,9 @@ var NotableUI = {
     if (this.stopped) throw new Error(this.shortName + ' is closed.');
     const diagnostics = Zotero.Prefs.get('notable.testDiagnostics', true) ? ['--debug-stacks'] : [];
     // PyMuPDF caches its message stream at import, before per-request redirects.
-    const process = await Subprocess.call({command, arguments: [...args, '--state', this.statePath, '--port', String(Zotero.Server.port), ...diagnostics],
-      stderr: 'pipe', environmentAppend: true, environment: {PYTHONUNBUFFERED: '1', PYTHONDONTWRITEBYTECODE: '1', PYMUPDF_MESSAGE: 'fd:2'}});
+    this.helperLaunch = {command, arguments: [...args, '--state', this.statePath, '--port', String(Zotero.Server.port)],
+      stderr: 'pipe', environmentAppend: true, environment: {PYTHONUNBUFFERED: '1', PYTHONDONTWRITEBYTECODE: '1', PYMUPDF_MESSAGE: 'fd:2'}};
+    const process = await Subprocess.call({...this.helperLaunch, arguments: [...this.helperLaunch.arguments, ...diagnostics]});
     this.process = process;
     const info = {id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2), started: Date.now(), ...runtimeIdentity};
     (this.processTraces ||= new WeakMap()).set(process, info);
@@ -414,6 +420,94 @@ var NotableUI = {
   },
   async refresh() {
     this.latest = await this.rpc('status'); this.refreshCollectionNames(); this.badge(); return this.latest;
+  },
+  async readKeywordReply(params) {
+    if (!this.helperLaunch && this.launching) await this.launching;
+    if (this.stopped) throw Error(this.shortName + ' is closed.');
+    const {Subprocess} = ChromeUtils.importESModule('resource://gre/modules/Subprocess.sys.mjs');
+    const options = this.helperLaunch;
+    if (!options) throw Error('Wait for the sync helper to start, then recheck.');
+    const process = await Subprocess.call({...options, arguments: [...options.arguments, '--keyword-recheck']});
+    this.keywordProcess = process;
+    let timer, exited = false;
+    const reply = async () => {
+      await process.stdin.write(JSON.stringify(params) + '\n');
+      await process.stdin.close();
+      let output = '';
+      for (let chunk; (chunk = await process.stdout.readString());) output += chunk;
+      const {exitCode} = await process.wait();
+      exited = true;
+      if (exitCode || !output) throw Error('The local keyword helper closed before finishing. Try again.');
+      const packet = JSON.parse(output);
+      if (packet.error) throw Error(packet.error);
+      return packet.result;
+    };
+    try {
+      if (this.stopped) throw Error(this.shortName + ' is closed.');
+      (async () => { while (await process.stderr.readString()) {} })().catch(() => {});
+      return await Promise.race([reply(), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Error('The local keyword recheck timed out. Try again.')), 120000);
+      })]);
+    } finally {
+      clearTimeout(timer);
+      if (!exited && this.keywordProcess === process) await process.kill().catch(() => {});
+      if (this.keywordProcess === process) this.keywordProcess = null;
+    }
+  },
+  async recheckKeywordsDuringSync(params, render) {
+    if (this.keywordTask) {
+      if (this.keywordTask.signature === JSON.stringify(params)) return this.keywordTask.result;
+      await this.keywordTask.result.catch(() => {});
+      if (!this.stopped) return this.action('recheck_keyword_warnings', params, render);
+      return;
+    }
+    const connection = this.filingConnection();
+    const job = {signature: JSON.stringify(params)};
+    this.keywordTask = job;
+    this.keywordActivity = 'Rechecking keyword warnings…'; this.refreshKeywordActivity();
+    job.result = (async () => {
+      try {
+        const result = await this.readKeywordReply(params);
+        if (this.stopped || connection !== this.filingConnection()) return;
+        this.keywordUpdates ||= new Map();
+        for (const update of result.keyword_updates) this.keywordUpdates.set(update.cloud, update);
+        this.badge();
+        this.keywordActivity = this.keywordResultMessage(result.keyword_recheck);
+        if (render && this.view && !this.view.closed && ['sync-review', 'links'].includes(this.tab)
+            && !this.view.document.querySelector?.('dialog[open]')) this.render();
+        return result;
+      } catch (error) {
+        this.keywordActivity = error.message;
+      } finally {
+        this.keywordTask = null; this.refreshKeywordActivity();
+      }
+    })();
+    return job.result;
+  },
+  refreshKeywordActivity() {
+    const node = this.view?.document?.getElementById('notable-keyword-activity');
+    if (!node || this.view.closed) return;
+    node.hidden = !this.keywordActivity;
+    node.textContent = this.keywordActivity || '';
+  },
+  keywordResultMessage({checked, resolved, unavailable}) {
+    return checked || unavailable
+      ? `Ran ${checked} keyword ${checked === 1 ? 'check' : 'checks'}. ${resolved} ${resolved === 1 ? 'warning' : 'warnings'} cleared${unavailable ? `, ${unavailable} changed or unavailable` : ''}.`
+      : 'There are no keyword warnings left to recheck.';
+  },
+  applyKeywordUpdates() {
+    if (!this.keywordUpdates?.size || !this.latest) return;
+    const links = new Map((this.latest.links || []).map(link => [link.cloud, link]));
+    for (const [cloud, update] of this.keywordUpdates) {
+      const link = links.get(cloud);
+      if (!link || link.keyword_snapshot !== update.evidence) { this.keywordUpdates.delete(cloud); continue; }
+      if (BigInt(link.keyword_rechecked_at || 0) >= BigInt(update.checked_at)) continue;
+      for (const field of ['keyword_review', 'keyword_has_zotero_tags', 'keyword_parent_unavailable']) delete link[field];
+      Object.assign(link, update.fields, {keyword_rechecked_at: update.checked_at});
+      const result = this.latest.status.result ||= {};
+      result.review = (result.review || []).filter(issue => issue.kind !== 'keywords' || issue.cloud !== cloud);
+      if (update.warning) result.review.push(update.warning);
+    }
   },
   reviewNeedsUpgrade(row) {
     const version = this.latest?.review_guidance?.version || 1;
@@ -638,6 +732,8 @@ var NotableUI = {
     return this.latest?.status?.message || 'Ready';
   },
   badge() {
+    this.applyKeywordUpdates();
+    globalThis.NotableSyncColumn?.update(this.latest);
     const count = (this.latest?.reviews || []).filter(row => row.kind === 'conflict' || !row.payload.routine).length
       + (this.latest?.bulk?.rows || []).filter(row => row.issues.length && row.status !== 'dismissed').length
       + (this.latest ? this.syncDecisionCount() : 0);
@@ -773,7 +869,10 @@ var NotableUI = {
   },
   open() {
     if (this.view && !this.view.closed) { this.view.focus(); return; }
-    this.view = Zotero.getMainWindow().openDialog('chrome://notable/content/workspace.xhtml', 'notable-workspace',
+    const window = Zotero.getMainWindow();
+    if (!window || window.closed) throw Error('Open the Zotero library window first.');
+    this.attach(window);
+    this.view = window.openDialog('chrome://notable/content/workspace.xhtml', 'notable-workspace',
       'chrome,dialog=no,resizable,centerscreen,width=1040,height=760', {controller: this});
   },
   openSetup() {
@@ -849,6 +948,9 @@ var NotableUI = {
     }
   },
   async action(method, params = {}, render = true) {
+    if (method === 'recheck_keyword_warnings' && this.operation?.method === 'sync' && (this.helperLaunch || this.launching)) {
+      return this.recheckKeywordsDuringSync(params, render);
+    }
     if (this.paperTagChecking) { try { await this.paperTagRequest; } catch (_) {} }
     if (this.inboxChecking) { try { await this.inboxRequest; } catch (_) {} }
     const syncing = method === 'sync';
@@ -928,11 +1030,8 @@ var NotableUI = {
       else if (result.intake_attachment) this.message(result.intake_attachment.source_retained
         ? 'PDF attached in Zotero. The original is still in ToSort.' : 'PDF attached in Zotero.');
       else if (result.keyword_recheck) {
-        const {checked, resolved, unavailable} = result.keyword_recheck;
         if (params.parent && this.saveFeedback?.tab === this.tab) this.message(this.saveFeedback.value, false, true);
-        else this.message(checked || unavailable
-          ? `Ran ${checked} keyword ${checked === 1 ? 'check' : 'checks'}. ${resolved} ${resolved === 1 ? 'warning' : 'warnings'} cleared${unavailable ? `, ${unavailable} unavailable` : ''}.`
-          : 'There are no keyword warnings left to recheck.');
+        else this.message(this.keywordResultMessage(result.keyword_recheck));
       }
       else if (result.folder_change) {
         const messages = {keep: 'Folder pair disconnected.', mirror: 'Matching folder moved to Trash.', restore: 'Original folder restored.'};
@@ -1438,6 +1537,11 @@ var NotableUI = {
   },
   async mount(window) {
     this.view = window;
+    window.addEventListener('unload', () => {
+      if (this.view !== window) return;
+      this.hideButtonHelp(); this.view = null; clearInterval(this.activityTimer);
+      this.reviewObserver?.disconnect(); this.schedule();
+    }, {once: true});
     if (typeof Zotero !== 'undefined') Zotero.UIProperties?.registerRoot(window.document.querySelector('body'));
     window.addEventListener('keydown', event => {
       if (event.defaultPrevented || event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey) return;
@@ -1457,11 +1561,11 @@ var NotableUI = {
         this.latest = {...this.latest, config};
       } catch (_) {}
     }
+    if (this.view !== window || window.closed) return;
     this.reviewUpgrade = null; this.reviewUpgradeWaiting = false;
     const initialTab = this.requestedTab || (this.latest.config.tablet_root ? 'inbox' : 'setup');
     const navigationSerial = this.tabNavigationSerial || 0;
     this.tab = initialTab; this.render();
-    window.addEventListener('unload', () => { if (this.view === window) { this.hideButtonHelp(); this.view = null; clearInterval(this.activityTimer); this.reviewObserver?.disconnect(); this.schedule(); } }, {once: true});
     try {
       if (!this.busy) await this.refresh();
       if (this.view !== window || window.closed) return;
@@ -1559,8 +1663,8 @@ var NotableUI = {
       'Pair reMarkable': 'Save the supplied pairing code’s account connection for this plugin.',
       'Connect Zotero': 'Authorize the existing local Zotero API connection for this plugin.',
       'Save tags': 'Apply the displayed paper and page tags to the selected items.',
-      'Recheck keywords': 'Check this paper’s Zotero tags and linked PDFs. During sync, this check queues until sync finishes.',
-      'Recheck keyword warnings': 'Check Zotero tags and local PDFs for these warnings. During sync, this check queues until sync finishes.',
+      'Recheck keywords': 'Check this paper’s Zotero tags and linked PDFs while sync continues.',
+      'Recheck keyword warnings': 'Check Zotero tags and local PDFs for these warnings while sync continues.',
       'Add tag': 'Add the typed tag to this draft. Save or file the paper to apply it.',
       'Add to filing queue': 'Save this paper’s current choices for filing after the active operation finishes.',
       'Resume link': 'Resume this existing connection without creating another tablet document.',
@@ -2033,6 +2137,8 @@ var NotableUI = {
     this.el('small', '', info, {id: 'activity-time', 'aria-live': 'off', tabindex: '0'});
     this.renderFilingQueue(root);
     this.el('p', '', root, {id: 'notable-after-sync', class: 'hint', role: 'status'});
+    this.el('p', '', root, {id: 'notable-keyword-activity', class: 'hint', role: 'status'});
+    this.refreshKeywordActivity();
     this.refreshAfterSync();
     this.el('div', '', root, {id: 'notable-tag-edits', 'aria-live': 'polite'});
     this.refreshTagEditQueue();

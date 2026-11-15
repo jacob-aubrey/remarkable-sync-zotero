@@ -1,5 +1,11 @@
 # Working while sync runs
 
+## Keyword rechecks and library status
+
+A keyword recheck can finish during a transfer. Zotero starts a separate instance of the bundled helper for that local check. PyMuPDF supports PDF reads in separate processes, and the helper reuses the existing native Zotero read API. A short SQLite transaction records just the keyword result after checking the saved link and PDF revision. When a newer sync changes that evidence, the recheck retries only the affected paper once. A relink leaves the previous result attached to its original evidence. Sync retains responsibility for transfers and its own link records. [PyMuPDF multiprocessing](https://pymupdf.readthedocs.io/en/latest/recipes-multiprocessing.html)
+
+The **reMarkable** column shows the last known status for each linked reference in My Library. Its icons identify a completed sync, a link waiting for its first sync, a paused link, or a link that needs attention. Zotero’s column picker can hide it. ZotSeek’s MIT-licensed index column shows a similar interaction, and the plugin uses Zotero’s maintained AGPL-licensed item-tree API directly. The native Windows Zotero 10.0.6 and 10.0.8 builds provide the same column and main-window lifecycle hooks. The workspace closes with the last library window, and the column reads from saved status in memory. [ZotSeek’s status column](https://github.com/introfini/ZotSeek#indexing-status-column) · [Zotero’s item-tree API](https://www.zotero.org/support/dev/zotero_7_for_developers#custom_item_tree_columns)
+
 ## Sync Conflicts and Sync Warnings audit for 0.19.23
 
 | Workflow | Evidence, presentation, and recovery |

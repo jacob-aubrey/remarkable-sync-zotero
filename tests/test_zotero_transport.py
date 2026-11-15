@@ -21,7 +21,7 @@ class TransportTests(unittest.TestCase):
         worker = SimpleNamespace(state=SimpleNamespace(read=lambda *args: {'cloud-paper': {
             'name': 'Paper', 'parent': 'PARENT23', 'collection': 'ROOT2345', 'view_key': 'VIEW2345',
             'revision': 'received-revision', 'baseline': 'private digest', 'rendered': {'input': ['private source']}}}))
-        self.assertEqual(progress_links(worker), [{'cloud': 'cloud-paper', 'unavailable': False, 'name': 'Paper', 'parent': 'PARENT23',
+        self.assertEqual(progress_links(worker), [{'cloud': 'cloud-paper', 'unavailable': False, 'keyword_snapshot': None, 'name': 'Paper', 'parent': 'PARENT23',
             'collection': 'ROOT2345', 'view_key': 'VIEW2345', 'revision': 'received-revision'}])
         self.assertIsNone(progress_links(SimpleNamespace()))
 
