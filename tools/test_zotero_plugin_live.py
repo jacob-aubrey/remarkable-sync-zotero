@@ -1119,7 +1119,8 @@ async function startup({rootURI}) {
               else themeRoot.setAttribute('data-color-scheme', initialScheme);
             }
             const activeUI = Zotero.Notable;
-            if (!activeUI.latest) activeUI.latest = await activeUI.rpc('status');
+            await waitFor(() => activeUI.latest?.status && activeUI.process && !activeUI.pending.size,
+              'Restored plugin did not finish loading its saved state');
             const original = activeUI.rpc, previousLinks = activeUI.latest.links, previousConfig = activeUI.latest.config;
             response.requests = [];
             const ctx = command.context;
@@ -1143,8 +1144,12 @@ async function startup({rootURI}) {
                 .find(b => b.textContent === 'Save tags');
               await waitFor(saveButton, 'Reader page editor did not open');
               response.heading = activeUI.view.document.querySelector('main h2')?.textContent;
-              const inputs = [...activeUI.view.document.querySelectorAll('main input')];
-              inputs[0].value = 'Native paper tag'; inputs[1].value = 'Native page tag';
+              for (const kind of ['paper', 'page']) {
+                const input = activeUI.view.document.querySelector(`input[data-notable-field="Add ${kind} tag"]`);
+                if (!input) throw Error('The linked reader editor did not have both tag fields');
+                input.value = `Native ${kind} tag`;
+                input.dispatchEvent(new activeUI.view.Event('input', {bubbles: true}));
+              }
               saveButton().click();
               await waitFor(() => activeUI.tagEdits.length === 1, 'Reader tags were not queued during sync');
               const editsPath = PathUtils.join(activeUI.statePath, 'tag-edits.json');
