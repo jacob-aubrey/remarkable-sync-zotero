@@ -17,6 +17,8 @@ function node(tag, text = '') {
 ui.el = (tag, text, parent, attrs = {}) => {const item = node(tag, text); Object.assign(item, attrs); parent?.children.push(item); return item;};
 ui.button = (text, parent, callback) => {const button = ui.el('button', text, parent, {dataset: {}}); button.click = callback; return button;};
 ui.checkbox = (text, parent, checked) => {const field = ui.el('checkbox', text, parent); field.checked = checked; return field;};
+ui.field = (_label, parent, value) => ui.el('input', '', parent, {value, notableRefreshValue() {}});
+ui.recentTags = [];
 ui.filingConnection = () => 'saved-connection';
 ui.latest = {config: {}, reviews: [{id: 'review', digest: 'sha1', status: 'pending', payload: {path: 'paper.pdf'}}]};
 ui.view = {closed: false};
@@ -29,36 +31,51 @@ async function main() {
   ui.message = () => {throw Error('Quiet progress must not replace the user status');};
   ui.receiveProgress({event: 'progress', quiet: true, message: 'Still working...'});
   const calls = [];
-  ui.action = async (...args) => {calls.push(args); return {saved: true, deferred_until_filing: true};};
   ui.rpc = async (method, params) => {calls.push([method, params]); assert.equal(ui.busy, false); return {proposal};};
-  ui.paperTagPanel(root, scope);
+  let savedTags, savedDefaults, changes = 0;
+  function mountFilingTags() {
+    const defaults = new Map(savedDefaults);
+    const editor = ui.renderTagEntry(root, {
+      kind: 'paper', values: savedTags || [], tagKey: ui.filingTagKey,
+      onChange(tags) { savedTags = tags; savedDefaults = [...defaults]; changes++; }
+    });
+    ui.paperTagPanel(root, scope, {editor, defaults});
+    return editor;
+  }
+  let editor = mountFilingTags();
   assert.equal(buttons().some(item => /Find keywords/.test(item.textContent)), false);
-  assert.equal(root.children[0].open, false, 'Suggestions start before the panel is expanded');
+  assert.equal(root.children.find(item => item.tag === 'details').open, false, 'Suggestions start before the panel is expanded');
   assert.ok(timers.size);
   await ui.preparePaperTags();
   assert.equal(calls.length, 1); assert.equal(calls[0][0], 'suggest_paper_tags'); assert.equal(calls[0][1].quiet, true);
   assert.equal(ui.busy, false, 'Automatic suggestions never activate global progress');
   assert.equal(timers.size, 0, 'A completed analysis does not poll or rerender repeatedly');
-  const checkbox = root.all().find(item => item.tag === 'checkbox');
-  checkbox.checked = true; checkbox.fire('change');
-  ui.paperTagPanel(root, scope); await ui.preparePaperTags();
-  assert.equal(calls.length, 1, 'The same paper analysis is reused');
-  assert.equal(root.all().filter(item => item.tag === 'checkbox').at(-1).checked, true, 'Draft choices survive rerender');
-  await buttons().find(item => item.textContent === 'Use these tags when filing').click();
-  assert.equal(calls[1][0], 'save_paper_tags', 'Only explicit approval saves choices');
-  assert.deepEqual(Array.from(calls[1][1].selected), ['Topic']);
-  const savedButton = buttons().find(item => item.textContent === 'Use these tags when filing');
-  assert.equal(savedButton.disabled, true);
-  checkbox.checked = false; checkbox.fire('change');
-  assert.equal(savedButton.disabled, false, 'Changing an approved selection enables saving it again immediately');
-  checkbox.checked = true; checkbox.fire('change');
+  const box = tag => root.all().find(item => item.tag === 'checkbox' && item.textContent === tag);
+  assert.equal(box('Keywords').checked, true);
+  assert.equal(box('Topic').checked, false);
+  assert.deepEqual([...editor.tags], ['Keywords']);
+  assert.equal(changes, 0, 'Loading defaults does not create a user-edited filing draft');
+  box('Topic').checked = true; box('Topic').fire('change');
+  assert.deepEqual([...editor.tags], ['Keywords', 'Topic']);
+  await buttons().find(item => item['aria-label'] === 'Remove Keywords from paper tags').click();
+  assert.equal(box('Keywords').checked, false, 'Removing a chip unchecks its keyword');
+  assert.equal(buttons().some(item => item.textContent === 'Use these tags when filing'), false);
+  assert.equal(calls.length, 1, 'Tag selections stay in the filing draft');
   const priorEntry = ui.paperTagEntry(scope);
   for (const output of priorEntry.outputs) output.isConnected = false;
-  ui.paperTagPanel(root, scope);
+  root.replaceChildren();
+  editor = mountFilingTags(); await ui.preparePaperTags();
+  assert.equal(calls.length, 1, 'The same paper analysis is reused');
+  assert.equal(box('Keywords').checked, false, 'The declined default stays unchecked across renders');
+  assert.equal(box('Topic').checked, true, 'Draft choices survive rerender');
+  editor.add('keywords');
+  assert.equal(box('Keywords').checked, true, 'An equivalent manually entered chip checks the option');
+  box('Keywords').checked = false; box('Keywords').fire('change');
+  assert.deepEqual([...editor.tags], ['Topic']);
   assert.equal(priorEntry.outputs.size, 1, 'Detached output nodes are pruned from the cache');
   assert.equal(priorEntry.listeners.size, 1, 'Detached panel callbacks do not retain old DOM trees');
   ui.paperTagEvidenceSerial = 1;
-  ui.paperTagPanel(root, scope);
+  root.replaceChildren(); mountFilingTags();
   ui.rpc = async () => {throw Error('File unavailable');};
   await ui.preparePaperTags();
   assert.equal(timers.size, 0, 'Failed analysis waits for an explicit retry');
@@ -72,7 +89,8 @@ async function main() {
   finish({proposal}); await pending;
   assert.equal(ui.paperTagChecking, false);
   assert.equal(root.all().filter(item => item.tag === 'checkbox').at(-1).checked, true, 'Retry preserves approved/manual draft choices');
-  ui.latest.reviews[0].digest = 'new-content'; ui.paperTagPanel(root, scope);
+  ui.latest.reviews[0].digest = 'new-content'; savedTags = savedDefaults = undefined;
+  root.replaceChildren(); mountFilingTags();
   const changedEntry = ui.paperTagEntry(scope); assert.equal(changedEntry.draft.selected.size, 0, 'New document bytes get a fresh draft');
   ui.busy = true; const before = changedEntry.state; await ui.preparePaperTags(); assert.equal(changedEntry.state, before, 'User operations have priority');
   ui.stopped = true; ui.schedulePaperTags(); assert.equal(timers.size, 0);

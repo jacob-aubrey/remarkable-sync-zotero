@@ -746,6 +746,7 @@ class Bridge:
                     row["uploaded"] = True
                     save()
 
+        keyword_selections = getattr(self.review_policy, 'selected_keyword_sources', set)() if apply else set()
         for number, (ck, item) in enumerate(cloud_pdfs.items(), 1):
             if ck in suspended:
                 continue
@@ -877,7 +878,9 @@ class Bridge:
                 save()
                 from .zotero_tagging import backfill_keywords, keyword_needs_recheck, keyword_warning
                 original = self.sources.path.parent / 'remarkable' / 'baselines' / (baseline + '.pdf')
-                backfill_keywords(self.zot, row['parent'], original, row, save)
+                selected_keywords = (('cloud', ck, baseline) in keyword_selections
+                                     or ('zotero', row.get('source_key'), baseline) in keyword_selections)
+                backfill_keywords(self.zot, row['parent'], original, row, save, add_keywords=not selected_keywords)
                 try:
                     self._tags(row['parent'], bundle, ck, row, save)
                     if keyword_needs_recheck(row):

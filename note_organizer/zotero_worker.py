@@ -485,13 +485,13 @@ class Worker:
             client.close()
 
     def suggest_paper_tags(self, identity='', key='', quiet=False):
-        from .zotero_tagging import analyse, VERSION
+        from .zotero_tagging import analyse, PROPOSAL_VERSION
         client = self.zotero()
         try:
             source = self._paper_target(client, identity, key)
             plans = self._tag_plans()
             previous = plans.get(source['target'], {})
-            if (previous.get('analysis_version') == VERSION
+            if (previous.get('analysis_version') == PROPOSAL_VERSION
                     and all(previous.get(field) == source[field] for field in ('path', 'digest', 'parent', 'tags'))
                     and isinstance(previous.get('keywords'), list) and isinstance(previous.get('suggestions'), list)):
                 return {'proposal': previous, 'cached': True}
@@ -501,7 +501,7 @@ class Worker:
                 self.progress('Reading stated keywords and preparing local tag suggestions…')
             from .zotero_maintenance import now
             proposal = {**source, **analyse(source['path'], vocabulary, [tag['tag'] for tag in source['tags']]),
-                        'analysis_version': VERSION, 'checked_at': now()}
+                        'analysis_version': PROPOSAL_VERSION, 'checked_at': now()}
             offered = {row['tag'] for row in proposal['suggestions']}
             proposal['selected'] = [tag for tag in previous.get('selected', []) if tag in offered
                                     and previous.get('digest') == source['digest']]
@@ -703,29 +703,32 @@ class Worker:
         finally:
             client.close()
 
-    def apply_document_keywords(self, client, parent, path, identity='', digest=''):
+    def apply_document_keywords(self, client, parent, path, identity='', digest='', *, keyword_tags=None):
         from .zotero_tagging import document_keywords, append_tags
         record = client.get('item', parent)
         if not record or record.get('deleted'):
             raise PilotError('The paper reference changed before its keyword tags could be saved.')
         existing = record.get('tags', [])
-        keyword_path = path
-        for link in self.state.read('documents', {}).values():
-            if link.get('parent') != parent:
-                continue
-            if not any(key and client.file_path(key) == path for key in (link.get('view_key'), link.get('source_key'))):
-                continue
-            baseline = link.get('baseline', '')
-            original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
-            if original.is_file() and file_sha(original) == baseline:
-                keyword_path = original
-                break
-        keywords = document_keywords(keyword_path, [row['tag'] for row in existing])
+        accepted = []
+        if keyword_tags is None:
+            keyword_path = path
+            for link in self.state.read('documents', {}).values():
+                if link.get('parent') != parent:
+                    continue
+                if not any(key and client.file_path(key) == path for key in (link.get('view_key'), link.get('source_key'))):
+                    continue
+                baseline = link.get('baseline', '')
+                original = self.state.directory / 'sources' / 'remarkable' / 'baselines' / (baseline + '.pdf')
+                if original.is_file() and file_sha(original) == baseline:
+                    keyword_path = original
+                    break
+            keyword_tags = [row['tag'] for row in document_keywords(keyword_path, [row['tag'] for row in existing])]
+            plan = self._tag_plans().get('review:' + identity, {}) if identity else {}
+            if plan.get('saved') and plan.get('digest') == file_sha(path):
+                accepted = plan.get('selected', [])
         if digest and file_sha(path) != digest:
             raise PilotError('The paper changed while reading its keywords. Its existing tags were retained.')
-        plan = self._tag_plans().get('review:' + identity, {}) if identity else {}
-        accepted = plan.get('selected', []) if plan.get('saved') and plan.get('digest') == file_sha(path) else []
-        updated = append_tags(existing, [row['tag'] for row in keywords], accepted)
+        updated = append_tags(existing, keyword_tags, accepted)
         if updated != existing:
             record['tags'] = updated
             client.authorize(); client.update(record)
@@ -2230,16 +2233,26 @@ class Worker:
         return {"filename": name}
 
     def approve(self, identity, digest, filename, title, document_type, collection, research=None, match="", review_token="", _batch=False,
-                main_reference='', main_reference_metadata=None, citation=None, tags=None):
+                main_reference='', main_reference_metadata=None, citation=None, tags=None, keyword_tags=None):
         from .sorting.core_logic import validate_document_filename
         from .zotero_tags import names
         edits = clean_citation_edits(citation)
-        requested_tags = names([] if tags is None else tags)
         row = self.review.row(identity)
         if not row or row["digest"] != digest:
             raise PilotError("The document changed. Refresh before approving.")
         if review_token and row["payload"].get("review_token") != review_token:
             raise PilotError("The reference details changed. Refresh the review before approving.")
+        if row['status'] == 'applying':
+            saved = row['approval']
+            if keyword_tags is not None and 'keyword_tags' not in saved:
+                raise PilotError('Resume this filing with its saved tag choices.')
+            if keyword_tags is None:
+                keyword_tags = saved.get('keyword_tags')
+            if tags is None:
+                tags = saved.get('tags')
+        requested_tags = names([] if tags is None else tags)
+        if keyword_tags is not None:
+            keyword_tags = names(keyword_tags)
         if row['status'] == 'pending' and row['payload'].get('local_recheck_error'):
             raise PilotError(row['payload']['local_recheck_error'])
         path = Path(row["payload"]["path"])
@@ -2381,8 +2394,10 @@ class Worker:
                 else:
                     original = {field: (reference or {}).get(field) for field in fields}
                 approval.update(citation_edits=edits, citation_original=original)
-            if requested_tags:
+            if requested_tags or keyword_tags is not None:
                 approval['tags'] = requested_tags
+            if keyword_tags is not None:
+                approval['keyword_tags'] = keyword_tags
             if row["kind"] == "zotero" and source_parent and source_reference:
                 if row["status"] != "applying" and row["payload"].get("metadata_signature") != citation_signature(source_reference):
                     raise PilotError("The Zotero citation changed during review. Sync to refresh it before filing.")
@@ -2421,7 +2436,7 @@ class Worker:
                 path = client.file_path(source)
                 if file_sha(path) != digest:
                     raise PilotError('The PDF changed while saving its citation. Its files were retained.')
-            self.apply_document_keywords(client, parent, path, identity, digest)
+            self.apply_document_keywords(client, parent, path, identity, digest, keyword_tags=keyword_tags)
             if row['kind'] == 'zotero':
                 path = client.file_path(source)
             if row["kind"] == "inbox":

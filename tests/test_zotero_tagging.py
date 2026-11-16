@@ -68,6 +68,20 @@ class PaperTagTests(unittest.TestCase):
         self.assertEqual([row['tag'] for row in keywords], ['CT', 'Tin filtration', '1.5 T MRI', 'E. coli'])
         self.assertEqual(review, [])
 
+    def test_lettered_printed_keywords_omit_list_markers(self):
+        keywords, review = keyword_candidates(
+            'Keywords: A. Metal-matrix composites (NMCs); B. Mechanical properties; '
+            'biocompatibility; D. Electron microprobe analysis; E. Sintering',
+            clean_printed_lists=True,
+        )
+        self.assertEqual([row['tag'] for row in keywords], ['Metal-matrix composites (NMCs)', 'Mechanical properties',
+                         'biocompatibility', 'Electron microprobe analysis', 'Sintering'])
+        self.assertEqual(review, [])
+        keywords, review = keyword_candidates('Index terms\nA. Microstructure\nB. Sintering\n\nIntroduction',
+                                              clean_printed_lists=True)
+        self.assertEqual([row['tag'] for row in keywords], ['Microstructure', 'Sintering'])
+        self.assertEqual(review, [])
+
     def test_mixed_metadata_and_clipped_phrases_require_review(self):
         keywords, review = keyword_candidates(
             'Keywords: Contrast imaging; Models and\n\nIntroduction',
@@ -387,6 +401,38 @@ class TagWorkflowTests(unittest.TestCase):
         self.assertIn('Spectral CT', [tag['tag'] for tag in reference['tags']])
         for tag in chosen:
             self.assertIn({'tag': tag, 'type': 0}, reference['tags'])
+
+    def test_explicit_choice_survives_interrupted_filing_and_first_sync(self):
+        path = make_pdf(self.root / 'reviewed-tablet-paper.pdf')
+        cloud = self.cloud.upload_pdf(path.read_bytes(), 'Tablet paper', self.croot.id, str(uuid.uuid4()), self.croot.id)
+        self.worker.sync()
+        row = next(row for row in self.worker.review.rows() if row['identity'] == cloud.id)
+        args = (row['id'], row['digest'], 'Paper.pdf', 'Paper', 'journal_article', 'ROOT2345')
+        with patch.object(self.worker, 'apply_document_keywords', side_effect=OSError('Interrupted filing')):
+            with self.assertRaisesRegex(OSError, 'Interrupted filing'):
+                self.worker.approve(*args, tags=['Manual topic'], keyword_tags=['Spectral CT'])
+        saved = self.worker.review.row(row['id'])['approval']
+        self.assertEqual(saved['keyword_tags'], ['Spectral CT'])
+        with self.assertRaisesRegex(PilotError, 'saved choices'):
+            self.worker.approve(*args, keyword_tags=['nanoparticles'])
+        self.worker.approve(*args)
+        self.worker.sync()
+        tags = self.zot.items[saved['parent']]['tags']
+        self.assertEqual(tags, [{'tag': 'Manual topic'}, {'tag': 'Spectral CT', 'type': 1}])
+        report = self.worker.state.read('documents', {})[cloud.id]['keyword_check']
+        self.assertEqual([keyword['tag'] for keyword in report['keywords']], ['Spectral CT', 'nanoparticles'])
+
+    def test_all_keywords_can_be_unchecked_for_a_zotero_original(self):
+        path = self.add_pdf()
+        path.unlink()
+        make_pdf(path)
+        self.zot.items['PARENT23']['tags'] = [{'tag': 'Existing tag', 'type': 0}]
+        with patch.object(self.worker.review, 'observe_ready', return_value=True):
+            self.worker.sync()
+        row = next(row for row in self.worker.review.rows() if row['identity'] == 'SOURCE23')
+        self.worker.approve(row['id'], row['digest'], 'Paper.pdf', 'Paper', 'journal_article', 'ROOT2345', keyword_tags=[])
+        self.worker.sync()
+        self.assertEqual(self.zot.items['PARENT23']['tags'], [{'tag': 'Existing tag', 'type': 0}])
 
 
 class KeywordImportTests(unittest.TestCase):

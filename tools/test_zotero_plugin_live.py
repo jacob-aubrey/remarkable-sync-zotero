@@ -940,7 +940,7 @@ async function startup({rootURI}) {
             }
           }
           else if (command.action === 'review_list') {
-            const saved = {latest: ui.latest, tab: ui.tab, rpc: ui.rpc};
+            const saved = {latest: ui.latest, tab: ui.tab, rpc: ui.rpc, queueFiling: ui.queueFiling};
             const ensure = (value, reason) => { if (!value) throw new Error(reason); };
             const settle = () => Zotero.Promise.delay(200);
             const requests = [];
@@ -948,10 +948,10 @@ async function startup({rootURI}) {
               ui.rpc = async (method, params) => {
                 requests.push({method, params});
                 if (method === 'suggest_paper_tags') return {proposal: command.proposal};
-                if (method === 'save_paper_tags') return {saved: true, deferred_until_filing: true};
                 if (method === 'status') return command.snapshot;
                 throw new Error('Unexpected tag UI request');
               };
+              ui.queueFiling = async (method, params) => requests.push({method, params});
               ui.latest = command.snapshot; ui.tab = 'review'; ui.selected = null; ui.showAllReviews = true; ui.reviewScrollTop = 0;
               ui.render(); ui.view.resizeTo(1040, 900); await settle();
               const doc = ui.view.document;
@@ -977,10 +977,24 @@ async function startup({rootURI}) {
               ensure(Math.abs(response.expanded.list - response.expanded.detail) < 2, 'List failed to follow expanded details');
               await ui.preparePaperTags(); await settle();
               const checks = [...doc.querySelector('.paper-tag-proposal').querySelectorAll('input[type="checkbox"]')];
-              ensure(checks.length && checks.every(input => !input.checked), 'Suggestions applied without selection');
-              checks[0].checked = true;
-              [...doc.querySelectorAll('button')].find(b => b.textContent === 'Use these tags when filing').click(); await settle();
-              ensure(requests.find(row => row.method === 'save_paper_tags')?.params.selected.length === 1, 'Tag selection not respected');
+              const keywordCount = command.proposal.keywords.length;
+              ensure(checks.slice(0, keywordCount).every(input => input.checked), 'Stated keywords did not start checked');
+              ensure(checks.slice(keywordCount).length && checks.slice(keywordCount).every(input => !input.checked),
+                'Suggestions applied without selection');
+              const rejected = command.proposal.keywords[0].tag;
+              doc.querySelector(`[aria-label="Remove ${rejected} from paper tags"]`).click();
+              await Promise.resolve();
+              ensure(!checks[0].checked, 'Removing a keyword chip did not uncheck it');
+              checks[keywordCount].checked = true;
+              checks[keywordCount].dispatchEvent(new ui.view.Event('change', {bubbles: true}));
+              const chosen = command.proposal.suggestions[0].tag;
+              ensure(doc.querySelector(`[aria-label="Remove ${chosen} from paper tags"]`), 'Checking a suggestion did not add its chip');
+              const approve = doc.querySelector('[data-approve="true"]');
+              ensure(approve && !approve.disabled, 'The synthetic filing must be ready for approval');
+              approve.click(); await settle();
+              const filing = requests.find(row => row.method === 'approve')?.params;
+              ensure(filing?.tags.includes(chosen) && !filing.keyword_tags.includes(rejected)
+                && filing.keyword_tags.length === keywordCount - 1, 'Filing did not receive the displayed tags');
               response.tags = sizes(); ensure(Math.abs(response.tags.list - response.tags.detail) < 2, 'Tag controls broke matching heights');
               ui.view.resizeTo(640, 900); await settle();
               const narrow = sizes();
@@ -989,9 +1003,9 @@ async function startup({rootURI}) {
               const icon = await (await fetch('chrome://notable/content/icons/tablet.svg')).text();
               ensure(icon.includes('M9 16V8') && !icon.includes('<line'), 'Toolbar icon still contains a dot');
               response.passed = ['review list matches details height', 'long list scrolls independently', 'keyboard selection stays visible',
-                'list position persists', 'expanded details and tag controls resize list', 'suggested tags require a selection',
+                'list position persists', 'expanded details and tag controls resize list', 'checked keywords and tag chips control filing',
                 'narrow list remains bounded', 'toolbar uses rectangle and R without dot'];
-            } finally { ui.rpc = saved.rpc; ui.latest = saved.latest; ui.tab = saved.tab; ui.selected = null; ui.showAllReviews = false; ui.view.resizeTo(1040, 760); ui.render(); }
+            } finally { ui.rpc = saved.rpc; ui.queueFiling = saved.queueFiling; ui.latest = saved.latest; ui.tab = saved.tab; ui.selected = null; ui.showAllReviews = false; ui.view.resizeTo(1040, 760); ui.render(); }
           }
           else if (command.action === 'review_scroll') {
             const saved = {latest: ui.latest, tab: ui.tab, selected: ui.selected, showAll: ui.showAllReviews};
@@ -1694,8 +1708,9 @@ def tagging_checks(client, root, checked):
         links=[], deletions=[], local_deletions=[], bulk=None)
     snapshot['reviews'] = [{'id': str(index), 'kind': 'cloud', 'identity': str(index), 'status': 'pending', 'digest': digest,
         'payload': {'path': str(path), 'title': f'Example paper {index:03}', 'filename': f'Example {index:03}.pdf',
-                    'document_type': 'journal_article', 'details': {}, 'issues': [], 'guidance_version': snapshot.get('review_guidance', {}).get('version', 1), 'guidance_state': 'ready'}} for index in range(160)]
-    proposal = copy.deepcopy(proposal); proposal['selected'] = []
+                    'document_type': 'journal_article', 'details': {}, 'issues': [], 'findings': [],
+                    'guidance_version': snapshot.get('review_guidance', {}).get('version', 1), 'guidance_state': 'ready'}} for index in range(160)]
+    proposal = copy.deepcopy(proposal); proposal['selected'] = []; proposal['tags'] = []
     result = command(root, 'review_list', snapshot=snapshot, proposal=proposal)
     for name in result['passed']:
         checked('native_' + name.replace(' ', '_'))

@@ -440,6 +440,14 @@ class ReviewStore(Ledger):
             return json.loads(row[2])
         return None
 
+    def selected_keyword_sources(self):
+        """Sources with a saved keyword selection, including an empty selection."""
+        with self.connect() as db:
+            rows = db.execute("""SELECT kind,identity,digest FROM review_queue
+                WHERE status='approved' AND kind IN ('cloud','zotero')
+                AND json_type(approval,'$.keyword_tags')='array'""").fetchall()
+        return {tuple(row) for row in rows}
+
     def primary_collection(self, parent):
         for row in self.rows(pending_only=False):
             if row["status"] == "approved" and row["approval"].get("parent") == parent:

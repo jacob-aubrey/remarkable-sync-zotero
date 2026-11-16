@@ -5,6 +5,7 @@ import unicodedata
 from pathlib import Path
 
 VERSION = 4
+PROPOSAL_VERSION = 5
 HEADING = re.compile(r"^\s*(?:(?:author(?:s)?['’]?\s+)?key[ -]?words?|index\s+terms)\s*(?:[:：—–-]\s*(.*))?$", re.I)
 STOP = re.compile(r'^\s*(?:abstract|introduction|background|references|acknowledg|copyright|received|accepted|\d+[.\s]+[A-Z])', re.I)
 GENERIC = {'paper', 'study', 'results', 'research', 'article', 'copyright', 'elsevier', 'springer', 'abstract', 'introduction', 'conclusion',
@@ -26,6 +27,7 @@ DATE = re.compile(
 AFFILIATION = re.compile(r'\b(?:university|hospital|department of)\b', re.I)
 METADATA = 'PDF/document keyword metadata'
 PRINTED = 'Printed keyword/index-term section'
+KEYWORD_LIST_MARKER = re.compile(r'^\s*([A-Z])\.\s+')
 
 
 def normal(value):
@@ -124,7 +126,7 @@ def review_reason(tag, source, evidence):
     return ''
 
 
-def keyword_candidates(front, metadata='', vocabulary=()):
+def keyword_candidates(front, metadata='', vocabulary=(), *, clean_printed_lists=False):
     canonical = {normal(value): value for value in vocabulary if value == clean(value) and not fragment_reason(value)}
     keywords, review = {}, {}
 
@@ -133,7 +135,13 @@ def keyword_candidates(front, metadata='', vocabulary=()):
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ';', text)
         text = re.sub(r'(\w)-\s*\n(\w)', r'\1\2', text)
         text = re.sub(r'\s*\n\s*', ' ', text)
-        for part in keyword_parts(text):
+        parts = list(keyword_parts(text))
+        markers = ([match[1] for part in parts if (match := KEYWORD_LIST_MARKER.match(part))]
+                   if clean_printed_lists and source == PRINTED else [])
+        lettered = markers[:2] == ['A', 'B'] and markers == sorted(set(markers))
+        for part in parts:
+            if lettered:
+                part = KEYWORD_LIST_MARKER.sub('', part)
             value = clean(part)
             if value:
                 key = normal(value)
@@ -161,6 +169,10 @@ def keyword_candidates(front, metadata='', vocabulary=()):
                 if not parts and next_line and not STOP.match(next_line) and len(list(keyword_parts(next_line))) > 1:
                     continue
                 break
+            if (clean_printed_lists and parts and KEYWORD_LIST_MARKER.match(parts[0])
+                    and KEYWORD_LIST_MARKER.match(following)):
+                parts.append('; ' + following)
+                continue
             if parts and following.lstrip().startswith(tuple(BULLETS + '·')):
                 parts.append(following)
                 continue
@@ -344,7 +356,7 @@ def update_keyword_tag_coverage(link, paper_tags):
     return True
 
 
-def backfill_keywords(client, parent, path, row, save):
+def backfill_keywords(client, parent, path, row, save, *, add_keywords=True):
     """Check the linked PDFs and preserve manual removals of automatic keywords."""
     def reference():
         record = client.get('item', parent)
@@ -359,7 +371,7 @@ def backfill_keywords(client, parent, path, row, save):
     existing = record.get('tags', [])
     previous_keywords = {normal(value['tag']) for value in previous.get('keywords', [])}
     reported = {normal(value['tag']): value['tag'] for value in report['keywords']}
-    if reported.keys() - previous_keywords - {normal(value['tag']) for value in existing}:
+    if add_keywords and reported.keys() - previous_keywords - {normal(value['tag']) for value in existing}:
         # Read the current Zotero tags just before adding keywords: parsing a PDF can
         # take long enough for a separate native edit to change the reference.
         record = reference()
@@ -367,7 +379,7 @@ def backfill_keywords(client, parent, path, row, save):
     current = {normal(value['tag']) for value in existing}
     removed = previous_keywords - current
     keywords = [value for key, value in reported.items() if key not in removed]
-    tags = append_tags(existing, keywords)
+    tags = append_tags(existing, keywords) if add_keywords else existing
     if tags != existing:
         record['tags'] = tags
         client.authorize()
@@ -386,7 +398,7 @@ def backfill_keywords(client, parent, path, row, save):
 def analyse(path, vocabulary=(), existing=()):
     text, front, metadata = read_document(path)
     vocabulary = sorted(set(vocabulary))
-    keywords, review = keyword_candidates(front, metadata, vocabulary)
+    keywords, review = keyword_candidates(front, metadata, vocabulary, clean_printed_lists=True)
     excluded = {normal(tag) for tag in existing} | {normal(row['tag']) for row in keywords}
     suggestions = [row for row in review if normal(row['tag']) not in excluded]
     seen = excluded | {normal(row['tag']) for row in suggestions}

@@ -1475,7 +1475,9 @@ var NotableUI = {
     const params = job.params;
     if (job.title != null && typeof job.title !== 'string') return false;
     if (params.research != null && (!Array.isArray(params.research) || params.research.some(key => !text(key)))) return false;
-    if (params.tags != null && (!Array.isArray(params.tags) || params.tags.some(tag => !text(tag)))) return false;
+    for (const tags of [params.tags, params.keyword_tags]) {
+      if (tags != null && (!Array.isArray(tags) || tags.some(tag => !text(tag)))) return false;
+    }
     if (params.citation != null && (typeof params.citation !== 'object' || Array.isArray(params.citation)
         || Object.values(params.citation).some(value => typeof value !== 'string'))) return false;
     return job.method === 'approve' ? text(params.identity) && text(params.digest)
@@ -1759,7 +1761,7 @@ var NotableUI = {
     'Pair reMarkable': 'plug', 'Refresh folders': 'folder-sync', 'Choose ToSort folder…': 'folder-open',
     'Save setup': 'save', 'Save folder change': 'save', 'Review folder change': 'folder-search',
     'Browse all papers': 'file-search', 'Show only papers needing attention': 'file-search',
-    'Find papers': 'search', 'Find keywords and suggest tags': 'tag', 'Use these tags when filing': 'save', 'Add keywords and selected tags': 'save',
+    'Find papers': 'search', 'Find keywords and suggest tags': 'tag', 'Add keywords and selected tags': 'save',
     'Change folder': 'folder-open', 'Disconnect folder': 'unlink', 'Confirm disconnect': 'unlink',
     'Cancel change': 'x', 'Cancel': 'x', 'Pause sync': 'x'
   },
@@ -2403,7 +2405,8 @@ var NotableUI = {
     try { Zotero.Prefs.set('notable.recentTags', JSON.stringify(this.recentTags), true); }
     catch (error) { if (typeof Zotero !== 'undefined') Zotero.logError?.(error); }
   },
-  renderTagEntry(section, {kind, values, inputValue = '', list, empty = `No ${kind} tags yet.`, onChange}) {
+  filingTagKey(tag) { return tag.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase(); },
+  renderTagEntry(section, {kind, values, inputValue = '', list, empty = `No ${kind} tags yet.`, onChange, tagKey = value => value}) {
     const label = `Add ${kind} tag`, tags = new Set(values);
     const colors = kind === 'paper' && typeof Zotero !== 'undefined' && Zotero.Tags?.getColors(Zotero.Libraries.userLibraryID);
     const chips = this.el('div', '', section, {class: 'tag-chips'});
@@ -2412,11 +2415,17 @@ var NotableUI = {
     input.dataset.browse = 'true'; input.maxLength = 255;
     if (list) input.setAttribute('list', list);
     const actions = this.el('div', '', entry, {class: 'actions'});
-    const update = () => onChange([...tags], input.value);
+    const update = () => { onChange([...tags], input.value); editor.onTagsChange?.(); };
+    const setTags = (values, notify = true) => {
+      tags.clear();
+      for (const value of values) tags.add(value);
+      if (notify) update();
+      draw();
+    };
     const add = (value = input.value) => {
       value = value.trim();
       if (!value) return;
-      tags.add(value);
+      if (![...tags].some(tag => tagKey(tag) === tagKey(value))) tags.add(value);
       if (value === input.value.trim()) { input.value = ''; input.notableRefreshValue(); }
       update(); draw();
     };
@@ -2432,7 +2441,8 @@ var NotableUI = {
         if (colors) this.applyTagColor(chip, value, colors);
         chip.addEventListener('click', () => input.focus());
       }
-      const choices = this.recentTags.filter(tag => !tags.has(tag));
+      const chosen = new Set([...tags].map(tagKey));
+      const choices = this.recentTags.filter(tag => !chosen.has(tagKey(tag)));
       recent.hidden = !choices.length;
       if (choices.length) {
         this.el('strong', 'Recent tags', recent);
@@ -2444,8 +2454,9 @@ var NotableUI = {
     input.addEventListener('keydown', event => {
       if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); add(); }
     });
+    const editor = {tags, add, input, setTags};
     draw();
-    return {tags, add, input};
+    return editor;
   },
   renderTagEditor(content) {
     const context = this.tagEditor;
@@ -4217,21 +4228,24 @@ var NotableUI = {
     if (queue !== 'inbox' && row.payload.parent) this.reviewNavigationButton('Open reference in Zotero', citation, 'references', [row.payload.parent]);
     const tagDetails = this.el('details', '', filing, {'data-review-detail': 'paper-tags'});
     this.el('summary', 'Paper tags', tagDetails);
-    this.el('p', 'Tags are added to the Zotero reference when you approve.', tagDetails, {class: 'hint'});
+    this.el('p', 'Filing adds the tags shown here to the Zotero reference.', tagDetails, {class: 'hint'});
+    const tagDefaults = new Map(draft.tag_defaults || []);
     const paperTags = this.renderTagEntry(tagDetails, {kind: 'paper', values: draft.tags || [], inputValue: draft.tag_input || '',
       list: this.tagSuggestions(tagDetails, 'paper'),
-      empty: 'No tags added to this filing.', onChange: () => saveDraft()});
-    this.paperTagPanel(tagDetails, {identity: row.id});
+      empty: 'No tags added to this filing.', onChange: () => saveDraft(), tagKey: this.filingTagKey});
     if (this.isInboxOfficeFile(row)) this.el('p', 'This Office file can be filed in Zotero.', filing, {class: 'hint'});
     const approve = this.button(this.busy ? 'Add to filing queue' : queue === 'inbox' ? this.inboxActionLabel(row, match?.value) : 'Approve & file', filing, async () => {
       if (pendingPreview) await pendingPreview;
       if (needsFilenamePreview) await requestFilename();
       if (needsFilenamePreview) throw Error('Wait for the updated filename suggestion, or enter the filename to use.');
       if (!main.panel.hidden && !main.select.value) throw Error('Choose the main paper in Zotero for this supporting information.');
+      if (['waiting', 'loading'].includes(tagReview?.state)) throw Error('Wait for the paper keywords to appear, then approve.');
       paperTags.add();
+      const tags = [...paperTags.tags];
+      const keywordTags = tags.filter(tag => tagDefaults.get(tag) === true);
       await this.queueFiling('approve', {identity: row.id, digest: row.digest, filename: filename.value, title: title.value,
         document_type: type.value, collection: home.value, research: Array.from(research.selectedOptions, o => o.value), match: match?.value || '', review_token: row.payload.review_token || '',
-        citation: citationEdits(), tags: [...paperTags.tags],
+        citation: citationEdits(), tags: tags.filter(tag => !keywordTags.includes(tag)), keyword_tags: keywordTags,
         main_reference: main.panel.hidden ? '' : main.select.value,
         main_reference_metadata: main.panel.hidden ? null : JSON.parse(main.select.selectedOptions[0].dataset.metadata)});
     }, true); approve.dataset.queue = 'true'; approve.dataset.approve = 'true';
@@ -4244,9 +4258,10 @@ var NotableUI = {
     const saveDraft = () => this.reviewDrafts.set(row.id, {digest: row.digest, review_token: draft.review_token ?? row.payload.review_token, title: title.value, document_type: type.value, filename: filename.value,
       proposal_baseline: {title: row.payload.title, filename: row.payload.filename, document_type: row.payload.document_type}, edited_fields: [...editedFields],
       generated_filename: generatedFilename, filename_needs_refresh: needsFilenamePreview, citation: {...editedCitation},
-      tags: [...paperTags.tags], tag_input: paperTags.input.value,
+      tags: [...paperTags.tags], tag_input: paperTags.input.value, tag_defaults: [...tagDefaults],
       collection: home.value, research: Array.from(research.selectedOptions, o => o.value), match: match?.value || '',
       main_reference: main.select.value, main_query: main.query.value});
+    const tagReview = this.paperTagPanel(tagDetails, {identity: row.id}, {editor: paperTags, defaults: tagDefaults});
     for (const [field, name] of [[title, 'title'], [filename, 'filename'], [type, 'document_type']]) {
       const edited = () => { editedFields.add(name); if (name === 'filename') { generatedFilename = false; needsFilenamePreview = false; } };
       field.addEventListener('input', edited);
@@ -4294,6 +4309,7 @@ var NotableUI = {
       await this.queueFiling('approve', {identity: row.id, digest: row.digest, filename: saved.filename, title: saved.title,
         document_type: saved.document_type, collection: saved.collection, research: saved.research || [], match: saved.match || '',
         ...(saved.citation_edits ? {citation: saved.citation_edits} : {}), ...(saved.tags?.length ? {tags: saved.tags} : {}),
+        ...(Array.isArray(saved.keyword_tags) ? {keyword_tags: saved.keyword_tags} : {}),
         review_token: row.payload.review_token || '', main_reference: supplement ? saved.parent : '', main_reference_metadata: mainMetadata}, saved.title);
     }, true, 'refresh-cw');
     resume.dataset.queue = 'true';
@@ -4629,7 +4645,48 @@ var NotableUI = {
     } catch (error) {entry.state = 'failed'; entry.error = error.message;}
     finally {this.paperTagChecking = false; this.paperTagBackground = false; notify(); this.schedulePaperTags();}
   },
-  paperTagPanel(parent, scope) {
+  renderFilingTagOptions(output, proposal, {editor, defaults}) {
+    const key = this.filingTagKey;
+    const selected = tag => [...editor.tags].find(value => key(value) === key(tag));
+    const existing = new Set((proposal.tags || []).map(row => key(row.tag)));
+    const additions = new Set(editor.tags);
+    const addDefaults = (tags, stated) => {
+      for (const tag of tags) {
+        if (defaults.has(tag)) continue;
+        defaults.set(tag, stated);
+        if (!existing.has(key(tag)) && !selected(tag)) additions.add(tag);
+      }
+    };
+    addDefaults(proposal.keywords.map(row => row.tag), true);
+    addDefaults(proposal.selected || [], false); // Restore choices saved before the shared tag editor.
+    editor.setTags(additions, false);
+    const controls = [];
+    const options = (title, rows, empty) => {
+      this.el('h3', title, output);
+      if (!rows.length) this.el('p', empty, output, {class: 'hint'});
+      for (const row of rows) {
+        if (existing.has(key(row.tag))) {
+          this.el('p', `${row.tag} · Already in Zotero · ${row.source}`, output, {class: 'hint'});
+          continue;
+        }
+        const input = this.checkbox(row.tag, output, !!selected(row.tag));
+        controls.push([row.tag, input]);
+        input.addEventListener('change', () => {
+          const next = new Set(editor.tags);
+          if (input.checked) next.add(row.tag);
+          else for (const tag of next) { if (key(tag) === key(row.tag)) next.delete(tag); }
+          editor.setTags(next);
+        });
+        this.el('p', row.reason ? `${row.source} · ${row.reason}` : row.source, output, {class: 'hint'});
+      }
+    };
+    options('Stated keywords', proposal.keywords, 'No reliable keyword list found.');
+    options('Suggested tags', proposal.suggestions, 'No additional tags suggested.');
+    editor.onTagsChange = () => {
+      for (const [tag, input] of controls) input.checked = !!selected(tag);
+    };
+  },
+  paperTagPanel(parent, scope, filing) {
     const entry = this.paperTagEntry(scope), draft = entry.draft;
     for (const listener of [...entry.listeners]) if (listener.output?.isConnected === false) entry.listeners.delete(listener);
     for (const output of [...entry.outputs]) if (output.isConnected === false) entry.outputs.delete(output);
@@ -4637,7 +4694,8 @@ var NotableUI = {
     panel.open = draft.open;
     panel.addEventListener('toggle', () => {draft.open = panel.open;});
     this.el('summary', 'Paper keywords and suggested tags', panel);
-    this.el('p', 'Keywords and topic suggestions are prepared automatically. Review them before adding tags.', panel);
+    this.el('p', filing ? 'Stated keywords start checked. Check or uncheck any tag to update the list above.'
+      : 'Keywords and topic suggestions are prepared automatically. Review them before adding tags.', panel);
     const output = this.el('div', '', panel);
     entry.outputs.add(output);
     const render = () => {
@@ -4651,6 +4709,7 @@ var NotableUI = {
         this.button('Retry tag suggestions', output, () => {entry.state = 'waiting'; render(); this.schedulePaperTags();}); return;
       }
       const proposal = entry.proposal;
+      if (filing) { this.renderFilingTagOptions(output, proposal, filing); return; }
       this.el('h3', 'Stated keywords', output);
       if (!proposal.keywords.length) this.el('p', 'No reliable keyword list found. Existing tags will be kept.', output);
       for (const row of proposal.keywords) this.el('p', `${row.tag} — ${row.source}`, output);
@@ -4668,16 +4727,14 @@ var NotableUI = {
       });
       this.el('p', proposal.notice, output, {class: 'hint'});
       const status = this.el('p', draft.saved ? draft.saveStatus : '', output, {class: 'save-status', role: 'status'});
-      const save = this.button(scope.identity ? 'Use these tags when filing' : 'Add keywords and selected tags', output, async () => {
+      const save = this.button('Add keywords and selected tags', output, async () => {
         try {
           const result = await this.action('save_paper_tags', {target: proposal.target, token: proposal.token,
             selected: options.filter(([, input]) => input.checked).map(([tag]) => tag)}, false);
           if (!result?.saved) return;
           draft.saved = true;
           save.disabled = true;
-          status.textContent = draft.saveStatus = result.deferred_until_filing
-            ? 'Tag choices saved. They will be added when this paper is filed.'
-            : 'Paper tags saved to Zotero. Linked copies will receive them on the next sync.';
+          status.textContent = draft.saveStatus = 'Paper tags saved to Zotero. Linked copies will receive them on the next sync.';
           await this.recheckKeywordsAfterSave(result.parent);
         } catch (error) {entry.state = 'failed'; entry.error = error.message; draft.saved = false; render();}
       }, true);
@@ -4685,6 +4742,7 @@ var NotableUI = {
     };
     render.output = output;
     entry.listeners.add(render); render(); this.schedulePaperTags();
+    return entry;
   },
   reviewOpenButton(row, parent) {
     const link = (this.latest.links || []).find(link => link.cloud === row.payload?.cloud);
