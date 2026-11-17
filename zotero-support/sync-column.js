@@ -1,5 +1,6 @@
 /* Show the last committed link state without querying either device per row. */
 var NotableSyncColumn = {
+  revealPref: 'notable.syncColumn.firstShown',
   states: {
     synced: ['✓', 'Synced with reMarkable at the last check'],
     pending: ['↻', 'Waiting for the first completed sync'],
@@ -27,6 +28,24 @@ var NotableSyncColumn = {
         return cell;
       },
     });
+    if (!this.key) Zotero.debug('reMarkable Sync: Zotero rejected registration of the status column.');
+  },
+  async reveal(window) {
+    const key = this.key;
+    if (!key || Zotero.Prefs.get(this.revealPref, true)) return;
+    // Zotero applies the library view's column defaults after registration.
+    // Wait for the real picker and preserve any visibility choices made later.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if (window.closed || this.key !== key || Zotero.Prefs.get(this.revealPref, true)) return;
+      const columns = window.ZoteroPane?.itemsView?.tree?._columns;
+      const index = columns?.getAsArray().findIndex(column => column.dataKey === key) ?? -1;
+      if (index >= 0 && !columns.getAsArray()[index].disabled) {
+        if (columns.getAsArray()[index].hidden) columns.toggleHidden(index);
+        if (!columns.getAsArray()[index].hidden) Zotero.Prefs.set(this.revealPref, true, true);
+        return;
+      }
+      await Zotero.Promise.delay(250);
+    }
   },
   update(snapshot) {
     if (!this.key || !snapshot) return;

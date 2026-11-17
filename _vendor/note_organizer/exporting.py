@@ -38,11 +38,13 @@ def _source_link(entry, page=None):
     An explicitly empty path means there is no verified durable counterpart.
     Older entries without the field retain their original source link.
     """
-    path = entry.get("source_link_path", entry["path"])
     target_page = entry.get("source_link_page", entry["page"]) if page is None else page
-    if not path or not isinstance(target_page, int) or target_page < 1:
+    if not isinstance(target_page, int) or target_page < 1:
         return None
-    return file_uri(path, target_page)
+    if entry.get("source_uri"):
+        return f"{entry['source_uri']}?page={target_page}"
+    path = entry.get("source_link_path", entry["path"])
+    return file_uri(path, target_page) if path else None
 
 
 def _source_hyperlink(paragraph, label, entry, page=None):
@@ -297,6 +299,8 @@ def _source_page_key(entry):
 
 
 def _entry_paper_title(entry):
+    if entry.get("display_title"):
+        return clean_text(entry["display_title"])
     metadata = entry.get("metadata", {})
     if entry.get("logical_paper_title"):
         metadata = {**metadata, "title": entry["logical_paper_title"]}

@@ -73,6 +73,8 @@ CITATION_VENUE = {'journalArticle': 'publicationTitle', 'magazineArticle': 'publ
                   'patent': 'issuingAuthority', 'standard': 'organization', 'webpage': 'websiteTitle', 'document': 'publisher'}
 NATIVE_DOI_TYPES = {*TYPE_MAP.values(), 'magazineArticle', 'newspaperArticle', 'webpage'}
 CITATION_EDITS = {'creators', 'date', 'venue', 'doi', 'patent_number'}
+NON_CITATION_FIELDS = {'id', 'key', 'version', 'itemType', 'libraryID', 'itemID', 'parentItem', 'collections',
+                       'tags', 'relations', 'deleted', 'dateAdded', 'dateModified', 'title', 'inPublications'}
 
 
 def file_sha(path):
@@ -110,10 +112,12 @@ def clean_citation_edits(values):
     from .sorting.metadata_lookup import normalize_doi
     if values is None:
         return {}
-    if not isinstance(values, dict) or any(key not in CITATION_EDITS or not isinstance(value, str) or len(value) > 4000
-                                          for key, value in values.items()):
+    if not isinstance(values, dict):
         raise PilotError('Review the citation fields before continuing.')
-    cleaned = {key: value.strip() for key, value in values.items()}
+    legacy = {key: value for key, value in values.items() if key != 'native'}
+    if any(key not in CITATION_EDITS or not isinstance(value, str) or len(value) > 4000 for key, value in legacy.items()):
+        raise PilotError('Review the citation fields before continuing.')
+    cleaned = {key: value.strip() for key, value in legacy.items()}
     if any('\n' in value or '\r' in value for key, value in cleaned.items() if key != 'creators'):
         raise PilotError('Use a single line for each citation field other than creators.')
     if cleaned.get('doi'):
@@ -121,13 +125,48 @@ def clean_citation_edits(values):
         if not doi:
             raise PilotError('Enter a valid DOI or clear the DOI field.')
         cleaned['doi'] = doi
+    if 'native' in values:
+        native = values['native']
+        if (legacy or not isinstance(native, dict) or set(native) != {'item_type', 'fields', 'before'}
+                or not isinstance(native['item_type'], str) or not re.fullmatch(r'[a-z][A-Za-z0-9]*', native['item_type'])):
+            raise PilotError('Reopen Citation details and review the Zotero draft.')
+        fields, before = native['fields'], native['before']
+        if not isinstance(fields, dict) or not isinstance(before, dict) or not before.keys() <= fields.keys():
+            raise PilotError('Reopen Citation details and review the Zotero draft.')
+        for record in (fields, before):
+            for key, value in record.items():
+                if key == 'creators':
+                    if not isinstance(value, list) or any(not valid_citation_creator(creator) for creator in value):
+                        raise PilotError('Review the creator names and roles in Citation details.')
+                elif (key in NON_CITATION_FIELDS or not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', key)
+                      or not isinstance(value, str)):
+                    raise PilotError('Review the Zotero citation fields before continuing.')
+        fields = fields.copy()
+        if fields.get('DOI'):
+            fields['DOI'] = normalize_doi(fields['DOI'])
+            if not fields['DOI']:
+                raise PilotError('Enter a valid DOI or clear the DOI field.')
+        cleaned['native'] = {**native, 'fields': fields}
     return cleaned
+
+
+def valid_citation_creator(creator):
+    return (isinstance(creator, dict) and (
+        set(creator) == {'creatorType', 'name'} and bool(creator['name'])
+        or set(creator) == {'creatorType', 'firstName', 'lastName'} and bool(creator['firstName'] or creator['lastName'])
+    ) and all(isinstance(value, str) and '\n' not in value and '\r' not in value for value in creator.values())
+       and bool(re.fullmatch(r'[a-z][A-Za-z0-9]*', creator['creatorType'])))
 
 
 def citation_patch(reference, edits, document_type):
     if not edits:
         return {}
     item_type = reference['itemType']
+    if 'native' in edits:
+        native = edits['native']
+        if native['item_type'] != item_type:
+            raise PilotError('The Zotero item type changed. Reopen Citation details before approving.')
+        return native['fields'].copy()
     fields = {'date': ('filingDate' if document_type == 'patent_application' else 'issueDate') if item_type == 'patent' else 'date',
               'venue': CITATION_VENUE.get(item_type), 'doi': 'DOI' if item_type in NATIVE_DOI_TYPES else None,
               'patent_number': 'patentNumber' if item_type == 'patent' else None}
@@ -401,6 +440,7 @@ class Worker:
                 "reviews": pending_reviews, "review_guidance": review_guidance, "review_revision": review_revision,
                 "linked_original_matches": self.state.read("linked_original_matches", []),
                 "deletions": self.review.deletions(), "local_deletions": self.review.local_deletions(), "types": DOCUMENT_TYPE_LABELS,
+                'citation_types': TYPE_MAP,
                 "collections": self.collections, "mappings": self.state.read("folders", {}),
                 'folder_issues': folder_blocks.get('issues', []), 'blocked_collections': folder_blocks.get('zotero', []),
                 "cleanup_pending": len(self.review.cleanups()), "bulk": self.bulk.read(),
@@ -2196,6 +2236,26 @@ class Worker:
             if started_trace and self.trace.operation:
                 self.trace.finish("completed" if self.last.get("state") in {"ready", "needs_review"} else "stopped")
 
+    def citation_draft(self, identity, digest, document_type):
+        row = self.review.row(identity)
+        if not row or row['digest'] != digest:
+            raise PilotError('The document changed. Refresh Inbox before editing its citation.')
+        payload = row['payload']
+        details = payload.get('details', {})
+        original = payload.get('citation') or {
+            'creators': '\n'.join(filter(None, details.get('creators') or [details.get('primary_creator')])),
+            'date': details.get('year'), 'venue': details.get('venue_or_publisher') or details.get('journal'),
+            'doi': details.get('identifier', {}).get('doi'),
+            'patent_number': details.get('patent_number') or details.get('identifier', {}).get('patent'),
+        }
+        item_type = TYPE_MAP.get(document_type, 'document')
+        seed = {key: str(value) for key, value in original.items() if value
+                and not re.fullmatch(r'Unknown(?: (?:author|journal|publisher))?', str(value), re.I)
+                and (key != 'patent_number' or item_type == 'patent')}
+        if 'creators' in seed:
+            seed['creators'] = '\n'.join(name for name in seed['creators'].splitlines() if name.strip().lower() not in {'unknown', 'unknown author'})
+        return {'item_type': item_type, 'fields': citation_patch({'itemType': item_type}, seed, document_type)}
+
     def preview(self, identity, document_type, title, template=None, citation=None):
         from .sorting.core_logic import _normalize_year, validate_filename_template
         from .zotero_filenames import PLACEHOLDER, proposed_filename, title_filename
@@ -2207,6 +2267,16 @@ class Worker:
         details = {**row["payload"]["details"], "document_type": document_type, "title": title}
         details['is_supplementary_material'] = supplement
         edits = clean_citation_edits(citation)
+        if native := edits.get('native'):
+            fields = native['fields']
+            item_type = native['item_type']
+            role = creator_role(item_type)
+            date_field = ('filingDate' if document_type == 'patent_application' else 'issueDate') if item_type == 'patent' else 'date'
+            edits = {name: fields[field] for name, field in (('date', date_field), ('venue', CITATION_VENUE.get(item_type)),
+                     ('doi', 'DOI'), ('patent_number', 'patentNumber')) if field in fields}
+            if 'creators' in fields:
+                creators = [creator_name(creator) for creator in fields['creators'] if creator['creatorType'] == role]
+                edits['creators'] = '\n'.join(creators or [creator_name(creator) for creator in fields['creators']])
         if 'creators' in edits:
             details['creators'] = [line.strip() for line in edits['creators'].splitlines() if line.strip()]
             details['primary_creator'] = next(iter(details['creators']), '')
@@ -2387,6 +2457,11 @@ class Worker:
             fields = citation_patch(reference or {'itemType': TYPE_MAP.get(document_type, 'document')}, edits, document_type)
             if edits:
                 original = row['approval'].get('citation_original') if row['status'] == 'applying' else None
+                if original is None and (native := edits.get('native')):
+                    if (native['before'] and not reference
+                            or any(((reference or {}).get(field) or None) != (value or None)
+                                   for field, value in native['before'].items())):
+                        raise PilotError('The Zotero citation changed. Reopen Citation details and review the current fields.')
                 if original is not None:
                     if any(((reference or {}).get(field) or None) not in (value or None, fields.get(field) or None)
                            for field, value in original.items()):
@@ -3003,7 +3078,7 @@ class Worker:
         finally:
             client.close()
 
-    def tag_context(self, key, page=None):
+    def tag_context(self, key, page=None, notebook_tag=None):
         from .zotero_tags import names
         links = self.state.read('documents', {})
         matches = [(identity, row) for identity, row in links.items() if row.get('view_key') == key]
@@ -3036,6 +3111,9 @@ class Worker:
                                           if pid not in row['page_map'] and values}}
             context['token'] = fingerprint(context)
             context.update(parent_key=row['parent'], pdf_digest=row['page_map_digest'])
+            if notebook_tag is not None:
+                context['notebook_pages'] = [index for index, identity in enumerate(row['page_map'])
+                                             if notebook_tag in row.get('page_tags', {}).get(identity, [])]
             return context
         finally:
             client.close()
@@ -3399,6 +3477,14 @@ class Worker:
     def local_check(self, method, params):
         """Only scan local evidence and save review rows or previews in this process."""
         self.background_check = True
+        if method == 'generate_notebook':
+            from .zotero_notebook import generate_notebook
+
+            return generate_notebook(**params)
+        if method == 'citation_draft':
+            return self.citation_draft(**params)
+        if method == 'tag_context' and isinstance(params.get('notebook_tag'), str):
+            return self.tag_context(**params)
         if method == 'maintenance' and params == {'action': 'names'}:
             return self.maintenance(**params)
         if method == 'check_inbox':

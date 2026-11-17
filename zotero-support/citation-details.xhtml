@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-stylesheet href="chrome://global/skin/global.css" type="text/css"?>
+<?xml-stylesheet href="chrome://zotero/skin/zotero.css" type="text/css"?>
+<?xml-stylesheet href="chrome://zotero-platform/content/zotero.css" type="text/css"?>
+<window xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+        xmlns:html="http://www.w3.org/1999/xhtml" windowtype="notable:citation-details"
+        title="Citation details" width="650" height="540">
+  <linkset><html:link rel="localization" href="zotero.ftl" /></linkset>
+  <html:style>
+    :root { background: Canvas; color: CanvasText; }
+    #citation-editor { display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; padding: 12px 16px; gap: 10px; }
+    #citation-scroll { flex: 1; min-height: 0; overflow: auto; }
+    #citation-type { margin: 0; font-size: 1.2em; font-weight: 600; }
+    #citation-draft-hint { margin: 0; }
+    #citation-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: 8px; }
+    #citation-actions button { min-height: 30px; padding-inline: 12px; }
+  </html:style>
+  <html:div id="citation-editor">
+    <html:h1 id="citation-type">Citation details</html:h1>
+    <html:p id="citation-draft-hint">Edits are saved to Zotero when you approve filing.</html:p>
+    <html:div id="citation-scroll" />
+    <html:div id="citation-actions">
+      <html:button id="citation-cancel" type="button">Cancel</html:button>
+      <html:button id="citation-apply" type="button">Use citation</html:button>
+    </html:div>
+  </html:div>
+  <script src="chrome://notable/content/citation-details.js" />
+</window>

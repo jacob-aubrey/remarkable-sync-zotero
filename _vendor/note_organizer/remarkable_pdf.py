@@ -564,7 +564,12 @@ def _annotated_pdf(item, bundle, cancelled=lambda: False, *, expand_margins=True
                 # expensive and can hold the GIL long enough to lose heartbeats.
                 output.insert_pdf(original, from_page=source_index, to_page=source_index, links=False,
                                   final=int(index == last_copy))
-                label = original[source_index].get_label() or str(source_index + 1)
+                try:
+                    label = original[source_index].get_label()
+                except IndexError:
+                    # PyMuPDF raises when the first label rule starts after this page.
+                    label = ''
+                label = label or str(source_index + 1)
             else:
                 size = getattr(tree.scene_info, "paper_size", None) if tree else None
                 w, h = size or (1404, 1872)

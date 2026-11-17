@@ -141,6 +141,29 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.worker.preview(identity, 'journal_article', details['title'])['filename'],
                          'Gunaseelan_et_al_Advanced_Science_2024.pdf')
 
+    def test_inbox_approval_applies_native_citation_fields_and_guards_newer_edits(self):
+        self.add_pdf()
+        reference = self.zot.items['PARENT23']
+        reference['numPages'] = '100'
+        with patch.object(self.worker.review, 'observe_ready', return_value=True):
+            status = self.worker.scan_inbox(discover=True)
+        row = next(row for row in status['reviews'] if row['kind'] == 'zotero')
+        creators = [{'creatorType': 'author', 'firstName': 'Jane', 'lastName': 'Aubrey'},
+                    {'creatorType': 'contributor', 'name': 'Research Consortium'}]
+        native = {'item_type': 'thesis', 'fields': {'numPages': '142', 'creators': creators},
+                  'before': {'numPages': '', 'creators': []}}
+        with self.assertRaisesRegex(PilotError, 'Zotero citation changed'):
+            self.worker.approve(row['id'], row['digest'], 'Reviewed.pdf', 'Dissertation', 'thesis_dissertation',
+                                'ROOT2345', citation={'native': native})
+        self.assertEqual(self.worker.review.row(row['id'])['status'], 'pending')
+        native['before']['numPages'] = '100'
+        self.worker.approve(row['id'], row['digest'], 'Reviewed.pdf', 'Dissertation', 'thesis_dissertation',
+                            'ROOT2345', citation={'native': native})
+        result = self.zot.items['PARENT23']
+        self.assertEqual(result['numPages'], '142')
+        self.assertEqual(result['creators'], creators)
+        self.assertEqual(result['university'], 'Example')
+
     def test_authoritative_Zotero_citation_still_generates_a_complete_name(self):
         path = self.root / 'Readable original.pdf'
         details = {'title': 'Targeted K-edge nanoprobes', 'document_type': 'journal_article',

@@ -77,6 +77,7 @@ var NotableUI = {
           onShowing: (event, {menuElem}) => menuElem.setAttribute('label', label),
           onCommand: () => this.open()}]});
     }
+    globalThis.NotableNotebook?.register(this);
     // Startup is awaited while Zotero initializes plugins, before its first
     // normal window can finish loading. Do not block that chain on UI ready.
     Zotero.uiReadyPromise.then(async () => {
@@ -186,6 +187,7 @@ var NotableUI = {
       this.open();
     });
     toolbar.appendChild(button); this.windows.add(window);
+    globalThis.NotableSyncColumn?.reveal(window).catch(error => Zotero.logError(error));
     if (this.latest) this.badge();
   },
   detach(window) {
@@ -213,6 +215,7 @@ var NotableUI = {
     this.view?.close(); this.view = null;
     for (const window of this.windows) this.detach(window);
     for (const target of ['main-menubar-tools', 'main-library-item']) Zotero.MenuManager.unregisterMenu('notable-' + target);
+    if (globalThis.NotableNotebook) Zotero.MenuManager.unregisterMenu(NotableNotebook.menuID);
     // A launch which is already awaiting Subprocess.call must observe stopped
     // and finish its child before replacement can create another writer.
     if (this.launching) { try { await this.launching; } catch (_) {} }
@@ -2249,6 +2252,7 @@ var NotableUI = {
     this.view?.document.querySelector?.('nav button[aria-pressed="true"]')?.focus?.({preventScroll: true});
   },
   render() {
+    if (this.citationDialogOpen) { this.inboxRenderPending = true; return; }
     if (!this.view || this.view.closed) return;
     this.inboxRenderPending = false;
     this.collectionCatalog();
@@ -2764,6 +2768,14 @@ var NotableUI = {
       state.tags.clear(); state.browseAll = false; updateTagButtons(); updateSelection(); apply(); input.focus();
     });
     clear.dataset.browse = 'true';
+    const notebook = this.button('Generate Word notebook…', selected, async () => {
+      const [tag] = state.tags;
+      try {
+        const message = await NotableNotebook.generate(this, this.view, {tag, scope: state.scope, showAutomatic: state.showAutomatic});
+        this.message(message || '');
+      } catch (error) { this.message(error.message, true); }
+    });
+    notebook.dataset.browse = 'true';
     const browse = this.button('Show all tagged items', panel, () => { state.browseAll = true; apply(); count.focus(); });
     browse.dataset.browse = 'true';
     const count = this.el('p', '', panel, {class: 'paper-search-count', role: 'status', tabindex: '-1'});
@@ -2809,6 +2821,7 @@ var NotableUI = {
     const apply = () => { state.limit = 25; this.runTagSearch(state); };
     const updateSelection = () => {
       selected.hidden = !state.tags.size;
+      notebook.hidden = state.tags.size !== 1;
       selectedList.replaceChildren();
       for (const value of state.tags) {
         const chip = this.button(`${value} ×`, selectedList, () => {
@@ -3097,14 +3110,20 @@ var NotableUI = {
       if (preview.can_undo) this.button('Undo previous highlight choice', output, () => queue({undo: true}));
     });
   },
-  async maintenanceFile(title, mode, suffix = '', suggested = '') {
+  async pickLocalFile(window, {title, mode, filter, suffix, suggested, defaultExtension}) {
     const {FilePicker} = ChromeUtils.importESModule('chrome://zotero/content/modules/filePicker.mjs');
     const picker = new FilePicker();
-    picker.init(this.view, title, picker[mode]);
-    if (suffix) picker.appendFilter(suffix === '.zip' ? 'ZIP backups' : 'Markdown files', '*' + suffix);
+    picker.init(window, title, picker[mode]);
+    if (suffix) picker.appendFilter(filter, '*' + suffix);
     if (suggested) picker.defaultString = suggested;
-    if (await picker.show() === picker.returnOK) return picker.file;
-    return null;
+    if (defaultExtension) picker.defaultExtension = defaultExtension;
+    const choice = await picker.show();
+    return [picker.returnOK, picker.returnReplace].includes(choice)
+      ? {path: picker.file, replace: choice === picker.returnReplace} : null;
+  },
+  async maintenanceFile(title, mode, suffix = '', suggested = '') {
+    const file = await this.pickLocalFile(this.view, {title, mode, suffix, suggested, filter: suffix === '.zip' ? 'ZIP backups' : 'Markdown files'});
+    return file && !file.replace ? file.path : null;
   },
   renderMaintenance(content) {
     const panel = this.el('details', '', content, {class: 'card'});
@@ -4166,8 +4185,15 @@ var NotableUI = {
     const filename = this.field('Proposed filename', filing, this.reviewProposalValue(row, draft, 'filename'));
     let generatedFilename = !!draft.generated_filename, needsFilenamePreview = !!draft.filename_needs_refresh, previewSerial = 0, pendingPreview;
     const editedCitation = {...draft.citation};
-    const citationEdits = () => Object.fromEntries(Object.entries(editedCitation).filter(([key]) =>
-      type.value !== 'supporting_information' && (key !== 'patent_number' || type.value.startsWith('patent'))));
+    const citationEdits = () => {
+      if (type.value === 'supporting_information') return {};
+      if (editedCitation.native) {
+        const itemType = this.latest.citation_types?.[type.value];
+        return {native: !row.payload.parent && itemType
+          ? NotableCitationDraft.retarget(editedCitation.native, itemType) : editedCitation.native};
+      }
+      return Object.fromEntries(Object.entries(editedCitation).filter(([key]) => key !== 'patent_number' || type.value.startsWith('patent')));
+    };
     const requestFilename = () => {
       const serial = ++previewSerial, previous = filename.value;
       const params = {identity: row.id, document_type: type.value, title: title.value, citation: citationEdits()};
@@ -4203,29 +4229,55 @@ var NotableUI = {
       [['', row.kind === 'cloud' ? 'Choose an existing Zotero PDF…' : 'Create a separate reMarkable copy'], ...row.payload.matches.map(m => [m.key, 'Use: ' + m.title])],
       draft.match ?? (row.payload.matches.length === 1 ? row.payload.matches[0].key : ''), {details: option => {const match = row.payload.matches.find(value => value.key === option.value); return match?.filename || match?.name || '';}});
     if (match) this.el('p', 'Using the existing copy keeps its notes. Your approval can update its name and folder.', filing, {class: 'hint'});
-    const citation = this.el('details', '', filing, {'data-review-detail': 'citation'}); this.el('summary', 'Citation details', citation);
-    const details = row.payload.details || {};
-    this.el('p', 'Edits are saved to the Zotero reference when you approve. Use Suggest filename to include citation changes in the name.', citation, {class: 'hint'});
-    const originals = row.payload.citation || {creators: (details.creators || [details.primary_creator]).filter(Boolean).join('\n'),
-      date: details.year, venue: details.venue_or_publisher || details.journal, doi: details.identifier?.doi,
-      patent_number: details.patent_number || details.identifier?.patent};
-    const patent = this.el('div', '', citation);
-    const citationInputs = [['creators', 'Creators (one per line)'], ['date', 'Date or year'],
-      ['venue', 'Journal, publisher, or institution'], ['doi', 'DOI'], ['patent_number', 'Patent number']];
-    for (const [key, label] of citationInputs) {
-      const initial = String(originals[key] || '').replace(/^Unknown(?: (?:author|journal|publisher))?$/i, '');
-      const input = this.field(label, key === 'patent_number' ? patent : citation, editedCitation[key] ?? initial,
-        key === 'creators' ? 'textarea' : 'input');
-      if (key === 'creators') { input.rows = 3; input.classList?.add('notable-wrapped-field'); }
-      input.addEventListener('input', () => {
-        if (input.value === initial) delete editedCitation[key]; else editedCitation[key] = input.value;
-        saveDraft();
+    if (queue === 'inbox') {
+      const edit = this.button('Citation details…', filing, async () => {
+        edit.disabled = true;
+        try {
+          const result = await NotableCitationDraft.edit(this, row, type.value, title.value, editedCitation.native);
+          if (!result) return;
+          for (const key of Object.keys(editedCitation)) delete editedCitation[key];
+          if (result.patch) editedCitation.native = result.patch;
+          if (title.value !== result.title) {
+            title.value = result.title;
+            title.notableRefreshValue();
+            editedFields.add('title');
+          }
+          saveDraft();
+        } finally {
+          edit.disabled = false;
+          if (this.inboxRenderPending && !this.view?.closed) this.render();
+        }
       });
+      edit.dataset.browse = 'true';
+      const showCitation = () => { edit.hidden = type.value === 'supporting_information'; };
+      showCitation();
+      type.addEventListener('change', showCitation);
+    } else {
+      const citation = this.el('details', '', filing, {'data-review-detail': 'citation'});
+      this.el('summary', 'Citation details', citation);
+      const details = row.payload.details || {};
+      this.el('p', 'Edits are saved to the Zotero reference when you approve. Use Suggest filename to include citation changes in the name.', citation, {class: 'hint'});
+      const originals = row.payload.citation || {creators: (details.creators || [details.primary_creator]).filter(Boolean).join('\n'),
+        date: details.year, venue: details.venue_or_publisher || details.journal, doi: details.identifier?.doi,
+        patent_number: details.patent_number || details.identifier?.patent};
+      const patent = this.el('div', '', citation);
+      const citationInputs = [['creators', 'Creators (one per line)'], ['date', 'Date or year'],
+        ['venue', 'Journal, publisher, or institution'], ['doi', 'DOI'], ['patent_number', 'Patent number']];
+      for (const [key, label] of citationInputs) {
+        const initial = String(originals[key] || '').replace(/^Unknown(?: (?:author|journal|publisher))?$/i, '');
+        const input = this.field(label, key === 'patent_number' ? patent : citation, editedCitation[key] ?? initial,
+          key === 'creators' ? 'textarea' : 'input');
+        if (key === 'creators') input.rows = 3;
+        input.addEventListener('input', () => {
+          if (input.value === initial) delete editedCitation[key]; else editedCitation[key] = input.value;
+          saveDraft();
+        });
+      }
+      const showCitation = () => { citation.hidden = type.value === 'supporting_information'; patent.hidden = !type.value.startsWith('patent'); };
+      showCitation();
+      type.addEventListener('change', showCitation);
+      if (row.payload.parent) this.reviewNavigationButton('Open reference in Zotero', citation, 'references', [row.payload.parent]);
     }
-    const showCitation = () => { citation.hidden = type.value === 'supporting_information'; patent.hidden = !type.value.startsWith('patent'); };
-    showCitation();
-    type.addEventListener('change', showCitation);
-    if (queue !== 'inbox' && row.payload.parent) this.reviewNavigationButton('Open reference in Zotero', citation, 'references', [row.payload.parent]);
     const tagDetails = this.el('details', '', filing, {'data-review-detail': 'paper-tags'});
     this.el('summary', 'Paper tags', tagDetails);
     this.el('p', 'Filing adds the tags shown here to the Zotero reference.', tagDetails, {class: 'hint'});

@@ -66,6 +66,102 @@ async function startup({rootURI}) {
               if (ui.view?.document.querySelector('[role="alert"]')) break;
               await Zotero.Promise.delay(100);
             }
+          } else if (command.action === 'notebook_and_citation') {
+            const win = Zotero.getMainWindow();
+            const wait = async (test, message) => {
+              const deadline = Date.now() + 30000;
+              while (Date.now() < deadline) {
+                const value = await test();
+                if (value) return value;
+                await Zotero.Promise.delay(75);
+              }
+              throw Error(typeof message === 'function' ? message() : message);
+            };
+            const collection = new Zotero.Collection();
+            collection.libraryID = Zotero.Libraries.userLibraryID;
+            collection.name = 'Notebook collection';
+            await collection.saveTx();
+            const paper = new Zotero.Item('journalArticle');
+            paper.libraryID = collection.libraryID;
+            paper.setField('title', 'Notebook article');
+            paper.setCreators(Array.from({length: 12}, (_, index) => ({creatorType: 'author', firstName: 'Example', lastName: 'Creator ' + index})));
+            paper.addTag('Notebook topic');
+            paper.addToCollection(collection.id);
+            await paper.saveTx();
+            const pdf = await Zotero.Attachments.importFromFile({file: Zotero.File.pathToFile(command.source), parentItemID: paper.id});
+            await Zotero.Annotations.saveFromJSON(pdf, {key: Zotero.DataObjectUtilities.generateKey(), type: 'highlight',
+              text: 'An annotated passage', comment: 'Research note', color: '#ffd400', pageLabel: '1',
+              sortIndex: '00000|000001|00000', position: {pageIndex: 0, rects: [[10, 10, 120, 35]]}});
+            const status = await ui.rpc('status');
+            ui.latest = {...status, links: [{parent: paper.key, view_key: pdf.key, revision: '1'}]};
+            ui.badge();
+            await win.ZoteroPane.selectItem(paper.id);
+            const visible = element => !!element?.getClientRects().length && !element.hidden;
+            await wait(() => [...win.document.querySelectorAll('.virtualized-table-header .cell')].some(node => visible(node) && node.textContent.trim() === 'reMarkable'),
+              'The reMarkable header is hidden in the real item list');
+            await wait(() => [...win.document.querySelectorAll('[aria-label="Synced with reMarkable at the last check"]')]
+              .some(node => visible(node) && node.textContent === '✓'), 'The linked paper has no visible status icon');
+
+            ui.tab = 'tags';
+            ui.render();
+            const doc = ui.view.document;
+            const button = text => [...doc.querySelectorAll('button')].find(node => node.textContent.trim() === text && visible(node));
+            (await wait(() => button('Notebook topic'), 'The Zotero paper tag was not listed')).click();
+            const generate = await wait(() => button('Generate Word notebook…'), 'Selecting one tag did not offer Word export');
+            const pickLocalFile = ui.pickLocalFile;
+            ui.pickLocalFile = async () => ({path: command.target, replace: false});
+            try {
+              generate.click();
+              await wait(() => doc.getElementById('message').textContent.startsWith('Saved ') && IOUtils.exists(command.target),
+                () => 'The tag export did not create a Word file. ' + doc.getElementById('message').textContent);
+            } finally {
+              ui.pickLocalFile = pickLocalFile;
+            }
+
+            await win.ZoteroPane.collectionsView.selectCollection(collection.id);
+            await win.ZoteroPane.buildCollectionContextMenu();
+            const collectionMenu = win.document.getElementById('zotero-collectionmenu');
+            collectionMenu.dispatchEvent(new win.Event('popupshowing', {bubbles: true}));
+            await wait(() => collectionMenu.querySelector('menuitem[label="Generate Word notebook…"]:not([hidden])'),
+              'The native collection menu did not offer Word export');
+
+            const row = {id: 'fixture-citation', kind: 'inbox', status: 'pending', identity: 'fixture', digest: 'fixture',
+              payload: {title: paper.getDisplayTitle(), parent: paper.key, filename: 'Notebook article.pdf', path: command.source,
+                document_type: 'journal_article', details: {}, issues: []}};
+            ui.latest = {...status, config: {zotero_root: collection.key, tablet_root: 'fixture-tablet', sync_paused: true},
+              collections: [{key: collection.key, name: collection.name}], mappings: {[collection.key]: {cloud: 'fixture-tablet'}}, reviews: [row]};
+            ui.tab = 'inbox';
+            ui.render();
+            const open = async () => {
+              const edit = await wait(() => button('Citation details…'), 'Inbox has no Citation details command');
+              edit.click();
+              return wait(() => {
+                const dialog = Services.wm.getMostRecentWindow('notable:citation-details');
+                return dialog?.document.querySelector('info-box [fieldname="volume"]') && dialog;
+              }, () => 'The Zotero Info editor did not render in the citation window. ' + doc.getElementById('message').textContent);
+            };
+            const dialog = await open();
+            const form = dialog.document.querySelector('info-box');
+            const more = form.querySelector('#more-creators-label');
+            if (!more) throw Error('The native editor did not offer to expand the long creator list');
+            more.querySelector('button, label, a')?.click();
+            if (form.querySelectorAll('.creator-type-value').length !== 12) more.click();
+            await wait(() => form.querySelectorAll('.creator-type-value').length === 12, 'Expanding creators did not reveal all 12 authors');
+            form.item.setField('volume', '42');
+            dialog.document.getElementById('citation-apply').click();
+            await wait(() => ui.reviewDrafts.get(row.id)?.citation?.native?.fields.volume === '42', 'The native field edit was not saved as an Inbox draft');
+            if (paper.getField('volume')) throw Error('Using a citation draft saved changes to Zotero before approval');
+            ui.latest.reviews = [command.newReview];
+            ui.render();
+            const newDialog = await open();
+            const newItem = newDialog.document.querySelector('info-box').item;
+            if (newItem.id || newItem.getField('publicationTitle') !== 'Example journal' || newItem.getCreator(0).lastName !== 'Reader') {
+              throw Error('An unfiled download did not open with its proposed creator and journal');
+            }
+            newDialog.document.getElementById('citation-cancel').click();
+            await wait(() => !ui.citationDialogOpen, 'Cancel did not close the draft');
+            if (ui.reviewDrafts.get(command.newReview.id)?.citation?.native) throw Error('Cancel saved a citation draft');
+            response.workflow = {attachment: pdf.key, citation: ui.reviewDrafts.get(row.id).citation};
           } else if (command.action === 'sync_column_and_keyword_recheck') {
             await ui.refresh();
             const win = Zotero.getMainWindow();
@@ -1740,6 +1836,31 @@ def review_scroll_checks(root, checked):
         checked('native_scroll_' + name.replace(' ', '_'))
 
 
+def notebook_and_citation_checks(root, checked):
+    from docx import Document
+    from note_organizer.zotero_worker import file_sha
+
+    source = root / 'Notebook article.pdf'
+    source.write_bytes(pdf_bytes())
+    path = root / 'Notes on Notebook topic.docx'
+    worker = Worker(root / 'profile/notable', recover_pause=False)
+    review_id = worker.review.offer('inbox', str(source), file_sha(source), {
+        'path': str(source), 'filename': source.name, 'title': 'Unfiled download', 'document_type': 'journal_article',
+        'details': {'creators': ['Eve Reader'], 'journal': 'Example journal', 'year': '2026'}, 'issues': [],
+    })
+    result = command(root, 'notebook_and_citation', source=str(source), target=str(path), newReview=worker.review.row(review_id))['workflow']
+    notebook = Document(path)
+    assert 'An annotated passage' in [p.text for p in notebook.paragraphs]
+    assert 'Note: Research note' in [p.text for p in notebook.paragraphs]
+    assert any(rel.is_external and rel.target_ref.endswith(f'/items/{result["attachment"]}?page=1') for rel in notebook.part.rels.values())
+    assert result['citation']['native']['before'] == {'volume': ''}
+    checked('visible_Zotero_status_column_and_linked_paper_icon')
+    checked('Tags_button_exports_real_Zotero_annotations_and_source_links_to_Word')
+    checked('native_Zotero_collection_menu_offers_Word_export')
+    checked('Inbox_uses_the_native_Info_editor_with_expandable_creators_and_draft_only_edits')
+    checked('an_unfiled_download_shows_citation_suggestions_and_Cancel_discards_edits')
+
+
 def review_guidance_checks(root, checked):
     """Render structured library findings and mapping comparisons in real Zotero."""
     import copy
@@ -2038,6 +2159,7 @@ def main():
     parser.add_argument('--preferences-checks', action='store_true', help='Open Setup from Zotero’s native settings pane')
     parser.add_argument('--tagging-checks', action='store_true')
     parser.add_argument('--review-scroll-checks', action='store_true', help='Only synthetic review input/layout checks; no cloud or library import')
+    parser.add_argument('--notebook-and-citation-checks', action='store_true', help='Exercise notebook export, citation drafts, and status visibility with synthetic Zotero items')
     parser.add_argument('--review-guidance-checks', action='store_true', help='Render structured library and paper/folder guidance at wide/narrow widths')
     parser.add_argument('--existing-fixture', type=Path, help='Copy only a previous synthetic fixture into this new disposable profile')
     args = parser.parse_args()
@@ -2102,11 +2224,13 @@ def main():
             command(root, 'tab', tab='review')
             checked('graphical_connect_persists_permission_without_terminal')
             snapshot = native_checks(client, root, checked) if not (args.existing_fixture or args.review_scroll_checks
-                         or args.review_guidance_checks or args.maintenance_checks) else None
+                         or args.review_guidance_checks or args.maintenance_checks or args.notebook_and_citation_checks) else None
             if args.maintenance_checks:
                 maintenance_checks(client, root, checked)
             if args.review_scroll_checks:
                 review_scroll_checks(root, checked)
+            if args.notebook_and_citation_checks:
+                notebook_and_citation_checks(root, checked)
             if args.review_guidance_checks:
                 review_guidance_checks(root, checked)
             if args.bulk_count:
@@ -2117,7 +2241,7 @@ def main():
                 activity_checks(root, checked)
             if args.tagging_checks:
                 tagging_checks(client, root, checked)
-            if not (args.skip_ocr or args.review_scroll_checks or args.review_guidance_checks or args.maintenance_checks):
+            if not (args.skip_ocr or args.review_scroll_checks or args.review_guidance_checks or args.maintenance_checks or args.notebook_and_citation_checks):
                 bundled_search_checks(client, root, args.handwriting_pdf, checked)
             if snapshot:
                 rendered = command(root, 'render', snapshot=snapshot, tab='sync-review')

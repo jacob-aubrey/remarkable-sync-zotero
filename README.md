@@ -19,6 +19,8 @@ In **Linked papers**, the citation, fields and tags, and full-text modes use Zot
 
 In **Tags**, type to narrow the list of tag names, then select tags to filter results as you go. Paper tags are shared with the Zotero reference. **Show Zotero tags** opens the reference’s native Tags section. Page tags are saved for individual pages of linked PDFs. Use the tag button in the PDF reader to edit paper and page tags together.
 
+Select one tag and choose **Generate Word notebook…** to save a snapshot of its PDF annotations. Paper tags include the matching papers’ annotations, and page tags include the tagged pages. You can also right-click a collection in Zotero and choose **Generate Word notebook…**, with the option to include subcollections. The export uses Notable’s Reading layout and links back to the relevant pages in Zotero. The Windows helper already bundles the MIT-licensed [python-docx](https://github.com/python-openxml/python-docx) writer.
+
 ### Merge duplicates in Zotero
 
 Use Zotero’s **Merge Items** for duplicate references. On the next sync, the plugin follows the native merge when it can verify the connected PDFs and the existing tablet copy. It can also follow Zotero Undo when the original PDF and reference return. If Zotero combined both linked references or the PDF changed, **Sync Conflicts** shows the affected connection for review. Use Zotero Undo to recover the original arrangement when you need to keep both links. [Zotero duplicate management](https://www.zotero.org/support/duplicate_detection)
@@ -29,7 +31,7 @@ If a PDF in your configured ToSort folder identifies a unique Zotero reference t
 
 Matching runs locally. It uses explicit DOI evidence read by the bundled [PyMuPDF](https://pymupdf.readthedocs.io/en/latest/document.html) and the existing DOI normalizer. A printed DOI also needs a matching paper title. Attaching uses Zotero’s existing [stored-copy workflow](https://www.zotero.org/support/attaching_files).
 
-Inbox lets you edit citation details and add paper tags before approval. Changing the document type updates the suggested filename. Use **Suggest filename** to include citation edits or replace a manually entered name. Approval saves the edited fields using the Zotero reference’s existing item type and adds your tags to its current tags. [Zotero item fields](https://www.zotero.org/support/kb/item_types_and_fields) · [Zotero write API](https://www.zotero.org/support/dev/web_api/v3/write_requests)
+Open **Citation details…** in Inbox to edit a draft using Zotero’s Info editor, including creator roles, names, and order. Choose **Use citation** to return to Inbox with your edits. Use **Suggest filename** to include citation edits or replace a manually entered name. Approval saves the citation and adds your paper tags. [Zotero item fields](https://www.zotero.org/support/kb/item_types_and_fields) · [Zotero write API](https://www.zotero.org/support/dev/web_api/v3/write_requests)
 
 ### Confirm a linked folder deletion
 
@@ -50,7 +52,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.26.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.27.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

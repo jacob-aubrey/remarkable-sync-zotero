@@ -120,6 +120,15 @@ class PDFNavigationRecoveryTests(unittest.TestCase):
         content = {"fileType": "pdf", "cPages": {"pages": records}}
         return {"paper.pdf": data, "paper.content": json.dumps(content).encode()}
 
+    def test_pages_before_the_first_label_rule_use_their_page_number(self):
+        bundle = self.bundle([0, 1, 2])
+        with pymupdf.open(stream=bundle["paper.pdf"], filetype="pdf") as source:
+            source.set_page_labels([{"startpage": 1, "prefix": "S", "style": "D"}])
+            bundle["paper.pdf"] = source.tobytes()
+        data = annotated_pdf(SimpleNamespace(id="paper"), bundle)
+        with pymupdf.open(stream=data, filetype="pdf") as document:
+            self.assertEqual([page.get_label() for page in document], ["1", "S1", "S2"])
+
     def test_bookmarks_and_cross_page_and_external_links_survive_reordered_added_pages(self):
         bundle = self.bundle([2, -1, 0])
         before = dict(bundle)
