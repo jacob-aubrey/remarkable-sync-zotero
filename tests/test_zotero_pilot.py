@@ -163,7 +163,7 @@ class ZoteroPilotTests(unittest.TestCase):
         client = LocalZotero.__new__(LocalZotero)
         client._reader_support = False
         client.reader_annotations = Mock(return_value=[{"itemType": "annotation"}])
-        with self.assertRaisesRegex(PilotError, "Companion Support"):
+        with self.assertRaisesRegex(PilotError, "reMarkable Sync for Zotero"):
             client.native_annotation_count("SELECT23")
 
     def test_deleted_item_is_not_recreated(self):

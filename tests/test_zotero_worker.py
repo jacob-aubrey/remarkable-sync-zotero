@@ -97,6 +97,41 @@ class WorkerTests(unittest.TestCase):
         path.write_bytes(pdf_bytes())
         return path
 
+    def test_selected_sync_preserves_global_pause_warnings_and_timestamp_and_skips_global_jobs(self):
+        links = {'first': {'parent': 'PARENT23', 'source_key': 'SOURCE23', 'view_key': 'VIEW2345'},
+                 'other': {'parent': 'OTHER234', 'source_key': 'OTHERPDF', 'view_key': 'OTHER456'}}
+        self.worker.state.write('documents', links)
+        self.worker.state.write('last_sync_at', 123)
+        self.worker.config['sync_paused'] = True
+        warning = {'cloud': 'other', 'reason': 'An unrelated warning'}
+        self.worker.last = {'result': {'review': [warning]}}
+        target = {'cloud': 'first', **links['first']}
+        with patch('note_organizer.zotero_worker.Bridge') as bridge, \
+             patch.object(self.worker, '_catalog', side_effect=AssertionError('Global discovery')), \
+             patch.object(self.worker, 'cleanup_intake', side_effect=AssertionError('Unrelated intake')), \
+             patch.object(self.worker, 'refresh_review_policy', side_effect=AssertionError('Unrelated review')):
+            bridge.return_value.run.return_value = {'actions': [], 'review': []}
+            result = self.worker.dispatch('sync_selected', {'targets': [target, target],
+                'connection': ['legacy', 'ROOT2345', self.croot.id]})
+        self.assertEqual(bridge.call_args.kwargs['selected_documents'], {'first'})
+        self.assertTrue(self.worker.config['sync_paused'])
+        self.assertEqual(result['last_sync_at'], 123)
+        self.assertEqual(result['status']['result']['selected_documents'], ['first'])
+        self.assertIn(warning, result['status']['result']['review'])
+
+    def test_selected_sync_rejects_changed_connection_pdf_mapping_and_empty_selection_before_writes(self):
+        link = {'parent': 'PARENT23', 'source_key': 'SOURCE23', 'view_key': 'VIEW2345'}
+        self.worker.state.write('documents', {'first': link})
+        target = {'cloud': 'first', **link}
+        good = ['legacy', 'ROOT2345', self.croot.id]
+        for targets, connection in [([], good), ([target], ['different', 'ROOT2345', self.croot.id]),
+                                    ([{**target, 'parent': 'CHANGED2'}], good), ([{**target, 'view_key': 'CHANGED2'}], good),
+                                    ([{**target, 'cloud': 'removed'}], good), (None, good)]:
+            with self.subTest(targets=targets, connection=connection), \
+                 patch.object(self.worker, 'cloud', side_effect=AssertionError('Invalid selection reached the cloud')):
+                with self.assertRaises(PilotError):
+                    self.worker.sync_selected(targets, connection)
+
     def test_missing_citation_keeps_existing_readable_filename_without_guessing_fields(self):
         path = self.root / 'Gunaseelan_et_al_Advanced_Science_2024.pdf'
         details = {'title': 'Targeted K-edge nanoprobes', 'document_type': 'journal_article',

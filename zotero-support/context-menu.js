@@ -35,16 +35,44 @@ var NotableContextMenu = {
       else Services.prompt.alert(window, label, error.message);
     }
   },
-  command(ui, label, visible, action, enabled = () => true) {
+  command(ui, label, visible, action, enabled = () => true, confirmation) {
     return {menuType: 'menuitem', onShowing: (_event, context) => {
-      context.menuElem.setAttribute('label', label);
+      context.menuElem.setAttribute('label', typeof label === 'function' ? label(context) : label);
       context.setVisible(!!visible(context));
       context.setEnabled(!ui.stopped && !!enabled(context));
     }, onCommand: (_event, context) => {
       // Resolve the current selection and link again; never retain menu snapshots.
       if (ui.stopped || !visible(context) || !enabled(context)) return;
-      return this.report(this.window(context), label, () => action(context), ui);
+      const title = typeof label === 'function' ? label(context) : label;
+      return this.report(this.window(context), title, () => {
+        if (confirmation) {
+          const before = JSON.stringify([ui.filingConnection(), this.singleLink(ui, context)]);
+          if (!Services.prompt.confirm(this.window(context), title, confirmation(context))) return;
+          if (!visible(context) || !enabled(context) || before !== JSON.stringify([ui.filingConnection(), this.singleLink(ui, context)])) {
+            throw Error('The paper or connection changed. Choose the action again to review its current state.');
+          }
+        }
+        return action(context);
+      }, ui);
     }};
+  },
+  async syncTargets(ui, window, links) {
+    if (!this.idle(ui) || !ui.canSync()) throw Error('Wait for the current operation to finish before syncing these PDFs.');
+    const targets = [...new Map(links.map(link => [link.cloud, Object.fromEntries(
+      ['cloud', 'parent', 'source_key', 'view_key'].map(key => [key, link[key] || '']))])).values()];
+    if (!targets.length) throw Error('Choose a linked paper or PDF to sync.');
+    const progress = new Zotero.ProgressWindow({window});
+    progress.changeHeadline('reMarkable Sync');
+    progress.addDescription(`Syncing ${targets.length} selected ${targets.length === 1 ? 'PDF' : 'PDFs'}…`);
+    progress.show();
+    try {
+      const result = await ui.action('sync_selected', {targets, connection: JSON.parse(ui.filingConnection())});
+      if (!result) throw Error('Another operation started. Choose Sync again when it finishes.');
+      progress.changeHeadline('reMarkable Sync');
+      progress.addDescription(result.status?.message || 'Selected PDF sync finished.');
+      progress.startCloseTimer(6000);
+      return result;
+    } catch (error) { progress.close(); throw error; }
   },
   showLinks(ui, links) {
     Object.assign(ui.paperSearchState(), {view: 'linked', query: '', appliedQuery: '', waitingForEnter: false,
@@ -66,6 +94,11 @@ var NotableContextMenu = {
     const linked = context => this.links(ui, selected(context));
     const availablePDF = context => one(context)?.view_key && !one(context).unavailable;
     const itemMenus = [
+      this.command(ui, context => selected(context).every(item => item.isPDFAttachment())
+        ? selected(context).length === 1 ? 'Sync this PDF now' : 'Sync selected PDFs now' : 'Sync selected papers now', context => {
+        const items = selected(context);
+        return items.length && items.every(item => this.links(ui, [item]).length);
+      }, context => this.syncTargets(ui, this.window(context), linked(context)), context => writable(context) && ui.canSync()),
       this.command(ui, NotableNotebook.label, context => selected(context).length, context =>
         NotableNotebook.generate(ui, this.window(context), {items: selected(context)}), () => !NotableNotebook.running),
       this.command(ui, 'Open reMarkable PDF', availablePDF, async context => {
@@ -96,12 +129,14 @@ var NotableContextMenu = {
         await ui.previewLinkRepair(one(context).cloud);
       }, writable),
       this.command(ui, 'Pause paper link (keep both copies)', context => one(context) && !one(context).paused,
-        async context => { ui.open(); await ui.action('link', {identity: one(context).cloud, paused: true}); }, writable),
+        async context => { ui.open(); await ui.action('link', {identity: one(context).cloud, paused: true}); }, writable,
+        context => `Pause the link for “${one(context).name || 'this paper'}”?\n\nBoth copies will stay in place. Changes to this paper will stop syncing until you resume its link.`),
       this.command(ui, 'Resume paper link', context => one(context)?.paused && !one(context).unavailable,
-        async context => { ui.open(); await ui.action('link', {identity: one(context).cloud, paused: false}); }, writable),
+        async context => { ui.open(); await ui.action('link', {identity: one(context).cloud, paused: false}); }, writable,
+        context => `Resume the link for “${one(context).name || 'this paper'}”?\n\nFuture syncs can update its PDFs, tags, filenames, and locations on Zotero and reMarkable. The current edition will be checked before resuming.`),
       this.command(ui, 'Rebuild reMarkable PDF search index', availablePDF, async context => {
         ui.open(); await ui.action('reindex', {key: one(context).view_key});
-      }, writable),
+      }, writable, context => `Rebuild the local search index for “${one(context).name || 'this PDF'}”?\n\nThis replaces its cached search text and may run OCR. The PDF and its annotations will stay in place.`),
       this.command(ui, 'Export source-linked annotations…', availablePDF, async context => {
         const link = one(context), connection = ui.filingConnection();
         const file = await ui.pickLocalFile(this.window(context), {title: 'Save source-linked annotations', mode: 'modeSave',
@@ -119,6 +154,8 @@ var NotableContextMenu = {
       return folder ? this.links(ui, NotableNotebook.collectionItems(folder, true)) : [];
     };
     const collectionMenus = [
+      this.command(ui, 'Sync collection and subcollection papers now', context => collectionLinks(context).length,
+        context => this.syncTargets(ui, this.window(context), collectionLinks(context)), () => this.idle(ui) && ui.canSync()),
       this.command(ui, NotableNotebook.label, collection, context =>
         NotableNotebook.exportCollection(ui, this.window(context), collection(context)), () => !NotableNotebook.running),
       this.command(ui, 'Show collection links (including subcollections)…', context => collectionLinks(context).length,
@@ -134,9 +171,6 @@ var NotableContextMenu = {
           context.menuElem.setAttribute('label', ui.shortName);
           context.setVisible(!!visible(context));
         }, menus: [...menus, {menuType: 'separator'},
-          this.command(ui, 'Sync all linked folders now', () => !!ui.latest?.config?.tablet_root, async () => {
-            ui.open(); await ui.action('sync');
-          }, () => this.idle(ui) && ui.canSync()),
           this.command(ui, 'Open reMarkable Sync…', () => true, () => ui.open()),
           this.command(ui, 'Sync setup…', () => true, () => ui.openSetup()),
         ],
@@ -146,14 +180,19 @@ var NotableContextMenu = {
       const node = reader._iframeWindow?.document.elementFromPoint(params.x, params.y)?.closest('#selector .tag, .annotation .tags .tag');
       const tag = node?.textContent;
       const pdf = Zotero.Items.get(reader.itemID);
-      if (!tag || !pdf?.isPDFAttachment()) return;
-      append({label: ui.shortName, groups: [[{label: 'Generate Word notebook for this tag…',
+      if (!pdf?.isPDFAttachment() || notableReviewItemInTrash(pdf)) return;
+      const links = this.links(ui, [pdf]), commands = [];
+      if (links.length) commands.push({label: 'Sync this PDF now', disabled: !this.idle(ui) || !ui.canSync(),
+        onCommand: () => this.report(reader._window, ui.shortName, () => this.syncTargets(ui, reader._window, this.links(ui, [pdf])), ui)});
+      if (tag) commands.push({label: 'Generate Word notebook for this tag…',
         disabled: !!NotableNotebook.running, onCommand: () => this.exportTag(ui, reader._window, {
           tag, libraryID: pdf.libraryID, annotationTags: true,
-        })}]]});
+        })});
+      if (commands.length) append({label: ui.shortName, groups: [commands]});
     };
-    Zotero.Reader.registerEventListener('createSelectorContextMenu', this.readerTagMenu, ui.id);
-    Zotero.Reader.registerEventListener('createAnnotationContextMenu', this.readerTagMenu, ui.id);
+    for (const type of ['createSelectorContextMenu', 'createViewContextMenu', 'createAnnotationContextMenu', 'createThumbnailContextMenu']) {
+      Zotero.Reader.registerEventListener(type, this.readerTagMenu, ui.id);
+    }
   },
   exportTag(ui, window, {tag, libraryID, scope = 'paper', annotationTags = true}) {
     return this.report(window, NotableNotebook.label, () => NotableNotebook.generate(ui, window,
@@ -238,8 +277,9 @@ var NotableContextMenu = {
   },
   unregister() {
     for (const id of this.menuIDs) Zotero.MenuManager.unregisterMenu(id);
-    if (this.readerTagMenu) Zotero.Reader.unregisterEventListener('createSelectorContextMenu', this.readerTagMenu);
-    if (this.readerTagMenu) Zotero.Reader.unregisterEventListener('createAnnotationContextMenu', this.readerTagMenu);
+    if (this.readerTagMenu) for (const type of ['createSelectorContextMenu', 'createViewContextMenu', 'createAnnotationContextMenu', 'createThumbnailContextMenu']) {
+      Zotero.Reader.unregisterEventListener(type, this.readerTagMenu);
+    }
     this.readerTagMenu = null;
     for (const window of this.windows.keys()) this.detach(window);
   },

@@ -37,8 +37,9 @@ async function startup({id, rootURI}) {
       let item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, key);
       if (!item || !item.isPDFAttachment() || item.deleted) return [404, 'text/plain', 'Attachment unavailable'];
       await item.loadAllData();
-      if (!item.getNote().includes('Notable pilot:')) return [403, 'text/plain', 'Attachment is not managed by Notable'];
+      if (!item.getNote().includes('Notable pilot:')) return [403, 'text/plain', 'Attachment is not managed by reMarkable Sync'];
       let all = item.getAnnotations();
+      let readersRefreshed = 0;
       let native = all.filter(annotation => !annotation.annotationIsExternal && !annotation.deleted).length;
       if (request.method === 'POST') {
         if (native) return [409, 'text/plain', 'Independent reader annotations require review'];
@@ -52,6 +53,13 @@ async function startup({id, rootURI}) {
         await Zotero.PDFWorker.import(item.id, true);
         await item.loadAllData();
         all = item.getAnnotations();
+        // Import notifications update annotation cards, but Zotero's local file
+        // upload does not reload PDF bytes in an already-open reader.
+        for (const reader of Zotero.Reader._readers.filter(reader => reader.itemID === item.id)) {
+          await reader._initPromise;
+          await reader.reload();
+          readersRefreshed++;
+        }
         const handwriting = all.filter(isHandwritingCard);
         if (handwriting.length) {
           // The attachment pane can draw a missing-image placeholder during
@@ -71,6 +79,7 @@ async function startup({id, rootURI}) {
         }
       }
       return [200, 'application/json', JSON.stringify({schema: 1, native,
+        readersRefreshed,
         external: all.filter(annotation => annotation.annotationIsExternal && !annotation.deleted).length,
         nativeText: all.filter(annotation => !annotation.annotationIsExternal && !annotation.deleted)
           .map(annotation => ({key: annotation.key, text: annotation.annotationText || '', comment: annotation.annotationComment || ''}))

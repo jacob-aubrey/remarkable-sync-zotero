@@ -136,6 +136,69 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual((self.cloud.uploads, self.cloud.folder_writes, self.zot.writes), (0, 0, 0))
         self.assertIsNone(self.state.read("documents"))
 
+    def test_selected_sync_refreshes_only_requested_pdfs_without_folder_or_discovery_writes(self):
+        first, first_bundle = self.tablet()
+        second, second_bundle = self.tablet()
+        self.engine.run(apply=True)
+        documents = self.state.read('documents')
+        for row in documents.values():
+            path = self.zot.file_path(row['view_key'])
+            path.write_bytes(self.zot.files[row['view_key']])
+            row['desktop_name'] = path.stem
+        self.state.write('documents', documents)
+        before = copy.deepcopy(self.state.read('documents'))
+        unselected_path = self.zot.file_path(before[second.id]['view_key'])
+        unselected_bytes = unselected_path.read_bytes()
+        for item, bundle in [(first, first_bundle), (second, second_bundle)]:
+            layer = next(name for name in bundle if name.endswith('.rm'))
+            bundle[layer] = bundle[layer].replace(b'Typed margin note', b'Fresh margin note')
+            self.cloud.add(replace(item, hash=hashlib.sha256(bundle[layer]).hexdigest()), bundle)
+        new_paper, _ = self.tablet()
+        self.zot.collection_records['NEWF2345'] = {'key': 'NEWF2345', 'name': 'Unrelated new folder', 'parentCollection': 'ROOT2345'}
+        before_maps = copy.deepcopy(self.state.read('folders'))
+        self.engine.selected_documents = frozenset({first.id})
+        self.engine.follow_changes = True
+        with patch.object(self.cloud, 'pdf_bundle', wraps=self.cloud.pdf_bundle) as downloads:
+            result = self.engine.run(apply=True)
+        self.assertEqual([call.args[0].id for call in downloads.call_args_list], [first.id])
+        after = self.state.read('documents')
+        self.assertEqual(after[second.id], before[second.id])
+        self.assertEqual(unselected_path.read_bytes(), unselected_bytes)
+        self.assertNotIn(new_paper.id, after)
+        self.assertEqual(self.state.read('folders'), before_maps)
+        self.assertEqual(self.cloud.folder_writes, 0)
+        self.assertEqual({row['cloud'] for row in result['actions']}, {first.id})
+        with pymupdf.open(stream=self.zot.files[after[first.id]['view_key']], filetype='pdf') as doc:
+            self.assertTrue(any(annot.info['content'] == 'Fresh margin note' for annot in doc[0].annots()))
+
+    def test_selected_sync_batch_deduplicates_and_rejects_empty_or_removed_scope(self):
+        first, _ = self.tablet()
+        second, _ = self.tablet()
+        self.engine.run(apply=True)
+        self.engine.selected_documents = frozenset([first.id, second.id, first.id])
+        self.assertEqual(self.engine.run(apply=True)['documents'], 2)
+        for targets in [frozenset(), frozenset({str(uuid.uuid4())})]:
+            self.engine.selected_documents = targets
+            with patch.object(self.cloud, 'library', side_effect=AssertionError('No cloud access for invalid selections')):
+                with self.assertRaises(PilotError):
+                    self.engine.run(apply=True)
+
+    def test_selected_sync_keeps_paused_links_and_their_files_unchanged(self):
+        from note_organizer.zotero_review import ReviewStore
+        first, _ = self.tablet()
+        self.engine.run(apply=True)
+        before = self.state.read('documents')
+        review = ReviewStore(self.root / 'selection-review')
+        review.link_control(first.id, paused=True)
+        self.engine.review_policy = review
+        self.engine.selected_documents = frozenset({first.id})
+        with patch.object(self.cloud, 'pdf_bundle', side_effect=AssertionError('Paused papers must not download')):
+            result = self.engine.run(apply=True)
+        self.assertEqual(self.state.read('documents'), before)
+        self.assertEqual(result['actions'], [])
+        self.assertEqual(result['review'][0]['cloud'], first.id)
+        self.assertTrue(review.link_control(first.id)['paused'])
+
     def test_tablet_paper_returns_annotations_and_repeats_without_duplicate_or_reupload(self):
         item, _ = self.tablet()
         self.engine.saved_annotations = lambda ck: ({"ocr": "savedscientifictranscript"},)

@@ -312,7 +312,7 @@ class LocalZotero:
         if not self.zot.local_api_key:
             if not getattr(self, "interactive", True):
                 raise AuthorizationRequired("Connect to Zotero once interactively before running in the background.")
-            grant = self.zot.authorize_local("Notable Zotero Pilot")
+            grant = self.zot.authorize_local("reMarkable Sync for Zotero")
             if getattr(self, "grant_store", None) and grant.get("remember"):
                 self.grant_store.save(json.dumps({"server": self.server_id, "key": grant["key"]}))
 
@@ -350,7 +350,7 @@ class LocalZotero:
             response.raise_for_status()
             return response.json()["native"]
         if self.reader_annotations(key):
-            raise PilotError("Install Notable Companion Support in Zotero to distinguish existing PDF annotations from desktop edits before refreshing.")
+            raise PilotError("Install reMarkable Sync for Zotero to distinguish existing PDF annotations from desktop edits before refreshing.")
         return 0
 
     def native_annotation_text(self, key):
@@ -399,7 +399,7 @@ class LocalZotero:
                         headers={'Zotero-Server-ID': self.server_id, 'Zotero-API-Key': self.zot.local_api_key,
                                  'Connection': 'close'})
                 if response.status_code in {401, 403}:
-                    raise AuthorizationRequired('Zotero permission is unavailable. Connect again from Notable settings.')
+                    raise AuthorizationRequired('Zotero permission is unavailable. Connect again from reMarkable Sync settings.')
                 if response.status_code == 409:
                     if action == 'create_collection':
                         raise PilotError('The collection could not be created. Refresh folders and retry.')

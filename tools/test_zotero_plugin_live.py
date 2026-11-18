@@ -26,7 +26,7 @@ async function startup({rootURI}) {
   const config = JSON.parse(await (await fetch(rootURI + 'config.json')).text());
   Zotero.uiReadyPromise.then(async () => {
     if (Zotero.DataDirectory.dir !== config.data) throw new Error('Unexpected test library');
-    Zotero.Server.LocalAPI._promptForAuthorization = async name => ({allow: name === 'Notable Zotero Pilot', remember: true});
+    Zotero.Server.LocalAPI._promptForAuthorization = async name => ({allow: name === 'reMarkable Sync for Zotero', remember: true});
     await IOUtils.writeUTF8(config.ready, JSON.stringify({version: Zotero.version, server: Zotero.Server.LocalAPI.getServerID(), pid: Services.appinfo.processID}));
     while (!(await IOUtils.exists(config.done))) {
       const path = PathUtils.join(PathUtils.parent(config.ready), 'command.json');
@@ -65,6 +65,117 @@ async function startup({rootURI}) {
             while ((!ui.process || !Object.keys(ui.latest?.types || {}).length || !ui.view?.document.getElementById('app')?.querySelector('h1')) && Date.now() < deadline) {
               if (ui.view?.document.querySelector('[role="alert"]')) break;
               await Zotero.Promise.delay(100);
+            }
+          } else if (command.action === 'reader_sync_setup' || command.action === 'reader_sync_state') {
+            const win = Zotero.getMainWindow();
+            const wait = async (test, label) => {
+              const deadline = Date.now() + 45000;
+              while (Date.now() < deadline) {
+                const value = await test();
+                if (value) return value;
+                await Zotero.Promise.delay(75);
+              }
+              throw Error(typeof label === 'function' ? label() : label);
+            };
+            if (command.action === 'reader_sync_setup') {
+              const papers = [], pdfs = [];
+              for (let index = 0; index < 2; index++) {
+                const paper = new Zotero.Item('journalArticle');
+                paper.libraryID = Zotero.Libraries.userLibraryID;
+                paper.setField('title', 'Scoped sync paper ' + index); await paper.saveTx(); papers.push(paper);
+                const pdf = await Zotero.Attachments.importFromFile({file: Zotero.File.pathToFile(command.source), parentItemID: paper.id});
+                pdf.setNote('Notable pilot: ' + 'a'.repeat(64)); await pdf.saveTx(); pdfs.push(pdf);
+              }
+              await Zotero.PDFWorker.import(pdfs[0].id, true);
+              const reader = await Zotero.Reader.open(pdfs[0].id, {pageIndex: 1});
+              await reader._initPromise;
+              await wait(() => reader._internalReader?._primaryView?._iframeWindow?.PDFViewerApplication?.pdfDocument,
+                'The reader did not open the test PDF');
+              const previous = ui.action, requests = [];
+              const scope = () => {
+                ui.latest.config = {...ui.latest.config, connection_id: 'reader-scope', zotero_root: 'ROOT2345',
+                  tablet_root: 'a989c1c3-8726-4f82-ad3f-1063f9ee31cb', sync_paused: true, automatic: false};
+                ui.latest.links = pdfs.map((pdf, index) => ({cloud: 'cloud-' + index, parent: papers[index].key,
+                  source_key: pdf.key, view_key: pdf.key}));
+              };
+              ui.action = async (method, params) => {
+                if (method !== 'sync_selected') throw Error('A context sync invoked a whole-library action');
+                requests.push(params);
+                return {...ui.latest, status: {state: 'ready', message: 'Selected PDFs synced.'}};
+              };
+              try {
+                await win.ZoteroPane.selectItems(papers.map(paper => paper.id));
+                await win.ZoteroPane.buildItemContextMenu();
+                // Native item notifications can refresh the synthetic worker
+                // snapshot while selection is loading. Set its menu fixture last.
+                scope();
+                const root = win.document.getElementById('zotero-itemmenu');
+                root.dispatchEvent(new win.Event('popupshowing', {bubbles: true}));
+                const sub = root.querySelector('menu[label="reMarkable Sync"] > menupopup');
+                sub.dispatchEvent(new win.Event('popupshowing', {bubbles: true}));
+                const sync = sub.querySelector('menuitem[label="Sync selected papers now"]');
+                if (!sync || sync.disabled) throw Error('The reference selection has no usable scoped sync');
+                sync.doCommand(); await wait(() => requests.length === 1, 'Reference sync did not execute');
+                win.Zotero_Tabs.select(reader.tabID);
+                const pdfWindow = reader._internalReader._primaryView._iframeWindow;
+                const target = await wait(() => pdfWindow.document.querySelector('.page[data-page-number="2"]'), 'The reading page did not render');
+                scope();
+                const dispatch = Zotero.Reader._dispatchEvent;
+                const contextEvents = [];
+                Zotero.Reader._dispatchEvent = function(event) {
+                  contextEvents.push({type: event.type, links: ui.latest.links?.map(link => link.cloud)});
+                  return dispatch.call(this, event);
+                };
+                const contextEvent = new pdfWindow.MouseEvent('contextmenu', {bubbles: true, cancelable: true,
+                  button: 2, buttons: 2, clientX: 200, clientY: 200, screenX: 200, screenY: 200});
+                target.dispatchEvent(contextEvent);
+                // Privileged iframe listeners may reject untrusted synthetic
+                // events. Exercise the same native page handler in that case.
+                if (!contextEvents.length) reader._internalReader._primaryView._onOpenViewContextMenu({x: 200, y: 200});
+                let command;
+                try {
+                  command = await wait(() => reader._popupset.querySelector('menu[label="reMarkable Sync"] menuitem[label="Sync this PDF now"]'),
+                    () => 'The PDF view has no branded reMarkable Sync submenu. ' + JSON.stringify({contextEvents,
+                      labels: [...reader._popupset.querySelectorAll('menu, menuitem')].map(node => node.getAttribute('label'))}));
+                } finally { Zotero.Reader._dispatchEvent = dispatch; }
+                scope(); command.doCommand(); await wait(() => requests.length === 2, 'Reader sync did not execute');
+                for (const popup of reader._popupset.querySelectorAll('menupopup')) popup.hidePopup();
+              } finally { ui.action = previous; }
+              if (requests[0].targets.length !== 2 || requests[1].targets.length !== 1
+                  || requests[1].targets[0].view_key !== pdfs[0].key) throw Error('The native context menu sent the wrong PDF scope');
+              const app = reader._internalReader._primaryView._iframeWindow.PDFViewerApplication;
+              app.pdfViewer.currentScaleValue = '1.25'; app.pdfViewer.currentPageNumber = 2;
+              await wait(() => reader._internalReader._state.primaryViewState?.pageIndex === 1
+                && reader._internalReader._state.primaryViewState?.scale === app.pdfViewer._location?.scale
+                && Math.abs(app.pdfViewer.currentScale - 1.25) < .01,
+                () => 'The reader did not save its reading position and zoom. ' + JSON.stringify(reader._internalReader._state.primaryViewState));
+              response.fixture = {key: pdfs[0].key, sibling: pdfs[1].key, requests, page: 1, scale: 1.25};
+            } else {
+              const pdf = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, command.key);
+              const reader = Zotero.Reader._readers.find(reader => reader.itemID === pdf.id);
+              if (!reader) throw Error('Sync closed the existing reader');
+              let seenText = '';
+              await wait(async () => {
+                const app = reader._internalReader._primaryView._iframeWindow?.PDFViewerApplication;
+                if (!app?.pdfDocument) return false;
+                if (app.pdfDocument.getPageData) {
+                  const options = Components.utils.cloneInto({pageIndex: 1}, reader._internalReader._primaryView._iframeWindow);
+                  const data = await app.pdfDocument.getPageData(options);
+                  seenText = data.chars.map(char => (char.u || char.c || '') + (char.spaceAfter || char.lineBreakAfter || char.paragraphBreakAfter ? ' ' : '')).join('');
+                  return seenText.includes(command.expected);
+                }
+                const text = await (await app.pdfDocument.getPage(2)).getTextContent();
+                return text.items.some(item => item.str.includes(command.expected));
+              }, () => 'The open reader still has the old PDF bytes. ' + JSON.stringify({seenText,
+                annotations: reader._internalReader._state.annotations.map(note => note.comment)}));
+              await wait(() => reader._internalReader._state.annotations.some(note => note.comment === command.expected),
+                'The open annotation sidebar did not receive the new note');
+              const app = reader._internalReader._primaryView._iframeWindow.PDFViewerApplication;
+              if (app.pdfViewer.currentPageNumber !== 2 || Math.abs(app.pdfViewer.currentScale - 1.25) > .01) {
+                throw Error('Refreshing the PDF lost the current page or zoom');
+              }
+              response.live = {page: app.pdfViewer.currentPageNumber,
+                scale: app.pdfViewer.currentScale, annotations: reader._internalReader._state.annotations.length};
             }
           } else if (command.action === 'notebook_and_citation') {
             const win = Zotero.getMainWindow();
@@ -193,7 +304,7 @@ async function startup({rootURI}) {
             const tagRect = annotationTag.getBoundingClientRect();
             annotationTag.dispatchEvent(new reader._iframeWindow.MouseEvent('contextmenu', {bubbles: true, cancelable: true,
               clientX: tagRect.x + tagRect.width / 2, clientY: tagRect.y + tagRect.height / 2}));
-            const readerTagExport = await wait(() => reader._popupset.querySelector('menu[label="reMarkable Sync"] menuitem'),
+            const readerTagExport = await wait(() => reader._popupset.querySelector('menu[label="reMarkable Sync"] menuitem[label="Generate Word notebook for this tag…"]'),
               'The reader tag context menu has no notebook command');
             ui.pickLocalFile = async () => ({path: command.readerTagTarget, replace: false});
             try {
@@ -1930,6 +2041,43 @@ def review_scroll_checks(root, checked):
         checked('native_scroll_' + name.replace(' ', '_'))
 
 
+def reader_sync_checks(client, root, checked):
+    import pymupdf as fitz
+    from note_organizer.zotero_pilot import Ledger, upload_attachment
+
+    paths = []
+    for revision in range(3):
+        path = root / f'Live reader revision {revision}.pdf'
+        with fitz.open() as pdf:
+            for page in range(3):
+                pdf.new_page().insert_text((70, 70), f'Reading page {page + 1}')
+            page = pdf[1]
+            page.insert_text((70, 140), f'Live tablet update {revision}')
+            for note in range(revision + 1):
+                annot = page.add_highlight_annot(fitz.Rect(70, 165 + note * 30, 250, 185 + note * 30))
+                annot.set_info(content=f'Live tablet update {note}')
+                pdf.xref_set_key(annot.xref, 'NM', fitz.get_pdf_str(f'remarkable-live-note-{note}'))
+                annot.update()
+            pdf.save(path)
+        paths.append(path)
+    result = command(root, 'reader_sync_setup', source=str(paths[0]))['fixture']
+    key, sibling = result['key'], result['sibling']
+    before_sibling = client.file_path(sibling).read_bytes()
+    ledger = Ledger(root / 'live-reader-upload')
+    for revision, path in enumerate(paths[1:], 1):
+        upload_attachment(client, ledger, 'live-reader', key, path, client.file_md5(key), hashlib.md5(path.read_bytes()).hexdigest())
+        refreshed = client.http.post(f'{client.endpoint}/notable/annotations/{key}', json={},
+            headers={'Zotero-Server-ID': client.server_id, 'Zotero-API-Key': client.zot.local_api_key}, timeout=30)
+        refreshed.raise_for_status()
+        assert refreshed.json()['readersRefreshed'] == 1, refreshed.text
+        live = command(root, 'reader_sync_state', key=key, expected=f'Live tablet update {revision}')['live']
+        assert live['page'] == 2 and abs(live['scale'] - 1.25) < .01, live
+        assert client.file_path(sibling).read_bytes() == before_sibling
+    checked('reference_selection_and_branded_reader_submenu_send_only_exact_selected_PDFs')
+    checked('every_published_PDF_update_reloads_the_existing_reader_and_live_annotation_sidebar')
+    checked('repeated_live_refresh_preserves_reading_page_zoom_and_unrelated_PDF_bytes')
+
+
 def notebook_and_citation_checks(root, checked):
     from docx import Document
     from note_organizer.zotero_worker import file_sha
@@ -2291,6 +2439,7 @@ def main():
     parser.add_argument('--tagging-checks', action='store_true')
     parser.add_argument('--review-scroll-checks', action='store_true', help='Only synthetic review input/layout checks; no cloud or library import')
     parser.add_argument('--notebook-and-citation-checks', action='store_true', help='Exercise notebook export, citation drafts, and status visibility with synthetic Zotero items')
+    parser.add_argument('--reader-sync-checks', action='store_true', help='Exercise branded scoped-sync menus and live PDF refresh in an already-open reader')
     parser.add_argument('--review-guidance-checks', action='store_true', help='Render structured library and paper/folder guidance at wide/narrow widths')
     parser.add_argument('--existing-fixture', type=Path, help='Copy only a previous synthetic fixture into this new disposable profile')
     args = parser.parse_args()
@@ -2355,13 +2504,15 @@ def main():
             command(root, 'tab', tab='review')
             checked('graphical_connect_persists_permission_without_terminal')
             snapshot = native_checks(client, root, checked) if not (args.existing_fixture or args.review_scroll_checks
-                         or args.review_guidance_checks or args.maintenance_checks or args.notebook_and_citation_checks) else None
+                         or args.review_guidance_checks or args.maintenance_checks or args.notebook_and_citation_checks or args.reader_sync_checks) else None
             if args.maintenance_checks:
                 maintenance_checks(client, root, checked)
             if args.review_scroll_checks:
                 review_scroll_checks(root, checked)
             if args.notebook_and_citation_checks:
                 notebook_and_citation_checks(root, checked)
+            if args.reader_sync_checks:
+                reader_sync_checks(client, root, checked)
             if args.review_guidance_checks:
                 review_guidance_checks(root, checked)
             if args.bulk_count:
@@ -2372,7 +2523,7 @@ def main():
                 activity_checks(root, checked)
             if args.tagging_checks:
                 tagging_checks(client, root, checked)
-            if not (args.skip_ocr or args.review_scroll_checks or args.review_guidance_checks or args.maintenance_checks or args.notebook_and_citation_checks):
+            if not (args.skip_ocr or args.review_scroll_checks or args.review_guidance_checks or args.maintenance_checks or args.notebook_and_citation_checks or args.reader_sync_checks):
                 bundled_search_checks(client, root, args.handwriting_pdf, checked)
             if snapshot:
                 rendered = command(root, 'render', snapshot=snapshot, tab='sync-review')

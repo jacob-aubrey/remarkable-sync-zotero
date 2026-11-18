@@ -4,13 +4,16 @@ const {join} = require('node:path');
 const vm = require('node:vm');
 
 async function test() {
-  const registrations = [], removed = [], calls = [];
+  const registrations = [], removed = [], calls = [], prompts = [], readerHooks = new Map();
+  let confirm = true;
   const scope = {Zotero: {
     Libraries: {userLibraryID: 1},
     MenuManager: {registerMenu: data => registrations.push(data), unregisterMenu: id => removed.push(id)},
-    Reader: {registerEventListener() {}, unregisterEventListener() {}},
+    Reader: {registerEventListener(type, listener) { readerHooks.set(type, listener); }, unregisterEventListener(type) { readerHooks.delete(type); }},
+    ProgressWindow: class {changeHeadline() {} addDescription() {} show() {} startCloseTimer() {} close() {}},
     logError: error => { throw error; },
-  }, Services: {prompt: {alert: assert.fail}}, notableReviewItemInTrash: item => !!(item.deleted || item.parentItem?.deleted)};
+  }, Services: {prompt: {alert: assert.fail, confirm(window, title, message) { prompts.push({title, message}); return confirm; }}},
+  notableReviewItemInTrash: item => !!(item.deleted || item.parentItem?.deleted)};
   for (const file of ['notebook.js', 'context-menu.js']) {
     vm.runInNewContext(readFileSync(join(__dirname, '../zotero-support', file), 'utf8'), scope);
   }
@@ -18,6 +21,7 @@ async function test() {
   const ui = {id: 'plugin', shortName: 'reMarkable Sync', latest: {config: {tablet_root: 'root'}, links: []},
     open: () => calls.push(['open']), openSetup() {}, openContextTab: tab => calls.push(['tab', tab]),
     paperSearchState() { return this.search ||= {}; }, canSync: () => true, canCheckDuringSync: () => false,
+    filingConnection: () => JSON.stringify(['connection', 'zotero', 'root']),
     action: async (method, params) => calls.push([method, params]),
   };
   const paper = (id, key, options = {}) => ({id, key, libraryID: 1, isRegularItem: () => true,
@@ -49,6 +53,9 @@ async function test() {
   assert.ok(!visible([a]).includes('Resume paper link'));
   assert.ok(visible([b]).includes('Resume paper link'));
   assert.ok(visible([aPDF]).includes('Open reMarkable PDF'));
+  assert.ok(visible([aPDF]).includes('Sync this PDF now'));
+  assert.ok(visible([a, b]).includes('Sync selected papers now'));
+  assert.ok(!visible([a]).includes('Sync all linked folders now'));
   assert.ok(!visible([unrelated]).includes('Open reMarkable PDF'), 'An unrelated supplementary PDF must not inherit its parent’s link');
   assert.ok(visible([a, b]).includes(notebook.label));
   assert.ok(visible([a, b]).includes('Show selected links…'));
@@ -66,9 +73,27 @@ async function test() {
   assert.equal(calls.length, 0, 'Building a menu must not run worker operations');
   await find('Show selected links…').onCommand(null, context([a, b]));
   assert.deepEqual([...ui.search.contextClouds], ['cloud-a', 'cloud-b']);
+  const beforeCancel = calls.length;
+  confirm = false;
+  await find('Pause paper link (keep both copies)').onCommand(null, context([aPDF]));
+  assert.equal(calls.length, beforeCancel, 'Canceling the confirmation must not change the link');
+  assert.ok(prompts.at(-1).message.includes('stop syncing'));
+  confirm = true;
   await find('Pause paper link (keep both copies)').onCommand(null, context([aPDF]));
   assert.equal(calls.at(-1)[0], 'link');
   assert.equal(calls.at(-1)[1].identity, 'cloud-a');
+  const beforeSyncPrompts = prompts.length;
+  await find('Sync selected papers now').onCommand(null, context([a, b, aPDF]));
+  assert.equal(calls.at(-1)[0], 'sync_selected');
+  assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a', 'cloud-b']);
+  assert.equal(prompts.length, beforeSyncPrompts, 'Ordinary selected sync does not need a destructive-action confirmation');
+  scope.Zotero.Items = {get: () => aPDF};
+  const readerMenus = [];
+  readerHooks.get('createViewContextMenu')({reader: {itemID: aPDF.id, _window: {}}, params: {}, append: menu => readerMenus.push(menu)});
+  assert.equal(readerMenus[0].label, 'reMarkable Sync');
+  assert.equal(readerMenus[0].groups[0][0].label, 'Sync this PDF now');
+  await readerMenus[0].groups[0][0].onCommand();
+  assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a']);
   const count = calls.length;
   ui.busy = true;
   await find('Pause paper link (keep both copies)').onCommand(null, context([a]));
@@ -77,6 +102,7 @@ async function test() {
   await find('Pause paper link (keep both copies)').onCommand(null, context([a]));
   assert.equal(calls.length, count, 'A removed link must not run a stale menu command');
   menu.unregister();
+  assert.equal(readerHooks.size, 0);
   assert.deepEqual(removed, [...menu.menuIDs]);
   console.log('Context menus: selection scope, exact PDF links, batches, Trash, groups, busy state, and cleanup passed.');
 }

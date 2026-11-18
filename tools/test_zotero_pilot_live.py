@@ -218,7 +218,7 @@ async function startup({rootURI}) {
   Zotero.uiReadyPromise.then(async () => {
     if (Zotero.DataDirectory.dir !== config.data) throw new Error('Unexpected data directory');
     Zotero.Server.LocalAPI._promptForAuthorization = async appName => ({
-      allow: appName === 'Notable Zotero Pilot', remember: true
+      allow: appName === 'reMarkable Sync for Zotero', remember: true
     });
     await IOUtils.writeUTF8(config.ready, JSON.stringify({version: Zotero.version,
       server: Zotero.Server.LocalAPI.getServerID()}));
@@ -349,7 +349,7 @@ def main():
                 matches = client.zot.items(q=query, qmode="everything")
                 assert any(row["key"] in {key, reference} for row in matches)
             checked("highlight_quote_typed_comment_and_saved_transcript_are_searchable")
-            client.zot.authorize_local("Notable Zotero Pilot")
+            client.zot.authorize_local("reMarkable Sync for Zotero")
             record = client.zot.item(reference)["data"]
             record["title"] = "Reviewed title in Zotero"
             client.zot.update_items([record])
@@ -398,7 +398,7 @@ def main():
             checked("long_thesis_search_finds_marker_beyond_100_pages_and_500000_characters",
                     pages=125, characters=character_count)
             # Mimic a native index rebuild that contains only printed PDF text.
-            client.zot.authorize_local("Notable Zotero Pilot")
+            client.zot.authorize_local("reMarkable Sync for Zotero")
             client.zot.set_fulltext(key, {"content": "A selected scientific result", "indexedPages": 1, "totalPages": 1})
             repaired = publish(client, ledger, namespace, updated, apply=True)["papers"][0]
             assert repaired["action"] == "unchanged"

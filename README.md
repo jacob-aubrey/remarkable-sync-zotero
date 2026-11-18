@@ -19,7 +19,7 @@ In **Linked papers**, the citation, fields and tags, and full-text modes use Zot
 
 In **Tags**, type to narrow the list of tag names, then select tags to filter results as you go. Paper tags are shared with the Zotero reference. **Show Zotero tags** opens the reference’s native Tags section. Page tags are saved for individual pages of linked PDFs. Use the tag button in the PDF reader to edit paper and page tags together.
 
-Select one tag and choose **Generate Word notebook…** to save a snapshot of its PDF annotations. Paper tags include the matching papers’ annotations, and page tags include the tagged pages. You can also right-click a collection in Zotero and choose **reMarkable Sync → Generate Word notebook…**, with the option to include subcollections. The export uses Notable’s Reading layout and links back to the relevant pages in Zotero. The Windows helper already bundles the MIT-licensed [python-docx](https://github.com/python-openxml/python-docx) writer.
+Select one tag and choose **Generate Word notebook…** to save a snapshot of its PDF annotations. Paper tags include the matching papers’ annotations, and page tags include the tagged pages. You can also right-click a collection in Zotero and choose **reMarkable Sync → Generate Word notebook…**, with the option to include subcollections. The export uses the Reading layout and links back to the relevant pages in Zotero. The Windows helper already bundles the MIT-licensed [python-docx](https://github.com/python-openxml/python-docx) writer.
 
 ### Right-click shortcuts
 
@@ -27,7 +27,11 @@ Right-click a reference, PDF, several selected items, or a collection, then open
 
 Right-click a tag in Zotero’s tag selector, a reference’s Tags pane, the reader’s annotation tag selector, or the plugin’s tag lists, then choose **reMarkable Sync → Generate Word notebook for this tag…**. Native tag exports use the clicked tag in its library. A reference tag includes its PDF annotations, a PDF tag includes that PDF’s annotations, and an annotation tag includes the tagged annotations. Plugin page tags retain their page scope.
 
-**Sync all linked folders now** runs the existing connection-wide sync. Connection and annotation repair decisions remain available on the selected links’ cards. See the [command audit and integration notes](documentation/CONTEXT_MENUS.md).
+Choose **Sync selected papers now** to update the linked PDFs for the selected references. A PDF selection offers **Sync this PDF now** or **Sync selected PDFs now** for those exact attachment links. Collections offer **Sync collection and subcollection papers now**. These actions preserve the global pause setting and leave unrelated filing, deletion, tag-edit, and folder-sync work pending. Papers that need linking or approval still go through Inbox.
+
+In an open linked PDF, right-click and choose **reMarkable Sync → Sync this PDF now**. Every sync refreshes an updated linked PDF in its existing reader, including its annotation sidebar, while retaining the reading page and zoom. New tablet notes appear once the tablet has uploaded them to reMarkable Cloud and the plugin receives them. The workspace’s **Sync now** command still checks the whole connection.
+
+Pausing a link, resuming it, and rebuilding its search index require a confirmation that identifies the paper and explains the effect. Export file pickers confirm replacement of existing files. Connection and annotation repair decisions retain their existing review steps. See the [command audit and integration notes](documentation/CONTEXT_MENUS.md).
 
 ### Freehand marks in image notes
 
@@ -64,7 +68,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.28.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.29.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

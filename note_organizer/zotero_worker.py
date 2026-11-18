@@ -2115,21 +2115,41 @@ class Worker:
                      "message": f"Filing paused: {completed} filed; {remaining} remaining." if self.stop.is_set() else f"Filed {completed} papers together; {held} held for review. Sync transfers approved papers."}
         return self.status()
 
-    def sync(self, automatic=False, verify=False, monitor_inbox=True):
+    def sync_selected(self, targets, connection):
+        expected_connection = [self.config.get('connection_id') or 'legacy', self.config.get('zotero_root'), self.config.get('tablet_root')]
+        if connection != expected_connection:
+            raise PilotError('The connection changed. Choose the papers again before syncing.')
+        if not isinstance(targets, list) or not targets:
+            raise PilotError('Choose at least one linked paper or PDF to sync.')
+        documents = self.state.read('documents', {})
+        identities = set()
+        for target in targets:
+            if not isinstance(target, dict) or not isinstance(target.get('cloud'), str):
+                raise PilotError('Choose current paper links before syncing.')
+            identity = target['cloud']
+            link = documents.get(identity)
+            if not link or any(target.get(key, '') != link.get(key, '') for key in ('parent', 'source_key', 'view_key')):
+                raise PilotError('A selected PDF link changed. Refresh the selection before syncing.')
+            identities.add(identity)
+        return self.sync(verify=True, monitor_inbox=False, selected_documents=identities)
+
+    def sync(self, automatic=False, verify=False, monitor_inbox=True, selected_documents=None):
+        scoped = selected_documents is not None
         if not self.config.get("tablet_root"):
             return self.status()
         if self.pause_pending.is_set():
             raise InterruptedError('Sync paused')
         if automatic and (self.config.get('sync_paused') or not self.config.get('automatic')):
             return self.status()
-        if self.config.get('sync_paused'):
+        if self.config.get('sync_paused') and not scoped:
             self.config['sync_paused'] = False
             self.save()
         self._begin_operation()
         # Periodically establish fresh byte evidence even when file stats agree.
         if verify or time.time() - getattr(self, '_last_digest_verification', 0) > 86400:
             self.file_digests.clear()
-            self._last_digest_verification = time.time()
+            if not scoped:
+                self._last_digest_verification = time.time()
         started_trace = self.trace.operation is None
         if started_trace:
             self.trace.start("sync")
@@ -2162,22 +2182,25 @@ class Worker:
             # normal sync from starting when its separate environment is absent.
             client = self.zotero()
             cloud = self.cloud()
-            self.trace.event("stage", name="cleaning_intake")
-            self.cleanup_intake(client)
-            self.trace.event("stage", name="cataloging_sources")
-            self.progress('Checking new papers and existing links…')
-            self._catalog(client, cloud)
-            self.trace.event("stage", name="refreshing_review_policy")
-            self.progress('Checking Zotero matches and saved review decisions…')
-            native_catalog = client.review_action('catalog')
-            self.refresh_review_policy(client, native_catalog)
+            if not scoped:
+                self.trace.event("stage", name="cleaning_intake")
+                self.cleanup_intake(client)
+                self.trace.event("stage", name="cataloging_sources")
+                self.progress('Checking new papers and existing links…')
+                self._catalog(client, cloud)
+                self.trace.event("stage", name="refreshing_review_policy")
+                self.progress('Checking Zotero matches and saved review decisions…')
+                native_catalog = client.review_action('catalog')
+                self.refresh_review_policy(client, native_catalog)
             self.trace.event("stage", name="syncing_bridge")
             excluded = connections.exclusions(self.directory, self.config)
-            excluded['documents'].update(issue['cloud'] for issue in self.catalog_issues if issue.get('cloud'))
+            catalog_issues = [] if scoped else self.catalog_issues
+            excluded['documents'].update(issue['cloud'] for issue in catalog_issues if issue.get('cloud'))
             result = Bridge(client, cloud, self.state, self.config["zotero_root"], self.config["tablet_root"], review_policy=self.review, follow_changes=True,
-                            progress=self.progress, exclusions=excluded, file_digests=self.file_digests).run(apply=True)
-            catalog_failures = {row['cloud'] for row in self.catalog_issues}
-            result['review'] = self.catalog_issues + [row for row in result['review'] if row.get('cloud') not in catalog_failures]
+                            progress=self.progress, exclusions=excluded, file_digests=self.file_digests,
+                            selected_documents=selected_documents).run(apply=True)
+            catalog_failures = {row['cloud'] for row in catalog_issues}
+            result['review'] = catalog_issues + [row for row in result['review'] if row.get('cloud') not in catalog_failures]
             links = self.state.read('documents', {})
             partial_indexes = 0
             for action in result.get('actions', []):
@@ -2201,6 +2224,18 @@ class Worker:
                 result['review'].append({'cloud': identity, 'title': title,
                     'reason': outcome + (f': {detail}' if detail else '') + '. ' + recovery})
             result['partial_indexes'] = partial_indexes
+            if scoped:
+                selected_review = list(result['review'])
+                previous = self.last.get('result', {}).get('review', [])
+                result['review'] = [issue for issue in previous if issue.get('cloud') not in selected_documents] + selected_review
+                result['scope'] = 'selected'
+                result['selected_documents'] = sorted(selected_documents)
+                completed_at = time.time()
+                message = ('Selected PDF sync finished. Review the selected links that need attention.' if selected_review
+                           else f'Synced {len(selected_documents)} selected {"PDF" if len(selected_documents) == 1 else "PDFs"} with reMarkable.')
+                self.last = {'state': 'needs_review' if result['review'] else 'ready', 'message': message,
+                             'updated': completed_at, 'result': result}
+                return self.status()
             from .zotero_bulk import library_index
             indexed, _ = library_index(native_catalog, cancelled=self.stop.is_set, cache=self.file_digests)
             candidates = {}
@@ -3467,7 +3502,7 @@ class Worker:
         allowed = {"status", "connect", "pair", "folders", "configure", "preview_connection", "preview_disconnect", "disconnect_folder", "pause_sync", "sync", "preview", "approve", "delete_decision", "resolve_conflict", "link", "reindex", "local_delete_decision", "move_link", "scan_library", "import_library", "approve_routine", "tag_context", "set_page_tags", "tag_search", "combine_tag_copies", "remove_unavailable_page_tags"}
         allowed.update({'create_destination', 'scan_inbox', 'paper_tag_candidates', 'suggest_paper_tags', 'save_paper_tags', 'preview_keyword_cleanup', 'remove_reviewed_keywords', 'preview_filename_cleanup', 'queue_filename_cleanup', 'cancel_filename_cleanup', 'retry_bulk', 'dismiss_review', 'runtime_health', 'recheck_review', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source'})
         allowed.update({'maintenance', 'undo_filename_cleanup', 'attach_intake_pdf', 'confirm_folder_change', 'apply_tag_edit',
-                        'recheck_keyword_warnings'})
+                        'recheck_keyword_warnings', 'sync_selected'})
         if method not in allowed:
             raise PilotError("Unsupported plugin request.")
         if method not in {'status', 'pause_sync', 'preview_disconnect', 'runtime_health', 'scan_inbox'}:
@@ -3781,11 +3816,11 @@ def _serve(args, worker_factory):
                 continue
             error_type = type(error).__name__.lower()
             if "timeout" in error_type:
-                safe = "Zotero did not answer within 30 seconds. Your files were retained; retry from Notable."
+                safe = "Zotero did not answer within 30 seconds. Your files were retained; retry from reMarkable Sync."
             elif "transport" in error_type or "connect" in error_type:
-                safe = "The connection to Zotero was interrupted. Your files were retained; retry from Notable."
+                safe = "The connection to Zotero was interrupted. Your files were retained; retry from reMarkable Sync."
             else:
-                safe = str(error) if isinstance(error, (PilotError, CloudError, ValueError, FileNotFoundError)) else "The operation could not finish. Your files were retained; retry from Notable."
+                safe = str(error) if isinstance(error, (PilotError, CloudError, ValueError, FileNotFoundError)) else "The operation could not finish. Your files were retained; retry from reMarkable Sync."
             if not quiet_request:
                 worker.last = {"state": "needs_attention", "message": safe, "error": type(error).__name__}
             # Validation/file errors may embed document text or a private title.

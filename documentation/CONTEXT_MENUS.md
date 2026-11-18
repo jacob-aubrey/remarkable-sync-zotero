@@ -1,6 +1,6 @@
 # Context-menu command audit
 
-Reviewed the workspace actions, native reader controls, worker dispatch methods, notebook collector, and annotation renderer for 0.19.28. The plugin now owns a **reMarkable Sync →** submenu in Zotero’s item and collection menus. The Tools command still opens the workspace.
+Reviewed the workspace actions, native reader controls, worker dispatch methods, notebook collector, and annotation renderer for 0.19.29. The plugin owns a **reMarkable Sync →** submenu in Zotero’s item, collection, and PDF-reader context menus. The Tools command still opens the workspace.
 
 ## Commands and scope
 
@@ -13,22 +13,26 @@ Reviewed the workspace actions, native reader controls, worker dispatch methods,
 | Review keywords and topic suggestions | Opens the existing approval panel for one reference’s best PDF or the selected PDF. Suggestions use the existing local reader and require the existing explicit save choice. |
 | Recheck keyword warnings | Reuses the selected link’s existing `recheck_keyword_warnings` action, including its local-check path during sync. This checks the plugin’s keyword evidence. Ordinary tag editing remains in Zotero. |
 | Check and repair a connection | **Check paper connection…** opens that link and obtains its existing repair preview. Applying a repair still uses the reviewed token and existing confirmation controls. |
-| Pause or resume a paper link | Shown for one link according to its current state. Pausing retains both copies. Resuming uses the worker’s existing edition and reference validation. |
-| Rebuild a PDF’s search index | Runs the existing local reindex operation for one available linked view. It does not rebuild unrelated PDFs. |
+| Pause or resume a paper link | Shown for one link according to its current state. A confirmation identifies the paper and explains the effect. Pausing retains both copies. Resuming uses the worker’s existing edition and reference validation. |
+| Rebuild a PDF’s search index | Confirms the paper and replacement of its cached search text, then runs the existing local reindex operation for one available linked view. |
 | Export source-linked annotations | Exports one available linked PDF through the existing Markdown exporter and file picker. Word notebooks remain a separate command. |
 | Rename or move a linked document | Available in the selected link’s existing card, with its saved draft, revision check, and destination chooser. A right-click opens the correct card through **Show selected links…**. |
 | Review or combine tablet highlight groups | Available in the selected link’s annotation controls. Geometry and membership require the existing preview and approval. |
 | Undo a queued filename repair | Remains on the selected link’s card, alongside the previous name and repair history. |
 | Mark a paper as read or unread | Retains the existing independent item-menu commands and shared manual Read tag. |
 | Paper and page tag editing | Zotero’s Tags pane and the existing reader tag button retain their roles. A reference right-click has no page position, so it cannot safely choose a page to edit. |
-| Sync or retry transfers | **Sync all linked folders now** reuses ordinary sync, including verification, retry, and pending-tag handling. The current engine reconciles the whole connection; no selected-paper command claims otherwise. |
+| Sync or retry transfers | **Sync selected papers now** resolves references to their recorded PDF links. PDF selections use exact source or view keys. A collection command names its subcollection scope. The selected IDs pass through worker validation into the existing bridge. Full sync remains in the workspace. |
+| Sync while reading | **reMarkable Sync → Sync this PDF now** appears in PDF-view, annotation, and thumbnail context menus. The same branded submenu can also offer tag notebook export. Progress uses Zotero’s native progress window and keeps the reader open. |
+| Receive live PDF updates | The common managed-annotation endpoint imports the current annotations and reloads matching open readers. Both automatic and manual syncs use it. The host reader retains its view state, and unrelated readers are left open. |
 | Open the workspace or setup | Both are available at the bottom of the submenu. |
 | Inbox discovery, citation editing, filing, and attaching ToSort downloads | Remain in Inbox, where review identity, evidence, filename, destination, and approval are available together. |
 | Windows library scans, bulk imports, and retrying an import row | Remain in Import library, where the source folder and scan plan are explicit. |
 | Paper or folder conflicts, Trash, restoration, and merge decisions | Remain in their existing review cards. A context menu alone does not provide the reviewed deletion inventory or conflict evidence. |
 | Library-wide tag cleanup, filename cleanup, maintenance, backups, and restoration | Retain their existing previews and settings. These operations have broader scope than the right-clicked paper. |
 
-For several selected items, notebook export and link inspection operate on the whole selection. Commands that require one unambiguous link are hidden when several links match. Deleted items, deleted parents, feeds, notes, and unsupported selections do not expose the item submenu. Worker mutations are disabled while the single writer is busy; keyword rechecks retain the existing concurrent local-check behavior. Group-library notebooks use their own library, while reMarkable link controls remain scoped to the personal-library connection.
+For several selected items, notebook export, selected sync, and link inspection operate on the whole selection. Other commands that require one unambiguous link are hidden when several links match. Deleted items, deleted parents, feeds, notes, and unsupported selections do not expose the item submenu. Worker mutations are disabled while the single writer is busy; keyword rechecks retain the existing concurrent local-check behavior. Group-library notebooks use their own library, while reMarkable link controls remain scoped to the personal-library connection.
+
+Selected sync validates the connection and the current parent, source, and view keys before starting. Empty, removed, or changed selections fail before cloud writes. It fetches the cloud catalog to verify scope, then processes only the requested document IDs. It skips discovery, intake cleanup, folder creation, folder metadata propagation, and unrelated review-policy refreshes. Paused links, blocked folders, conflicts, baseline checks, and publication guards retain their existing behavior. Saved folder mappings and unselected document rows remain unchanged. The global pause setting and last-full-sync timestamp remain intact, and finishing selected sync does not drain unrelated UI queues or immediately start an overdue full sync.
 
 ## Reused integrations
 
@@ -37,6 +41,10 @@ Zotero’s maintained, AGPL-licensed [MenuManager](https://github.com/zotero/zot
 MenuManager does not expose a library-tag or item-tag target in the installed build. Small, removable document listeners extend those existing native tag popups, preserving Zotero’s tag commands. The reader uses Zotero’s [custom reader event API](https://www.zotero.org/support/dev/zotero_7_for_developers#custom_reader_event_handlers), with the clicked tag resolved from the reader tag selector. Listeners, popup nodes, and registrations are removed on window close or plugin shutdown. A separate plugin framework or copied menu system would add lifecycle work without supplying these plugin-specific actions.
 
 The existing notebook collector and bundled MIT-licensed python-docx writer already support annotations and source links. This change extends their selection inputs instead of adding a second exporter. The existing worker remains responsible for connection checks, tag evidence, link control, annotation export, and indexing.
+
+For selected sync, the existing AGPL-licensed cloud adapter already supports stable per-document IDs and root-generation checks, as illustrated by [rMAPI’s sync tree](https://github.com/ddvk/rmapi/blob/master/api/sync15/tree.go). Zotero’s [sync documentation](https://www.zotero.org/support/dev/web_api/v3/syncing) distinguishes individual-item and library versions. These primitives are already in the Windows helper; adding a document-ID scope to the bridge reuses them without introducing another sync service or requiring tablet changes. Catalog reads may still be account-wide, while PDF downloads and writes are selection-specific. The reader refresh reuses the host’s native [Reader.reload implementation](https://github.com/zotero/zotero/blob/main/chrome/content/zotero/xpcom/reader.js), whose internal PDF view reload retains view state. These interfaces remain covered by the plugin’s Zotero 10.0 compatibility limit.
+
+The plugin’s timeout, interrupted-connection, installation, and permission messages use reMarkable Sync. The native authorization prompt names reMarkable Sync for Zotero. Legacy machine identifiers and attachment ownership markers remain unchanged so existing connections keep working.
 
 ## Freehand image-note correction
 

@@ -20,6 +20,8 @@ async function main() {
     Libraries: {userLibraryID: 1},
     Items: {getByLibraryAndKeyAsync: async () => attachment},
     Item: class {},
+    Reader: {_readers: [{itemID: 1, _initPromise: Promise.resolve(), reload: async () => events.push('reload')},
+      {itemID: 99, reload: async () => assert.fail('An unrelated PDF was reloaded')} ]},
     PreferencePanes: {register: async () => {}},
     PDFWorker: {
       import: async () => { annotations = [handwriting, other, added]; },
@@ -51,15 +53,16 @@ async function main() {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../zotero-support/bootstrap.js'), 'utf8'), context);
   await context.startup({id: 'notable-companion@local.invalid', rootURI: 'resource://test/'});
   const Endpoint = Zotero.Server.Endpoints['/api/notable/annotations/:itemKey'];
-  const [status] = await new Endpoint().run({
+  const [status, , body] = await new Endpoint().run({
     method: 'POST', headers: new Map([['Zotero-Server-ID', 'fixture']]), pathParams: {itemKey: 'PDF23456'}
   });
   assert.equal(status, 200);
+  assert.equal(JSON.parse(body).readersRefreshed, 1);
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(events, ['invalidate:11', 'render']);
+  assert.deepEqual(events, ['reload', 'invalidate:11', 'render']);
   finishRendering();
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(events, ['invalidate:11', 'render', ['modify', 'item', [11]]]);
+  assert.deepEqual(events, ['reload', 'invalidate:11', 'render', ['modify', 'item', [11]]]);
 }
 
 main().then(() => console.log('Handwriting thumbnail refresh passed.'), error => {

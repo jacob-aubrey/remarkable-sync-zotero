@@ -243,7 +243,8 @@ def annotation_render_id(fingerprint, *, group_highlights=False, handwriting_car
 
 
 class Bridge:
-    def __init__(self, zotero, cloud, state, zotero_root, cloud_root, *, saved_annotations=None, review_policy=None, follow_changes=False, progress=None, exclusions=None, file_digests=None):
+    def __init__(self, zotero, cloud, state, zotero_root, cloud_root, *, saved_annotations=None, review_policy=None, follow_changes=False, progress=None, exclusions=None, file_digests=None, selected_documents=None):
+        self.selected_documents = None if selected_documents is None else frozenset(selected_documents)
         self.file_digests = file_digests if file_digests is not None else {}
         self.zot, self.cloud, self.state = zotero, cloud, state
         self.zroot, self.croot = zotero_root, str(uuid.UUID(cloud_root))
@@ -268,6 +269,9 @@ class Bridge:
 
     def run(self, *, apply=False):
         with self.state.lock():
+            if self.selected_documents is not None:
+                if not self.selected_documents or not self.selected_documents <= self.state.read('documents', {}).keys():
+                    raise PilotError('The selected paper links changed. Refresh the selection and try again.')
             self.state.bind(self.zot.server_id, self.namespace)
             return self._run(apply)
 
@@ -297,10 +301,15 @@ class Bridge:
         self.progress('Checking reMarkable’s current file list…')
         catalog = self.cloud.library()
         confirmed = self.state.read('folder_blocks', {}).get('confirmed', {})
-        zscope, cscope, blocked = sync_folder_scope(collections, catalog, self.zroot, self.croot, saved_maps, self.exclusions, confirmed)
+        scoped = self.selected_documents is not None
+        scope_conflicts = {key for key, link in saved_maps.items() if link.get('pending')} if scoped else set()
+        if scoped and self.review_policy:
+            scope_conflicts.update(row['identity'] for row in self.review_policy.rows()
+                                   if row['kind'] == 'conflict' and row['payload'].get('type') == 'folder')
+        zscope, cscope, blocked = sync_folder_scope(collections, catalog, self.zroot, self.croot, saved_maps, self.exclusions, confirmed, conflicts=scope_conflicts)
         blocked_keys = set(blocked['zotero'])
         maps = {key: link for key, link in saved_maps.items() if key not in blocked_keys}
-        if apply:
+        if apply and not scoped:
             self.state.write('folder_blocks', blocked)
         zby = {key: row for key, (row, _) in zscope.items()}
         cby = {key: row for key, (row, _) in cscope.items()}
@@ -312,14 +321,14 @@ class Bridge:
             for row in self.review_policy.rows():
                 if row['kind'] == 'conflict':
                     (applying_conflicts if row['status'] == 'applying' else pending_conflicts).add(row['identity'])
-            if apply:
+            if apply and not scoped:
                 for issue in blocked['issues']:
                     if {issue['zotero_state'], issue['tablet_state']} & {'trash', 'outside'}:
                         self.review_policy.retire_conflict(issue['zotero'])
         folder_conflicts = set()
 
         def scan_folder_conflicts():
-            if not self.follow_changes:
+            if not self.follow_changes or scoped:
                 return
             from .zotero_review import fingerprint
             reverse = {link['cloud']: key for key, link in maps.items()}
@@ -374,7 +383,8 @@ class Bridge:
 
         def save():
             if apply:
-                self.state.write("folders", {**saved_maps, **maps})
+                if not scoped:
+                    self.state.write("folders", {**saved_maps, **maps})
                 self.state.write("documents", documents)
 
         def zwrite():
@@ -385,7 +395,7 @@ class Bridge:
 
         # Recover uncertain folder creation using the identities committed before
         # the request. A confirmed deletion is never treated as an incomplete job.
-        for zk, link in list(maps.items()):
+        for zk, link in ([] if scoped else list(maps.items())):
             ck = link["cloud"]
             if link.get("pending") == "cloud" and ck not in cby:
                 if zk not in zby:
@@ -415,6 +425,8 @@ class Bridge:
         # Discover parent before child in either direction. A unique sibling name
         # can link folders; paper identity always requires a recorded source ID.
         pending_z, pending_c = set(zby) - set(maps), set(cby) - {v["cloud"] for v in maps.values()}
+        if scoped:
+            pending_z, pending_c = set(), set()
         while pending_z or pending_c:
             progressed = False
             for zp, parent_link in list(maps.items()):
@@ -472,7 +484,7 @@ class Bridge:
         reverse = {v["cloud"]: k for k, v in maps.items()}
         if len(reverse) != len(maps):
             raise PilotError("More than one collection maps to the same tablet folder.")
-        for zk, link in maps.items():
+        for zk, link in (() if scoped else maps.items()):
             if link.get("root"):
                 continue
             if self.follow_changes:
@@ -515,11 +527,16 @@ class Bridge:
         suspended = ((self.review_policy.suspended_documents() if self.review_policy else set())
                      | self.exclusions['documents'] | (applying_conflicts & set(documents)))
         suspended.update(folder_blocked_papers(documents, catalog, blocked))
+        if scoped:
+            for identity in sorted(self.selected_documents & suspended):
+                reviews.append({'cloud': identity, 'reason': 'This paper link or its folder is paused or needs review. Open its link or Sync Conflicts before syncing it.'})
         if self.follow_changes:
             from pathlib import Path
             from .zotero_review import fingerprint
             by_id = {item.id: item for item in catalog}
             for identity, row in documents.items():
+                if scoped and identity not in self.selected_documents:
+                    continue
                 if identity in suspended or not row.get("parent"):
                     continue
                 with self._document_errors(reviews, cloud=identity, suspended=suspended):
@@ -616,7 +633,7 @@ class Bridge:
                     if apply and identity in pending_conflicts:
                         self.review_policy.retire_conflict(identity)
         self.progress('Checking Zotero papers in connected folders…')
-        for zk in zby:
+        for zk in (() if scoped else zby):
             if not apply and zk not in zscope:
                 continue
             for row in self.zot.collection_items(zk):
@@ -701,10 +718,13 @@ class Bridge:
                     reports.append({"action": "pdf_to_tablet", "attachment": source_key, "cloud": ck})
 
         cloud_pdfs = {r.id: r for r in catalog if not r.deleted and r.is_pdf and r.parent in reverse}
+        if scoped:
+            cloud_pdfs = {key: item for key, item in cloud_pdfs.items() if key in self.selected_documents}
         for identity in suspended:
             cloud_pdfs.pop(identity, None)
-        for number, (ck, row) in enumerate(list(documents.items()), 1):
-            self.progress(f'Checking approved paper {number} of {len(documents)}…')
+        active_documents = {key: row for key, row in documents.items() if not scoped or key in self.selected_documents}
+        for number, (ck, row) in enumerate(list(active_documents.items()), 1):
+            self.progress(f'Checking approved paper {number} of {len(active_documents)}…')
             if ck in suspended:
                 continue
             if ck in cloud_pdfs:

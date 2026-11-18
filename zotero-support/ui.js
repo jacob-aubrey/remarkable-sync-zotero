@@ -830,6 +830,7 @@ var NotableUI = {
     const queued = this.queuedReviewIds();
     const saved = queued.size ? `${queued.size} decisions saved in filing queue · ` : '';
     const linked = (this.latest?.links || []).filter(row => !row.unavailable).length;
+    if (this.operation?.scoped) return `Syncing ${this.operation.targetCount} selected ${this.operation.targetCount === 1 ? 'PDF' : 'PDFs'}`;
     if (this.operation?.method === 'sync') return `${saved}${linked} linked so far`;
     const waiting = this.latest?.filing_summary?.approved_waiting_sync;
     return `${saved}${waiting == null ? '' : `${waiting} approved, waiting for sync · `}${linked} linked`;
@@ -839,7 +840,7 @@ var NotableUI = {
     const job = this.operation?.method === 'sync' ? this.operation : null;
     const mode = job?.yielding ? 'Finishing the current paper before filing…'
       : this.pausing || job?.stopping ? 'Stopping sync…'
-      : job ? 'Syncing with reMarkable…'
+      : job?.scoped ? 'Syncing selected PDFs with reMarkable…' : job ? 'Syncing with reMarkable…'
       : config.sync_paused ? 'Sync paused'
       : this.syncFailure && config.automatic ? 'Sync waiting to retry'
       : this.syncFailure || this.latest?.status?.state === 'needs_attention' ? 'Sync needs attention'
@@ -1108,9 +1109,10 @@ var NotableUI = {
       try { await this.paperTagRequest; } catch (_) {}
     }
     if (this.inboxChecking) { try { await this.inboxRequest; } catch (_) {} }
-    const syncing = method === 'sync';
+    const scopedSync = method === 'sync_selected';
+    const syncing = method === 'sync' || scopedSync;
     if (syncing && (params.automatic ? !this.automaticAllowed() : !this.canSync())) return;
-    if (syncing && !params.automatic && !this.busy && this.syncDecisions.some(job => !job.error)) {
+    if (syncing && !scopedSync && !params.automatic && !this.busy && this.syncDecisions.some(job => !job.error)) {
       await this.drainSyncDecisions();
       if (!this.canSync() || this.syncDecisions.some(job => !job.error)) return;
     }
@@ -1132,13 +1134,13 @@ var NotableUI = {
     }
     clearTimeout(this.timer);
     this.timer = null;
-    if (syncing) this.syncDue = null;
+    if (syncing && !scopedSync) this.syncDue = null;
     this.busy = true;
     const reviewChangeSerial = this.reviewChangeSerial || 0;
     const checkingInbox = method === 'check_inbox';
-    const localReviewAction = checkingInbox || ['recheck_review', 'recheck_keyword_warnings', 'attach_intake_pdf', 'confirm_folder_change', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source', 'create_destination', 'preview_keyword_cleanup', 'remove_reviewed_keywords',
+    const localReviewAction = scopedSync || checkingInbox || ['recheck_review', 'recheck_keyword_warnings', 'attach_intake_pdf', 'confirm_folder_change', 'acknowledge_review_finding', 'preview_link_repair', 'repair_link', 'close_removed_source', 'create_destination', 'preview_keyword_cleanup', 'remove_reviewed_keywords',
       'preview_filename_cleanup', 'queue_filename_cleanup', 'cancel_filename_cleanup', 'maintenance'].includes(method);
-    const labels = {sync: 'Syncing with reMarkable', scan_library: 'Scanning your Windows library',
+    const labels = {sync: 'Syncing with reMarkable', sync_selected: 'Syncing selected PDFs with reMarkable', scan_library: 'Scanning your Windows library',
       suggest_paper_tags: 'Finding paper keywords and tag suggestions', save_paper_tags: 'Saving your paper-tag choices',
       preview_keyword_cleanup: 'Checking saved keyword evidence', remove_reviewed_keywords: 'Removing selected automatic tags',
       preview_filename_cleanup: 'Checking linked filenames against Zotero citations', queue_filename_cleanup: 'Saving selected filename changes',
@@ -1150,7 +1152,8 @@ var NotableUI = {
       acknowledge_review_finding: 'Saving this library decision', reindex: 'Rebuilding the search index', folders: 'Loading folders',
       maintenance: 'Running the selected local library action', apply_tag_edit: 'Applying saved tag changes'};
     const detail = checkingInbox ? '' : 'Starting…';
-    this.operation = {method, automatic: !!params.automatic, title: labels[method] || 'Updating your setup',
+    this.operation = {method: syncing ? 'sync' : method, scoped: scopedSync, targetCount: params.targets?.length,
+      automatic: !!params.automatic, title: labels[method] || 'Updating your setup',
       started: Date.now(), updated: Date.now(), detail};
     if (syncing) this.badge();
     else if (!checkingInbox) this.message(detail);
@@ -1167,7 +1170,7 @@ var NotableUI = {
         if (this.inboxReferenceSelection?.id === reference) this.inboxReferenceSelection.attachment = key;
         this.zoteroInboxDirty ||= result.native_files_settling;
       }
-      if (['sync', 'set_page_tags', 'apply_tag_edit', 'combine_tag_copies', 'remove_unavailable_page_tags'].includes(method)) {
+      if (['sync', 'sync_selected', 'set_page_tags', 'apply_tag_edit', 'combine_tag_copies', 'remove_unavailable_page_tags'].includes(method)) {
         this.tagSyncRevision = (this.tagSyncRevision || 0) + 1;
       }
       if (syncing && !this.operation.stopping) {
@@ -1228,7 +1231,10 @@ var NotableUI = {
       this.badge(); this.message(error.message, true); throw error;
     }
     finally {
-      this.busy = false; this.operation = null; this.disable(false); this.schedule();
+      this.busy = false; this.operation = null; this.disable(false);
+      // A selected-paper refresh must not immediately launch an overdue full sync.
+      if (scopedSync && this.syncDue != null) this.syncDue = Math.max(this.syncDue, Date.now() + 300000);
+      this.schedule();
       if (this.searchRefreshWaiting || (syncing && this.tab === 'tags')) {
         this.searchRefreshWaiting = false;
         this.scheduleSearchRefresh();
@@ -1238,7 +1244,7 @@ var NotableUI = {
       if (this.reviewUpgradeWaiting && this.view && !this.view.closed) {
         this.reviewUpgradeWaiting = false; this.prepareReviewGuidance();
       } else if (!localReviewAction && this.filingQueue.length && !this.drainingFilings) this.drainFilings().catch(error => this.message(error.message, true));
-      if (method !== 'recheck_keyword_warnings') {
+      if (method !== 'recheck_keyword_warnings' && !scopedSync) {
         if (!this.drainingSyncDecisions) this.drainSyncDecisions();
         if (!this.drainingTagEdits) this.drainTagEdits();
         if (!this.drainingAfterSync) this.drainAfterSync();
