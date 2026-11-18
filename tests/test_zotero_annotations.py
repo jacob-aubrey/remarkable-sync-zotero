@@ -89,7 +89,9 @@ class AnnotationCardsTests(unittest.TestCase):
                              [mark.info['id'] for mark in original])
             self.assertEqual([mark.vertices for mark in first.annots(types=[fitz.PDF_ANNOT_INK])],
                              [mark.vertices for mark in second.annots(types=[fitz.PDF_ANNOT_INK])])
-            [card] = second.annots(types=[fitz.PDF_ANNOT_SQUARE])
+            cards = list(second.annots(types=[fitz.PDF_ANNOT_SQUARE]))
+            self.assertEqual(len(cards), 2)  # Nearby handwriting, plus the isolated stroke.
+            card = cards[0]
             self.assertEqual(card.info['content'], 'Handwritten note')
             self.assertIn(page_id, card.info['id'])
             self.assertRegex(combined.xref_get_key(card.xref, 'Zotero:Key')[1], r'^[23456789A-NP-Z]{8}$')
@@ -109,3 +111,39 @@ class AnnotationCardsTests(unittest.TestCase):
 
         with rendered() as plain, rendered(handwriting_cards=True) as with_cards:
             self.assertEqual(plain[0].get_pixmap().samples, with_cards[0].get_pixmap().samples)
+
+    def test_every_drawing_tool_gets_a_card_without_changing_page_or_snapped_text(self):
+        for tool in Pen:
+            if tool in {Pen.ERASER, Pen.ERASER_AREA}:
+                continue
+            with self.subTest(tool=tool):
+                item, bundle = fixture()
+                layer = next(name for name in bundle if name.endswith('.rm'))
+                blocks = list(read_blocks(BytesIO(bundle[layer])))
+                strokes = [block for block in blocks if isinstance(block, SceneLineItemBlock)]
+                self.assertTrue(strokes)
+                # A single closed stroke surrounding most of a figure/page,
+                # larger than both of the previous region-size cutoffs.
+                strokes[0].item.value.tool = tool
+                strokes[0].item.value.points = [Point(x, y, 0, 0, 16, 90) for x, y in
+                    [(-600, 400), (600, 400), (600, 1600), (-600, 1600), (-600, 400)]]
+                blocks = [block for block in blocks if not isinstance(block, SceneLineItemBlock) or block is strokes[0]]
+                stream = BytesIO(); write_blocks(stream, blocks, options={'version': '3.1'})
+                bundle[layer] = stream.getvalue()
+                with fitz.open(stream=annotated_pdf(item, bundle), filetype='pdf') as plain, \
+                     fitz.open(stream=annotated_pdf(item, bundle, handwriting_cards=True), filetype='pdf') as converted:
+                    page, original = converted[0], plain[0]
+                    [card] = page.annots(types=[fitz.PDF_ANNOT_SQUARE])
+                    [ink] = page.annots(types=[fitz.PDF_ANNOT_INK])
+                    self.assertTrue(all(card.rect.contains(point) for point in ink.vertices[0]))
+                    self.assertEqual(card.info['content'], 'Handwritten note')
+                    self.assertEqual(page.get_pixmap().samples, original.get_pixmap().samples)
+                    self.assertEqual([a.vertices for a in page.annots(types=[fitz.PDF_ANNOT_HIGHLIGHT])],
+                                     [a.vertices for a in original.annots(types=[fitz.PDF_ANNOT_HIGHLIGHT])])
+
+    def test_single_dot_is_included_in_image_notes(self):
+        from note_organizer.remarkable_marks import handwriting_regions
+        page = fitz.Rect(0, 0, 600, 800)
+        [(identity, region)] = handwriting_regions([('dot', fitz.Rect(40, 40, 41, 41))], page)
+        self.assertEqual(identity, 'dot')
+        self.assertTrue(region.contains(fitz.Rect(40, 40, 41, 41)))

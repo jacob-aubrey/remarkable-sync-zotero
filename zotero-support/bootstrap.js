@@ -100,6 +100,7 @@ async function startup({id, rootURI}) {
   Services.scriptloader.loadSubScript(rootURI + 'reading-status.js', globalThis);
   Services.scriptloader.loadSubScript(rootURI + 'sync-column.js', globalThis);
   Services.scriptloader.loadSubScript(rootURI + 'notebook.js', globalThis);
+  Services.scriptloader.loadSubScript(rootURI + 'context-menu.js', globalThis);
   Services.scriptloader.loadSubScript(rootURI + 'citation-draft.js', globalThis);
   Services.scriptloader.loadSubScript(rootURI + 'annotation-jump.js', globalThis);
   NotableSyncColumn.register(id);

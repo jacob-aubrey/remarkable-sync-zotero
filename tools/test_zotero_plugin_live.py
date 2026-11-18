@@ -122,8 +122,102 @@ async function startup({rootURI}) {
             await win.ZoteroPane.buildCollectionContextMenu();
             const collectionMenu = win.document.getElementById('zotero-collectionmenu');
             collectionMenu.dispatchEvent(new win.Event('popupshowing', {bubbles: true}));
-            await wait(() => collectionMenu.querySelector('menuitem[label="Generate Word notebook…"]:not([hidden])'),
+            const submenu = collectionMenu.querySelector('menu[label="reMarkable Sync"]:not([hidden]) > menupopup');
+            if (!submenu) throw Error('The collection context menu has no reMarkable Sync submenu');
+            submenu.dispatchEvent(new win.Event('popupshowing', {bubbles: true}));
+            await wait(() => submenu.querySelector('menuitem[label="Generate Word notebook…"]:not([hidden])'),
               'The native collection menu did not offer Word export');
+
+            const itemCommands = async items => {
+              await win.ZoteroPane.selectItems(items.map(item => item.id));
+              await win.ZoteroPane.buildItemContextMenu();
+              const popup = win.document.getElementById('zotero-itemmenu');
+              popup.dispatchEvent(new win.Event('popupshowing', {bubbles: true}));
+              const sub = popup.querySelector('menu[label="reMarkable Sync"]:not([hidden]) > menupopup');
+              if (!sub) throw Error('The item context menu has no reMarkable Sync submenu');
+              sub.dispatchEvent(new win.Event('popupshowing', {bubbles: true}));
+              return sub;
+            };
+            const has = (popup, label) => popup.querySelector(`menuitem[label="${label}"]:not([hidden="true"])`);
+            const linkedMenus = await itemCommands([paper]);
+            if (!has(linkedMenus, 'Open reMarkable PDF') || !has(linkedMenus, 'Recheck paper keywords')) {
+              throw Error('The linked reference is missing its context-specific commands');
+            }
+            const unrelated = await Zotero.Attachments.importFromFile({file: Zotero.File.pathToFile(command.source), parentItemID: paper.id});
+            if (has(await itemCommands([unrelated]), 'Open reMarkable PDF')) {
+              throw Error('An unrelated PDF inherited another attachment’s tablet link');
+            }
+            const multiple = await itemCommands([pdf, unrelated]);
+            if (!has(multiple, 'Generate Word notebook…')) throw Error('Multiple PDFs cannot export a notebook');
+            ui.pickLocalFile = async () => ({path: command.selectionTarget, replace: false});
+            try {
+              has(multiple, 'Generate Word notebook…').doCommand();
+              await wait(() => doc.getElementById('message').textContent.includes(command.selectionTarget) && IOUtils.exists(command.selectionTarget),
+                'The selected-PDF menu did not export a notebook');
+            } finally { ui.pickLocalFile = pickLocalFile; }
+
+            // Native tag selector: the right-clicked tag can differ from active filters.
+            await win.ZoteroPane.selectItem(paper.id);
+            const nativeTag = await wait(() => [...win.document.querySelectorAll('.tag-selector-item')]
+              .find(node => node.textContent === 'Notebook topic'), 'The native tag selector did not list the test tag');
+            nativeTag.dispatchEvent(new win.MouseEvent('contextmenu', {bubbles: true, cancelable: true, screenX: 100, screenY: 100}));
+            const tagMenu = win.document.getElementById('tag-menu');
+            const tagExport = await wait(() => tagMenu.querySelector('.notable-tag-menu menuitem'), 'The native tag menu has no Word export');
+            ui.pickLocalFile = async () => ({path: command.tagTarget, replace: false});
+            try {
+              tagExport.doCommand(); tagMenu.hidePopup();
+              await wait(() => doc.getElementById('message').textContent.includes(command.tagTarget) && IOUtils.exists(command.tagTarget),
+                () => 'The native tag command did not export a notebook. ' + doc.getElementById('message').textContent);
+            } finally { ui.pickLocalFile = pickLocalFile; }
+
+            await ui.showZoteroTags(paper.key);
+            const tagRow = await wait(() => [...win.document.querySelectorAll('tags-box [tagName]')]
+              .find(node => node.getAttribute('tagName') === 'Notebook topic'), 'The native Tags pane did not render the saved tag');
+            tagRow.dispatchEvent(new win.MouseEvent('contextmenu', {bubbles: true, cancelable: true, screenX: 120, screenY: 120}));
+            const boxMenu = tagRow.closest('tags-box').querySelector('menupopup[id$="tags-context-menu"]');
+            if (!boxMenu) throw Error('The native tag popup could not be located');
+            await wait(() => boxMenu.querySelector('.notable-tag-menu menuitem'),
+              () => 'The native item Tags pane has no notebook command. ' + boxMenu.outerHTML);
+            boxMenu.hidePopup();
+
+            const taggedAnnotation = pdf.getAnnotations()[0];
+            taggedAnnotation.addTag('Annotation notebook topic');
+            await taggedAnnotation.saveTx();
+            const reader = await Zotero.Reader.open(pdf.id);
+            await wait(() => reader._internalReader?.toggleSidebar, 'The PDF reader did not initialize');
+            reader._internalReader.toggleSidebar(true);
+            await wait(() => reader._iframeWindow?.document.getElementById('selector'), 'The reader tag selector did not load');
+            const readerDoc = reader._iframeWindow.document;
+            const annotationTag = await wait(() => [...readerDoc.querySelectorAll('#selector .tag')]
+              .find(node => node.textContent === 'Annotation notebook topic'), 'The reader did not list the annotation tag');
+            const tagRect = annotationTag.getBoundingClientRect();
+            annotationTag.dispatchEvent(new reader._iframeWindow.MouseEvent('contextmenu', {bubbles: true, cancelable: true,
+              clientX: tagRect.x + tagRect.width / 2, clientY: tagRect.y + tagRect.height / 2}));
+            const readerTagExport = await wait(() => reader._popupset.querySelector('menu[label="reMarkable Sync"] menuitem'),
+              'The reader tag context menu has no notebook command');
+            ui.pickLocalFile = async () => ({path: command.readerTagTarget, replace: false});
+            try {
+              readerTagExport.doCommand();
+              await wait(() => doc.getElementById('message').textContent.includes(command.readerTagTarget) && IOUtils.exists(command.readerTagTarget),
+                () => 'The reader tag export failed. ' + doc.getElementById('message').textContent);
+            } finally { ui.pickLocalFile = pickLocalFile; }
+            for (const popup of reader._popupset.querySelectorAll('menupopup')) popup.hidePopup();
+            win.Zotero_Tabs.select('zotero-pane');
+
+            // Render a retained tablet scene through Zotero's real annotation importer.
+            const inkPDF = await Zotero.Attachments.importFromFile({file: Zotero.File.pathToFile(command.inkSource), parentItemID: paper.id});
+            await Zotero.PDFWorker.import(inkPDF.id, true);
+            await inkPDF.loadAllData();
+            const cards = inkPDF.getAnnotations().filter(note => note.annotationType === 'image' && note.annotationComment === 'Handwritten note');
+            if (!cards.length) throw Error('The freehand highlighter outline did not become a native image note');
+            await Zotero.PDFWorker.renderAttachmentAnnotations(inkPDF.id);
+            if (!(await Zotero.Annotations.hasCacheImage(cards[0]))) throw Error('The outline image note has no screenshot');
+            ui.pickLocalFile = async () => ({path: command.inkTarget, replace: false});
+            try {
+              has(await itemCommands([inkPDF]), 'Generate Word notebook…').doCommand();
+              await wait(() => doc.getElementById('message').textContent.includes(command.inkTarget) && IOUtils.exists(command.inkTarget),
+                'The ink screenshot did not export to Word');
+            } finally { ui.pickLocalFile = pickLocalFile; }
 
             const row = {id: 'fixture-citation', kind: 'inbox', status: 'pending', identity: 'fixture', digest: 'fixture',
               payload: {title: paper.getDisplayTitle(), parent: paper.key, filename: 'Notebook article.pdf', path: command.source,
@@ -1843,12 +1937,41 @@ def notebook_and_citation_checks(root, checked):
     source = root / 'Notebook article.pdf'
     source.write_bytes(pdf_bytes())
     path = root / 'Notes on Notebook topic.docx'
+    from io import BytesIO
+    from rmscene import read_blocks, write_blocks
+    from rmscene.scene_stream import SceneLineItemBlock
+    from rmscene.scene_items import Pen, PenColor, Point
+    from note_organizer.remarkable_pdf import annotated_pdf
+    from tests.test_remarkable import fixture
+    item, bundle = fixture()
+    import pymupdf as fitz
+    with fitz.open(stream=bundle[item.id + '.pdf'], filetype='pdf') as figure:
+        figure[0].draw_rect(fitz.Rect(170, 190, 430, 435), color=(0, 0, 0))
+        figure[0].draw_line((190, 410), (405, 220), color=(.1, .4, .8), width=2)
+        figure[0].insert_text((190, 460), 'Figure 3: source content inside the outline')
+        bundle[item.id + '.pdf'] = figure.tobytes()
+    layer = next(name for name in bundle if name.endswith('.rm'))
+    blocks = list(read_blocks(BytesIO(bundle[layer])))
+    for block in blocks:
+        if isinstance(block, SceneLineItemBlock):
+            block.item.value.tool = Pen.HIGHLIGHTER_2
+            block.item.value.color = PenColor.YELLOW
+            block.item.value.points = [Point(x, y, 0, 0, 16, 90) for x, y in
+                [(-600, 400), (600, 400), (600, 1600), (-600, 1600), (-600, 400)]]
+    stream = BytesIO(); write_blocks(stream, blocks, options={'version': '3.1'})
+    bundle[layer] = stream.getvalue()
+    ink_source = root / 'Freehand figure outline.pdf'
+    ink_source.write_bytes(annotated_pdf(item, bundle, handwriting_cards=True))
     worker = Worker(root / 'profile/notable', recover_pause=False)
     review_id = worker.review.offer('inbox', str(source), file_sha(source), {
         'path': str(source), 'filename': source.name, 'title': 'Unfiled download', 'document_type': 'journal_article',
         'details': {'creators': ['Eve Reader'], 'journal': 'Example journal', 'year': '2026'}, 'issues': [],
     })
-    result = command(root, 'notebook_and_citation', source=str(source), target=str(path), newReview=worker.review.row(review_id))['workflow']
+    selection_target, tag_target, ink_target = (root / name for name in ['Selected PDFs.docx', 'Native tag.docx', 'Figure notes.docx'])
+    reader_tag_target = root / 'Reader tag.docx'
+    result = command(root, 'notebook_and_citation', source=str(source), target=str(path), newReview=worker.review.row(review_id),
+                     selectionTarget=str(selection_target), tagTarget=str(tag_target), readerTagTarget=str(reader_tag_target),
+                     inkSource=str(ink_source), inkTarget=str(ink_target))['workflow']
     notebook = Document(path)
     assert 'An annotated passage' in [p.text for p in notebook.paragraphs]
     assert 'Note: Research note' in [p.text for p in notebook.paragraphs]
@@ -1857,6 +1980,14 @@ def notebook_and_citation_checks(root, checked):
     checked('visible_Zotero_status_column_and_linked_paper_icon')
     checked('Tags_button_exports_real_Zotero_annotations_and_source_links_to_Word')
     checked('native_Zotero_collection_menu_offers_Word_export')
+    assert 'An annotated passage' in [p.text for p in Document(selection_target).paragraphs]
+    assert 'An annotated passage' in [p.text for p in Document(tag_target).paragraphs]
+    assert 'An annotated passage' in [p.text for p in Document(reader_tag_target).paragraphs]
+    assert len(Document(ink_target).inline_shapes) >= 1
+    checked('native_reference_PDF_and_multi_selection_submenus_use_exact_attachment_links')
+    checked('native_tag_right_click_exports_the_clicked_tag_to_Word')
+    checked('item_Tags_pane_and_reader_annotation_tag_contexts_offer_notebooks')
+    checked('freehand_highlighter_figure_outline_imports_as_a_native_image_note_and_exports_its_screenshot')
     checked('Inbox_uses_the_native_Info_editor_with_expandable_creators_and_draft_only_edits')
     checked('an_unfiled_download_shows_citation_suggestions_and_Cancel_discards_edits')
 

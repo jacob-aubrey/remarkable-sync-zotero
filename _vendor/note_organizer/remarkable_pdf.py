@@ -14,7 +14,7 @@ from .remarkable_cloud import trace_event
 from .remarkable_marks import TextMark, group_text_highlights, handwriting_regions, zotero_card_key
 
 
-RENDER_REVISION = 6
+RENDER_REVISION = 7
 
 
 class UnsupportedAnnotations(ValueError):
@@ -300,7 +300,9 @@ def apply_scene(document, page, page_id, tree, *, expand_margins=True,
                 annot.set_blendmode("Multiply")
             annot.set_border(width=width)
             annot.set_info(subject="reMarkable pen")
-            if handwriting_document and not Pen.is_highlighter(item.tool):
+            # GlyphRange above is snapped text. Every Line is freehand ink,
+            # including highlighter outlines, dots, and large figure enclosures.
+            if handwriting_document:
                 radius = width / 2
                 strokes.append((iid, fitz.Rect(min(p.x for p in points) - radius, min(p.y for p in points) - radius,
                                                max(p.x for p in points) + radius, max(p.y for p in points) + radius)))

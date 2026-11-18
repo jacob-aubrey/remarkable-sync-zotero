@@ -795,14 +795,14 @@ class Bridge:
                 from .zotero_tags import render_fingerprint
                 cached = row.get("rendered", {})
                 fingerprint = render_fingerprint(ck, retained_bundle)
-                cached_input = cached.get("input") or []
                 first_publication = not (row.get("view_key") or row.get("revision") or cached)
                 # Grouping existing marks requires the separate manual repair.
                 # New links opt in and keep the choice on every later sync.
                 group_highlights = row.get("group_highlights", first_publication)
                 approved = row.get("approved_highlight_groups") or []
-                handwriting_cards = (row.get("handwriting_cards") or first_publication
-                                     or bool(cached_input and fingerprint != cached_input[0]))
+                # Refresh old links as well: a renderer upgrade must recover
+                # image notes for ink previously omitted from the Notes pane.
+                handwriting_cards = True
                 render_id = annotation_render_id(fingerprint, group_highlights=group_highlights,
                                                  handwriting_cards=handwriting_cards, approved_highlight_groups=approved)
                 output = self.state.directory / "rendered" / (cached.get("sha256", "missing") + ".pdf")

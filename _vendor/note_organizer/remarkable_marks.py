@@ -123,20 +123,15 @@ def group_text_highlights(page, marks):
 
 
 def handwriting_regions(strokes, page):
-    """Find bounded multi-stroke regions without changing the original ink."""
-    if len(strokes) < 2:
-        return []
+    """Cover every visible freehand mark, including single strokes and figure outlines."""
     groups = []
     for identity, rect in strokes:
-        if rect.width > page.width * .6 or rect.height > page.height * .35:
-            continue
         members = [(identity, rect)]
         combined = fitz.Rect(rect)
         for index in range(len(groups) - 1, -1, -1):
             other, boundary = groups[index]
             extent = combined | boundary
-            if (extent.width <= page.width * .6 and extent.height <= page.height * .35
-                    and any(_near_ink(rect, existing) for _, existing in other)):
+            if any(_near_ink(rect, existing) for _, existing in other):
                 members = other + members
                 combined = extent
                 groups.pop(index)
@@ -144,8 +139,6 @@ def handwriting_regions(strokes, page):
 
     regions = []
     for members, rect in groups:
-        if len(members) < 2:
-            continue
         padded = (rect + (-4, -4, 4, 4)) & page
         if not padded.is_empty:
             regions.append((members[0][0], padded))

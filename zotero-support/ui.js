@@ -71,13 +71,13 @@ var NotableUI = {
         this.syncDecisions = saved;
       } catch (_) { this.syncDecisionReadError = 'Saved sync decisions could not be read. Confirmations are on hold.'; }
     }
-    for (const [target, label] of [['main/menubar/tools', this.shortName], ['main/library/item', this.name + '…']]) {
+    for (const [target, label] of [['main/menubar/tools', this.shortName]]) {
       Zotero.MenuManager.registerMenu({menuID: 'notable-' + target.replaceAll('/', '-'), pluginID: this.id, target,
         menus: [{menuType: 'menuitem', icon: target === 'main/menubar/tools' ? 'chrome://notable/content/icons/tablet.svg' : undefined,
           onShowing: (event, {menuElem}) => menuElem.setAttribute('label', label),
           onCommand: () => this.open()}]});
     }
-    globalThis.NotableNotebook?.register(this);
+    globalThis.NotableContextMenu?.register(this);
     // Startup is awaited while Zotero initializes plugins, before its first
     // normal window can finish loading. Do not block that chain on UI ready.
     Zotero.uiReadyPromise.then(async () => {
@@ -173,6 +173,7 @@ var NotableUI = {
     return this.processTraces?.get(process) || {};
   },
   attach(window) {
+    globalThis.NotableContextMenu?.attach(this, window);
     if (this.stopped) return;
     if (this.windows.has(window)) return;
     const toolbar = window.document.getElementById('zotero-tabs-toolbar');
@@ -191,6 +192,7 @@ var NotableUI = {
     if (this.latest) this.badge();
   },
   detach(window) {
+    globalThis.NotableContextMenu?.detach(window);
     this.windows.delete(window);
     if (![...this.windows].some(other => !other.closed) && this.view && !this.view.closed) this.view.close();
     if (!window.closed) window.document?.getElementById('notable-open')?.remove();
@@ -215,7 +217,7 @@ var NotableUI = {
     this.view?.close(); this.view = null;
     for (const window of this.windows) this.detach(window);
     for (const target of ['main-menubar-tools', 'main-library-item']) Zotero.MenuManager.unregisterMenu('notable-' + target);
-    if (globalThis.NotableNotebook) Zotero.MenuManager.unregisterMenu(NotableNotebook.menuID);
+    globalThis.NotableContextMenu?.unregister();
     // A launch which is already awaiting Subprocess.call must observe stopped
     // and finish its child before replacement can create another writer.
     if (this.launching) { try { await this.launching; } catch (_) {} }
@@ -1020,6 +1022,12 @@ var NotableUI = {
     }
     this.open();
   },
+  openContextTab(tab) {
+    if (this.view && !this.view.closed && this.view.document.getElementById('app')?.querySelector('h1')) {
+      this.openTab(tab);
+    } else this.requestedTab = tab;
+    this.open();
+  },
   async openPageTags(reader) {
     const state = reader._internalReader?._state;
     const page = (state?.primary !== false ? state?.primaryViewStats : state?.secondaryViewStats)?.pageIndex;
@@ -1702,7 +1710,9 @@ var NotableUI = {
   },
   async mount(window) {
     this.view = window;
+    globalThis.NotableContextMenu?.attach(this, window);
     window.addEventListener('unload', () => {
+      globalThis.NotableContextMenu?.detach(window);
       if (this.view !== window) return;
       this.hideButtonHelp(); this.view = null; clearInterval(this.activityTimer);
       this.reviewObserver?.disconnect(); this.schedule();
@@ -2383,6 +2393,14 @@ var NotableUI = {
     this.renderTagMaintenance(content);
   },
   renderTagMaintenance(content) {
+    if (this.contextPaperTags) {
+      const {key, title} = this.contextPaperTags;
+      const card = this.el('section', '', content, {class: 'card'});
+      this.el('h3', title, card);
+      this.paperTagEntry({key}).draft.open = true;
+      this.paperTagPanel(card, {key});
+      this.button('Close paper suggestions', card, () => { this.contextPaperTags = null; this.render(); }).dataset.browse = 'true';
+    }
     this.renderKeywordCleanup(content);
     const finder = this.el('details', '', content, {class: 'card'});
     this.el('summary', 'Paper keywords and tag suggestions', finder);
@@ -2441,6 +2459,7 @@ var NotableUI = {
       if (!tags.size) this.el('span', empty, chips, {class: 'hint'});
       for (const value of [...tags].sort()) {
         const chip = this.button(`${value} ×`, chips, () => { tags.delete(value); update(); draw(); });
+        chip.dataset.notableTag = value; chip.dataset.notableTagScope = kind === 'page' ? 'page' : 'paper';
         chip.dataset.browse = 'true'; chip.setAttribute('aria-label', `Remove ${value} from ${kind} tags`);
         if (colors) this.applyTagColor(chip, value, colors);
         chip.addEventListener('click', () => input.focus());
@@ -2451,7 +2470,11 @@ var NotableUI = {
       if (choices.length) {
         this.el('strong', 'Recent tags', recent);
         const buttons = this.el('div', '', recent, {class: 'tag-chips'});
-        for (const value of choices) this.button(value, buttons, () => { add(value); input.focus?.(); }, false, null, {help: false}).dataset.browse = 'true';
+        for (const value of choices) {
+          const choice = this.button(value, buttons, () => { add(value); input.focus?.(); }, false, null, {help: false});
+          choice.dataset.browse = 'true'; choice.dataset.notableTag = value;
+          choice.dataset.notableTagScope = kind === 'page' ? 'page' : 'paper';
+        }
       }
     };
     input.addEventListener('input', update);
@@ -2829,6 +2852,7 @@ var NotableUI = {
         });
         chip.dataset.browse = 'true';
         chip.setAttribute('aria-label', `Remove ${value} from selected tags`);
+        chip.dataset.notableTag = value; chip.dataset.notableTagScope = state.scope;
       }
     };
     const updateTagButtons = () => {
@@ -2842,6 +2866,7 @@ var NotableUI = {
       for (let index = tagButtons.length; index < end; index++) {
         const tag = matchingTags[index];
         const choice = this.el('button', tag, fragment, {type: 'button', 'aria-pressed': String(state.tags.has(tag))});
+        choice.dataset.notableTag = tag; choice.dataset.notableTagScope = state.scope;
         tagButtons.push(choice);
         choice.tabIndex = index === 0 ? 0 : -1;
         choice.dataset.browse = 'true';
@@ -2943,7 +2968,11 @@ var NotableUI = {
     const page = result.scope === 'page';
     const row = this.el('section', '', parent, {class: 'card search-result'});
     this.el('h3', result.title, row);
-    this.el('p', `${page ? 'Page ' + (result.page + 1) : 'Paper tags'} · ${result.tags.join(' · ')}`, row, {class: 'hint'});
+    const tagLine = this.el('p', page ? 'Page ' + (result.page + 1) : 'Paper tags', row, {class: 'hint'});
+    for (const tag of result.tags) {
+      tagLine.append(' · ');
+      this.el('span', tag, tagLine, {'data-notable-tag': tag, 'data-notable-tag-scope': page ? 'page' : 'paper'});
+    }
     const show = this.button('Show Zotero tags', row, () => this.showZoteroTags(result.parent), false, 'tag');
     show.dataset.browse = 'true';
     if (!page && result.pdf) this.button('Open PDF', row, async () => {
@@ -5123,10 +5152,15 @@ var NotableUI = {
   },
   renderLinks(content) {
     const state = this.paperSearchState(), reviewing = state.view === 'review';
-    const links = this.latest.links || [];
+    const contextClouds = state.contextClouds && new Set(state.contextClouds);
+    const links = (this.latest.links || []).filter(row => !contextClouds || contextClouds.has(row.cloud));
     const activeLinks = links.filter(row => !row.unavailable);
     const received = activeLinks.filter(row => row.revision).length;
     this.el('h2', 'Linked papers', content);
+    if (contextClouds) {
+      this.el('p', 'Showing links for your Zotero selection.', content, {role: 'status'});
+      this.button('Show all linked papers', content, () => { delete state.contextClouds; this.render(); }).dataset.browse = 'true';
+    }
     const render = () => { if (this.tab === 'links' && this.view?.document) this.render(); };
     let update = () => {};
     this.renderPaperSearch(content, state, reviewing, () => update(), value => {

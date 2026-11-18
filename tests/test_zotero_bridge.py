@@ -150,7 +150,7 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(row["group_highlights"])
         self.assertTrue(row["handwriting_cards"])
 
-    def test_existing_unchanged_view_does_not_republish_for_annotation_features(self):
+    def test_existing_unchanged_view_recovers_missing_ink_cards_once(self):
         item, _ = self.tablet()
         self.engine.run(apply=True)
         links = self.state.read("documents")
@@ -160,10 +160,14 @@ class BridgeTests(unittest.TestCase):
         row["rendered"]["input"] = row["rendered"]["input"][:2]
         self.state.write("documents", links)
 
-        with patch("note_organizer.zotero_bridge.annotated_pdf") as render:
+        from note_organizer.remarkable_pdf import annotated_pdf
+        with patch("note_organizer.zotero_bridge.annotated_pdf", wraps=annotated_pdf) as render:
+            self.engine.run(apply=True)
+            self.assertTrue(render.call_args.kwargs['handwriting_cards'])
+            render.reset_mock()
             self.engine.run(apply=True)
             render.assert_not_called()
-        self.assertEqual(self.zot.uploads, 1)
+        self.assertTrue(self.state.read('documents')[item.id]['handwriting_cards'])
 
     def test_desktop_pdf_goes_to_tablet_and_notes_return_under_existing_thesis(self):
         self.add_desktop()
@@ -526,4 +530,4 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(first["attachment_key"], second["attachment_key"])
         self.assertEqual(self.zot.uploads, 2)
         with pymupdf.open(stream=self.zot.files[second["attachment_key"]], filetype="pdf") as doc:
-            self.assertEqual(len(list(doc[0].annots())), 3)
+            self.assertEqual(len(list(doc[0].annots())), 4)  # Text, ink, typed note, and the ink image card.
