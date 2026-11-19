@@ -84,6 +84,46 @@ def _can_join(left, left_hit, right, right_hit, lines, bounds):
     return True
 
 
+def _rectangles_overlap(left, right):
+    for left_rect in left.rects:
+        for right_rect in right.rects:
+            intersection = left_rect & right_rect
+            if not intersection.is_empty and intersection.width > .1 and intersection.height > .1:
+                return True
+    return False
+
+
+def _spatially_connected(left, left_hits, right, right_hits):
+    if left_hits[0][:2] != right_hits[0][:2]:
+        return False
+    if abs(left_hits[0][1] - right_hits[0][1]) > 1:
+        return False
+    return _rectangles_overlap(left, right)
+
+
+def _merge_passage_text(current, mark_text):
+    left_words = ' '.join(current.split()).split()
+    right_words = ' '.join(mark_text.split()).split()
+    if not left_words or not right_words:
+        return (current + ' ' + mark_text).strip()
+    normalized_left = [word.casefold().strip('.,;:!?') for word in left_words]
+    normalized_right = [word.casefold().strip('.,;:!?') for word in right_words]
+    overlap = 0
+    for size in range(min(len(left_words), len(right_words)), 0, -1):
+        if normalized_left[-size:] == normalized_right[:size]:
+            overlap = size
+            break
+    if overlap:
+        return (' '.join(left_words + right_words[overlap:])).strip()
+    left_phrase = ' '.join(normalized_left)
+    right_phrase = ' '.join(normalized_right)
+    if right_phrase and right_phrase in left_phrase:
+        return current
+    if left_phrase and left_phrase in right_phrase:
+        return mark_text
+    return (' '.join(left_words + right_words)).strip()
+
+
 def group_text_highlights(page, marks):
     """Return multi-mark passages. Uncertain marks keep their own IDs and geometry."""
     if len(marks) < 2 or page.rotation:
@@ -106,14 +146,33 @@ def group_text_highlights(page, marks):
         if all(_consecutive(left, right, lines, bounds) for left, right in zip(hits, hits[1:])):
             located.append((mark, hits))
     located.sort(key=lambda entry: entry[1][0])
-    runs = []
-    for mark, hits in located:
-        if runs:
-            previous, previous_hits = runs[-1][-1]
-            if _can_join(previous, previous_hits[-1], mark, hits[0], lines, bounds):
-                runs[-1].append((mark, hits))
-                continue
-        runs.append([(mark, hits)])
+
+    # Build connected components rather than only extending the previous mark.
+    # An overlap in the middle can therefore bridge two disjoint passes.
+    parent = list(range(len(located)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left, right):
+        left, right = find(left), find(right)
+        if left != right:
+            parent[right] = left
+
+    for left_index, (left, left_hits) in enumerate(located):
+        for right_index in range(left_index + 1, len(located)):
+            right, right_hits = located[right_index]
+            if (_can_join(left, left_hits[-1], right, right_hits[0], lines, bounds)
+                    or _spatially_connected(left, left_hits, right, right_hits)):
+                union(left_index, right_index)
+
+    components = {}
+    for index, entry in enumerate(located):
+        components.setdefault(find(index), []).append(entry)
+    runs = list(components.values())
 
     groups = []
     for run in runs:
@@ -122,18 +181,13 @@ def group_text_highlights(page, marks):
         text = run[0][0].text.strip()
         for (previous, hits), (mark, following) in zip(run, run[1:]):
             mark_text = mark.text.strip()
-            normalized_text = ' '.join(text.split()).casefold()
-            normalized_mark = ' '.join(mark_text.split()).casefold()
-            if normalized_mark and normalized_mark in normalized_text:
-                continue
-            if normalized_text and normalized_text in normalized_mark:
-                text = mark_text
-                continue
             tail = lines[hits[-1][:2]][hits[-1][3]][4]
             wrapped = hits[-1][:2] != following[0][:2]
             hyphenated = wrapped and tail.endswith(('-', '\u00ad')) and (
                 previous.text.rstrip().endswith(tail) or previous.text.rstrip().endswith(tail[:-1]))
-            text += ('' if hyphenated else ' ') + mark_text
+            separator = '' if hyphenated else None
+            text = (text.rstrip('-') + separator + mark_text if separator == '' else
+                    _merge_passage_text(text, mark_text))
         groups.append(HighlightGroup(tuple(mark.id for mark, _ in run),
                                      tuple(rect for mark, _ in run for rect in mark.rects),
                                      text, run[0][0].stroke))

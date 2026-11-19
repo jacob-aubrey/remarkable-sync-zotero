@@ -102,6 +102,17 @@ class AnnotationCardsTests(unittest.TestCase):
             self.assertEqual(group.text, whole.text)
             self.assertIn(word_rect, group.rects)
 
+    def test_gap_between_two_passes_is_closed_by_transitive_bridge_highlight(self):
+        with letter_page() as doc:
+            page = doc[0]
+            left = line_mark(page, 'left', 0, first=0, last=2)
+            bridge = line_mark(page, 'bridge', 0, first=1, last=3)
+            right = line_mark(page, 'right', 0, first=2)
+            [group] = group_text_highlights(page, [right, left, bridge])
+            self.assertEqual(group.ids, ('left', 'bridge', 'right'))
+            self.assertEqual(group.text, 'A highlighted passage continues here')
+            self.assertEqual(set(group.rects), set(left.rects + bridge.rects + right.rects))
+
     def test_grouped_pdf_and_handwriting_cards_preserve_mark_geometry(self):
         item, bundle = fixture()
         layer = next(name for name in bundle if name.endswith('.rm'))

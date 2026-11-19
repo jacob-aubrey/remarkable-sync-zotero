@@ -9,10 +9,19 @@ var NotableAnnotationRefresh = {
   },
   matches(old, incoming) {
     const a = this.rectangles(old), b = this.rectangles(incoming);
-    if (!a || !b || a.pageIndex !== b.pageIndex || old.annotationType !== incoming.type
-        || old.annotationColor !== incoming.color) return false;
+    if (!a || !b || a.pageIndex !== b.pageIndex || old.annotationType !== incoming.type) return false;
     const equal = (x, y) => x.length === 4 && y.length === 4 && x.every((v, i) => Math.abs(v - y[i]) < .05);
-    if (incoming.type === 'highlight') return a.rects.every(x => b.rects.some(y => equal(x, y)));
+    if (incoming.type === 'highlight') {
+      // Separate passes can change color and leave gaps. Membership means
+      // that at least one old rectangle is contained in or overlaps the new
+      // transitive highlight group, not that every old pass has identical geometry.
+      return a.rects.some(x => b.rects.some(y => {
+        if (equal(x, y)) return true;
+        const overlapX = Math.min(x[2], y[2]) - Math.max(x[0], y[0]);
+        const overlapY = Math.min(x[3], y[3]) - Math.max(x[1], y[1]);
+        return overlapX > .1 && overlapY > .1;
+      }));
+    }
     if (incoming.type !== 'image' || old.annotationComment !== 'Handwritten note'
         || incoming.comment !== 'Handwritten note' || a.rects.length !== 1 || b.rects.length !== 1) return false;
     const [x0, y0, x1, y1] = a.rects[0], [u0, v0, u1, v1] = b.rects[0];
