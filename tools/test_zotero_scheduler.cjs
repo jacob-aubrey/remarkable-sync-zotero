@@ -28,9 +28,9 @@ async function main() {
   await fire();
   assert.equal(calls.length, 1);
   assert.equal(calls[0][1].automatic, true);
-  assert.equal(timers.get(ui.timer).delay, 300000);
+  assert.equal(timers.get(ui.timer).delay, 1800000);
   now += 200000; ui.schedule();
-  assert.equal(timers.get(ui.timer).delay, 100000, 'An unrelated action keeps the original deadline');
+  assert.equal(timers.get(ui.timer).delay, 1600000, 'An unrelated action keeps the original 30-minute deadline');
   ui.busy = true;
   await fire();
   assert.equal(calls.length, 1, 'A local check keeps the single writer');
@@ -50,7 +50,7 @@ async function main() {
   ui.schedule(); assert.equal(ui.timer, null);
   ui.latest.config.automatic = true;
   ui.failures = 2;
-  ui.schedule(1000); assert.equal(timers.get(ui.timer).delay, 900000);
+  ui.schedule(1000); assert.equal(timers.get(ui.timer).delay, 600000);
   ui.stopped = true; ui.schedule(); assert.equal(timers.size, 0);
   console.log('PASS: open-workspace sync, persistent deadlines, busy retry, filing priority, pause races, and backoff');
 }

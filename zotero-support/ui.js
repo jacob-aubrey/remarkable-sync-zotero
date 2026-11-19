@@ -948,7 +948,11 @@ var NotableUI = {
       this.syncDue = null; return;
     }
     const now = Date.now();
-    this.syncDue ??= now + Math.min(900000, 300000 * 2 ** Math.min(this.failures || 0, 2));
+    // Ordinary automatic checks wait 30 minutes after the previous check.
+    // Retain a shorter exponential retry only after failures.
+    this.syncDue ??= now + (!this.failures
+      ? 1800000
+      : Math.min(900000, 300000 * 2 ** Math.min(this.failures - 1, 2)));
     if (sooner != null && !this.failures) this.syncDue = Math.min(this.syncDue, now + sooner);
     const delay = Math.max(this.syncDue - now, this.automaticAllowed() ? 0 : 1000);
     const timer = setTimeout(async () => {
@@ -1693,6 +1697,20 @@ var NotableUI = {
       const detail = doc.getElementById('notable-sync-step');
       const step = syncing ? job.detail : '';
       if (detail.textContent !== step) detail.textContent = step;
+      const progress = doc.getElementById('notable-sync-progress');
+      if (progress) {
+        const count = step.match(/(\d+) of (\d+)/);
+        if (count && Number(count[2]) > 0) {
+          progress.hidden = false;
+          progress.max = Number(count[2]);
+          progress.value = Number(count[1]);
+          progress.setAttribute('aria-valuetext', `${count[1]} of ${count[2]}`);
+        } else {
+          progress.hidden = true;
+          progress.removeAttribute('value');
+          progress.removeAttribute('aria-valuetext');
+        }
+      }
     }
     // Intake checks serialize worker writes, but are silent background work.
     const visibleBusy = !!this.busy && !this.inboxChecking && !syncing;
@@ -2309,6 +2327,7 @@ var NotableUI = {
     syncDetails.open = !!syncDetailsOpen;
     this.el('summary', 'Sync details', syncDetails);
     this.el('p', '', syncDetails, {id: 'notable-sync-step', tabindex: '0'});
+    this.el('progress', '', syncDetails, {id: 'notable-sync-progress', 'aria-label': 'Sync paper progress'});
     const activity = this.el('section', '', status, {id: 'activity', class: 'activity', 'aria-label': 'Current activity'});
     this.el('span', '', activity, {class: 'activity-spinner', 'aria-hidden': 'true'});
     const info = this.el('div', '', activity, {class: 'activity-content'});
