@@ -1,6 +1,6 @@
 # Context-menu command audit
 
-Reviewed the workspace actions, native reader controls, worker dispatch methods, notebook collector, and annotation renderer for 0.19.29. The plugin owns a **reMarkable Sync →** submenu in Zotero’s item, collection, and PDF-reader context menus. The Tools command still opens the workspace.
+Reviewed the workspace actions, native reader controls, worker dispatch methods, notebook collector, and annotation renderer for 0.19.30. The plugin owns a **reMarkable Sync →** submenu in Zotero’s item, collection, and PDF-reader context menus. The Tools command still opens the workspace.
 
 ## Commands and scope
 
@@ -55,3 +55,24 @@ The downstream image-card filter excluded highlighter strokes, isolated strokes,
 Renderer revision 7 invalidates the old render cache, and image cards are enabled when existing links regenerate. The normal publisher retains its annotation-preservation checks. Existing handwritten-note labels and stable card keys are retained for compatibility with Zotero’s thumbnail refresh and saved tags.
 
 Regression checks cover all 16 drawing-tool variants, one-stroke outlines larger than the old limits, isolated dots, unchanged PDF pixels, stable snapped-highlight geometry, and one-time regeneration of older links. The native disposable-profile test exercises reference, PDF, collection, multiple-selection, and tag menus, then imports a highlighter outline as a Zotero image annotation and exports its screenshot to Word.
+
+
+## Selected-sync and annotation corrections in 0.19.30
+
+The packaged UI added the full-sync-only `monitor_inbox` argument to selected-sync requests. The worker correctly rejected that incompatible request signature, but the earlier transport test did not enable the packaged-helper branch. Only full sync now receives that argument. The regression checks exercise the managed UI branch, and the native smoke test sends an actual selected-sync request through the bundled helper to scope validation.
+
+Renderer revision 8 groups consecutive same-color passages on existing links as well as new links. Explicit manual repair selections remain intact. Tablet line breaks can occupy three character positions; the grouping accepts up to four whitespace positions between geometrically consecutive lines. Word adjacency, line order, column alignment, vertical spacing, and color equality still prevent merging omitted text, another column, a separate paragraph, or different colors. The old requirement that every wrapped line nearly reach the right edge rejected ordinary ragged text and has been removed. Original highlight quadrilaterals remain intact.
+
+Freehand grouping revisits components after a connecting stroke joins them, includes small components contained within a larger note's bounds, and accepts slightly wider word and line spacing: horizontal gaps up to 14 points, vertical gaps up to 10 points, and a combined gap up to 18 points. It retains separate distant notes and every visible stroke. A retained problem page with 13 text highlights and seven handwriting cards regenerates as three same-color passages and four handwriting regions, with the interior word included. The private paper is not included in the repository; public regression fixtures use synthetic text and geometry.
+
+Zotero skips rendering any image annotation whose PNG already exists. That includes stale, valid PNGs. The adapter now invalidates every managed handwriting card after an updated import, including newly created placeholders, serializes refreshes of the same PDF, and reports completion or failure. The helper waits for actual thumbnail completion before recording its reader receipt. An interrupted or failed render remains retryable on the next sync, without uploading the PDF again.
+
+Before native import replaces grouped annotations, the adapter previews the new annotations with Zotero's existing PDF worker, retains the surviving annotation key, combines manual tags, and records `dc:replaces` aliases for the other members. Old annotation links resolve to the surviving passage through the reader's existing open route. Saved note content is untouched. Original annotation records are saved in the profile's `notable/annotation-recovery` directory before changes. Conflicting comments stop the import for review. Independently created Zotero reader annotations retain the existing protection against replacement.
+
+### Existing work considered
+
+[remarks](https://github.com/lucasrla/remarks) is GPL-3.0 and uses PyMuPDF and Shapely, both available as Windows wheels. Its actual [text conversion code](https://github.com/lucasrla/remarks/blob/master/remarks/conversion/text.py) groups consecutively highlighted words and uses character offsets to join smart highlights. That supplies useful precedent. Its current README explicitly warns that reMarkable software 3.0 and later are unsupported, describes maintenance as uncertain, and reports testing on 2.14 and 2.15. Replacing the current parser with it would therefore regress modern-device compatibility. No code or dependency from remarks is bundled.
+
+The MIT-licensed [rmc](https://github.com/ricklupton/rmc) and [rmscene](https://github.com/ricklupton/rmscene) support the v6 scene format introduced with tablet software 3. The actual rmc Markdown exporter walks text and GlyphRange items; it does not supply semantic grouping of arbitrary handwritten strokes. The plugin already bundles rmscene 0.8 on Windows, so small geometry and passage adaptations retain its existing device support and avoid another parser or setup step.
+
+The native integration reuses the installed AGPL Zotero 10 [PDF worker](https://github.com/zotero/zotero/blob/main/chrome/content/zotero/xpcom/pdfWorker/manager.js), [annotation API](https://github.com/zotero/zotero/blob/main/chrome/content/zotero/xpcom/annotations.js), and [relation API](https://github.com/zotero/zotero/blob/main/chrome/content/zotero/xpcom/data/relations.js). Native tests cover stale PNG replacement on every page, tag preservation, saved note content, and old source links. The internal interfaces remain limited to the plugin's tested Zotero 10 compatibility range.

@@ -29,7 +29,7 @@ async function main() {
     },
     Annotations: {
       removeCacheImage: async annotation => { events.push(`invalidate:${annotation.id}`); },
-      hasCacheImage: async annotation => annotation.id === handwriting.id
+      hasCacheImage: async annotation => [handwriting.id, added.id].includes(annotation.id)
     },
     Notifier: {trigger: async (event, type, ids) => {
       events.push([event, type, Array.from(ids)]);
@@ -48,7 +48,8 @@ async function main() {
     NotableUI: {start: async () => {}},
     NotableReadingStatus: {register() {}},
     NotableSyncColumn: {register() {}},
-    NotableAnnotationJump: {register() {}}
+    NotableAnnotationJump: {register() {}},
+    NotableAnnotationRefresh: {register() {}, preserve: async () => {}}
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../zotero-support/bootstrap.js'), 'utf8'), context);
   await context.startup({id: 'notable-companion@local.invalid', rootURI: 'resource://test/'});
@@ -59,10 +60,26 @@ async function main() {
   assert.equal(status, 200);
   assert.equal(JSON.parse(body).readersRefreshed, 1);
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(events, ['reload', 'invalidate:11', 'render']);
+  assert.equal(JSON.parse(body).imagesReady, false);
+  assert.deepEqual(events, ['reload', 'invalidate:11', 'invalidate:13', 'render']);
   finishRendering();
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(events, ['reload', 'invalidate:11', 'render', ['modify', 'item', [11]]]);
+  assert.deepEqual(events, ['reload', 'invalidate:11', 'invalidate:13', 'render', ['modify', 'item', [11, 13]]]);
+  const [, , ready] = await new Endpoint().run({method: 'GET',
+    headers: new Map([['Zotero-Server-ID', 'fixture']]), pathParams: {itemKey: 'PDF23456'}});
+  assert.equal(JSON.parse(ready).imagesReady, true);
+  Zotero.PDFWorker.renderAttachmentAnnotations = async () => { throw Error('Synthetic image failure'); };
+  await new Endpoint().run({method: 'POST', headers: new Map([['Zotero-Server-ID', 'fixture']]), pathParams: {itemKey: 'PDF23456'}});
+  await new Promise(resolve => setImmediate(resolve));
+  const [, , failed] = await new Endpoint().run({method: 'GET',
+    headers: new Map([['Zotero-Server-ID', 'fixture']]), pathParams: {itemKey: 'PDF23456'}});
+  assert.equal(JSON.parse(failed).imagesFailed, true);
+  Zotero.PDFWorker.renderAttachmentAnnotations = async () => {};
+  await new Endpoint().run({method: 'POST', headers: new Map([['Zotero-Server-ID', 'fixture']]), pathParams: {itemKey: 'PDF23456'}});
+  await new Promise(resolve => setImmediate(resolve));
+  const [, , retried] = await new Endpoint().run({method: 'GET',
+    headers: new Map([['Zotero-Server-ID', 'fixture']]), pathParams: {itemKey: 'PDF23456'}});
+  assert.equal(JSON.parse(retried).imagesReady, true);
 }
 
 main().then(() => console.log('Handwriting thumbnail refresh passed.'), error => {

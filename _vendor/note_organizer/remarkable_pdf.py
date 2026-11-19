@@ -14,7 +14,7 @@ from .remarkable_cloud import trace_event
 from .remarkable_marks import TextMark, group_text_highlights, handwriting_regions, zotero_card_key
 
 
-RENDER_REVISION = 7
+RENDER_REVISION = 8
 
 
 class UnsupportedAnnotations(ValueError):

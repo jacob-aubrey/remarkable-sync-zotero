@@ -9,12 +9,15 @@ var notableChrome;
 var NotableUI;
 var NotableReadingStatus;
 var NotableSyncColumn;
+var notableImageJobs = new Map();
 
 async function startup({id, rootURI}) {
   await Zotero.initializationPromise;
   notableChrome = Cc['@mozilla.org/addons/addon-manager-startup;1'].getService(Ci.amIAddonManagerStartup)
     .registerChrome(Services.io.newURI(rootURI + 'manifest.json'), [['content', 'notable', rootURI]]);
   Services.scriptloader.loadSubScript(rootURI + 'library.js', globalThis);
+  Services.scriptloader.loadSubScript(rootURI + 'annotation-refresh.js', globalThis);
+  NotableAnnotationRefresh.register();
   // Root inherits Zotero's local API enablement, Host/browser restrictions,
   // server-ID validation and normal local-write authorization. The inherited
   // endpoint interface is version-sensitive; validate before widening manifest.
@@ -45,7 +48,11 @@ async function startup({id, rootURI}) {
         if (native) return [409, 'text/plain', 'Independent reader annotations require review'];
         const isHandwritingCard = annotation => annotation.annotationIsExternal && !annotation.deleted
           && annotation.annotationType === 'image' && annotation.annotationComment === 'Handwritten note';
-        const existingCards = new Set(all.filter(isHandwritingCard).map(annotation => annotation.id));
+        try { await NotableAnnotationRefresh.preserve(item); }
+        catch (error) {
+          Zotero.logError(error);
+          return [409, 'text/plain', 'Existing annotation metadata could not be preserved. Review before regrouping.'];
+        }
         // The native importer compares whole-second mtimes. A verified upload
         // can happen within the same second; explicitly invalidate its stamp.
         item.attachmentLastProcessedModificationTime = 0;
@@ -65,21 +72,32 @@ async function startup({id, rootURI}) {
           // The attachment pane can draw a missing-image placeholder during
           // import. Retained cards can also have new ink inside the same crop.
           // Zotero's renderer skips cached images, so regenerate those cards.
-          (async () => {
+          const previous = notableImageJobs.get(key);
+          const job = {state: 'rendering'};
+          notableImageJobs.set(key, job);
+          job.promise = (async () => {
+            // Serialize refreshes of one PDF. A previous render must finish
+            // before its replacement clears and rebuilds the same cache files.
+            if (previous) await previous.promise;
             for (const annotation of handwriting) {
-              if (existingCards.has(annotation.id)) await Zotero.Annotations.removeCacheImage(annotation);
+              await Zotero.Annotations.removeCacheImage(annotation);
             }
             await Zotero.PDFWorker.renderAttachmentAnnotations(item.id);
             const ready = [];
             for (const annotation of handwriting) {
               if (await Zotero.Annotations.hasCacheImage(annotation)) ready.push(annotation.id);
             }
+            if (ready.length !== handwriting.length) throw Error('Some image notes were not rendered');
             if (ready.length) await Zotero.Notifier.trigger('modify', 'item', ready);
-          })().catch(error => Zotero.logError(error));
-        }
+            job.state = 'ready';
+          })().catch(error => { job.state = 'failed'; Zotero.logError(error); });
+        } else notableImageJobs.delete(key);
       }
+      const imageJob = notableImageJobs.get(key);
       return [200, 'application/json', JSON.stringify({schema: 1, native,
         readersRefreshed,
+        imagesReady: !imageJob || imageJob.state === 'ready',
+        imagesFailed: imageJob?.state === 'failed',
         external: all.filter(annotation => annotation.annotationIsExternal && !annotation.deleted).length,
         nativeText: all.filter(annotation => !annotation.annotationIsExternal && !annotation.deleted)
           .map(annotation => ({key: annotation.key, text: annotation.annotationText || '', comment: annotation.annotationComment || ''}))
@@ -125,6 +143,7 @@ async function startup({id, rootURI}) {
 }
 
 async function shutdown() {
+  globalThis.NotableAnnotationRefresh?.unregister();
   globalThis.NotableAnnotationJump?.unregister();
   NotableReadingStatus?.unregister();
   NotableSyncColumn?.unregister();

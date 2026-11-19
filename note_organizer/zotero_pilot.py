@@ -18,6 +18,7 @@ from urllib.request import url2pathname
 from .remarkable_cloud import trace_event
 
 INDEX_REVISION = 2
+READER_REVISION = 2
 ZOTERO_REQUEST_TIMEOUT = 30
 
 class PilotError(RuntimeError):
@@ -368,8 +369,23 @@ class LocalZotero:
         if response.status_code in {401, 403}:
             raise AuthorizationRequired("Zotero write permission is unavailable. Run Connect again.")
         if response.status_code == 409:
+            if response.text.startswith('Existing annotation metadata'):
+                raise PilotError('Existing annotation metadata needs review before regrouping. Your PDF and saved annotation records were retained.')
             raise PilotError("This PDF has Zotero reader annotations. Review them before refreshing its tablet view.")
         response.raise_for_status()
+        # The adapter renders image cards asynchronously so no local request
+        # has to block behind Zotero's PDF-worker queue. Do not commit the
+        # reader receipt before its thumbnails have actually been refreshed.
+        deadline = time.monotonic() + 300
+        while response.json().get('imagesReady') is False:
+            if response.json().get('imagesFailed'):
+                raise PilotError('Zotero could not refresh every image note. Your PDF was retained; sync again to retry the screenshots.')
+            if time.monotonic() >= deadline:
+                raise PilotError('Zotero is still refreshing the image notes. Your PDF was retained; sync again to check their screenshots.')
+            time.sleep(.25)
+            response = self.http.get(f"{self.endpoint}/notable/annotations/{key}",
+                headers={"Zotero-Server-ID": self.server_id}, timeout=ZOTERO_REQUEST_TIMEOUT)
+            response.raise_for_status()
 
     def update(self, record):
         if not self.zot.update_item(record):
@@ -746,8 +762,9 @@ def publish(client, ledger, namespace, papers, *, apply=False, collection_key=No
             reports.append(result)
             if not apply:
                 continue
+            reader_token = f'{paper.sha256}:{READER_REVISION}'
             needs_reader = (getattr(client, "can_refresh_reader", False)
-                            and ledger.reader_revision(paper.source_id) != paper.sha256)
+                            and ledger.reader_revision(paper.source_id) != reader_token)
             if (action == "unchanged" and state["indexed_sha"] == index_token
                     and not needs_reader and not needs_link and not upload_intent):
                 expected_index = ledger.index_digest(paper.source_id)
@@ -784,7 +801,7 @@ def publish(client, ledger, namespace, papers, *, apply=False, collection_key=No
             ledger.save(paper.source_id, published=1, md5=wanted, pending_md5="")
             if needs_reader:
                 client.refresh_reader(key)
-                ledger.reader_revision(paper.source_id, paper.sha256)
+                ledger.reader_revision(paper.source_id, reader_token)
             # Retry indexing independently after a crash or failed API response.
             result["pages_without_text"] = client.index(key, path, paper.annotations)
             ledger.index_digest(paper.source_id, client.index_digest(key))

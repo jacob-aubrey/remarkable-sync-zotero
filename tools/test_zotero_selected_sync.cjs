@@ -6,6 +6,7 @@ async function main() {
   const context = {clearTimeout, setTimeout, Date};
   vm.runInNewContext(fs.readFileSync('zotero-support/ui.js', 'utf8'), context);
   const ui = context.NotableUI;
+  ui.helperLaunch = {command: 'managed-worker'};
   const drains = [];
   ui.latest = {config: {connection_id: 'C', zotero_root: 'Z', tablet_root: 'T', sync_paused: true},
     status: {}, reviews: [], links: []};
@@ -20,6 +21,8 @@ async function main() {
     assert.equal(ui.operation.method, 'sync');
     assert.equal(ui.operation.scoped, true);
     assert.equal(params.targets[0].cloud, 'selected');
+    assert.deepEqual(Object.keys(params).sort(), ['connection', 'targets'],
+      'The managed helper rejects full-sync-only parameters on selected sync');
     return {...ui.latest, status: {message: 'Selected PDF sync finished.'}};
   };
   ui.syncDue = Date.now() - 1000;

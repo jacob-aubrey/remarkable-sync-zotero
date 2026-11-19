@@ -31,6 +31,8 @@ Choose **Sync selected papers now** to update the linked PDFs for the selected r
 
 In an open linked PDF, right-click and choose **reMarkable Sync → Sync this PDF now**. Every sync refreshes an updated linked PDF in its existing reader, including its annotation sidebar, while retaining the reading page and zoom. New tablet notes appear once the tablet has uploaded them to reMarkable Cloud and the plugin receives them. The workspace’s **Sync now** command still checks the whole connection.
 
+Existing papers receive the same passage grouping as new papers: consecutive highlighted text of one color becomes one annotation. Handwriting regions include contained words and use more forgiving spacing. Annotation tags, saved note content, and old source links are preserved during regrouping, and stale image thumbnails are rebuilt before the sync is recorded as complete.
+
 Pausing a link, resuming it, and rebuilding its search index require a confirmation that identifies the paper and explains the effect. Export file pickers confirm replacement of existing files. Connection and annotation repair decisions retain their existing review steps. See the [command audit and integration notes](documentation/CONTEXT_MENUS.md).
 
 ### Freehand marks in image notes
@@ -68,7 +70,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.29.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.30.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

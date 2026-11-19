@@ -32,6 +32,49 @@ def line_mark(page, identity, line, start=None, stroke=(1, .84, 0), *, block=0, 
 
 
 class AnnotationCardsTests(unittest.TestCase):
+    def test_wrapped_text_groups_across_tablet_crlf_gaps_and_ragged_line_ends(self):
+        with fitz.open() as doc:
+            page = doc.new_page(width=600, height=800)
+            page.insert_text((60, 100), ['Short first highlighted line',
+                                       'A somewhat longer highlighted second line',
+                                       'And the concluding line'], fontsize=11)
+            marks = []
+            start = 0
+            for index in range(3):
+                mark = line_mark(page, str(index), index, start=start)
+                marks.append(mark)
+                start += mark.length + 3  # CR, LF, and a separating space
+            [group] = group_text_highlights(page, marks)
+            self.assertEqual(group.ids, ('0', '1', '2'))
+            self.assertEqual(group.text, ' '.join(mark.text for mark in marks))
+            self.assertEqual(group.rects, tuple(rect for mark in marks for rect in mark.rects))
+
+    def test_handwriting_interior_word_is_absorbed_without_combining_separate_notes(self):
+        import random
+        from note_organizer.remarkable_marks import handwriting_regions
+        strokes = [('top', fitz.Rect(10, 10, 70, 20)),
+                   ('left', fitz.Rect(10, 20, 20, 80)),
+                   ('right', fitz.Rect(60, 20, 70, 80)),
+                   ('bottom', fitz.Rect(10, 70, 70, 80)),
+                   ('is', fitz.Rect(40, 40, 45, 45)),
+                   ('separate', fitz.Rect(160, 150, 170, 160))]
+        page = fitz.Rect(0, 0, 600, 800)
+        expected = sorted(tuple(rect) for _, rect in handwriting_regions(strokes, page))
+        self.assertEqual(len(expected), 2)
+        self.assertTrue(fitz.Rect(expected[0]).contains(strokes[4][1]))
+        rng = random.Random(8)
+        for _ in range(25):
+            rng.shuffle(strokes)
+            self.assertEqual(sorted(tuple(rect) for _, rect in handwriting_regions(strokes, page)), expected)
+
+    def test_handwriting_word_spacing_is_more_forgiving_but_distant_notes_stay_separate(self):
+        from note_organizer.remarkable_marks import handwriting_regions
+        groups = handwriting_regions([('first', fitz.Rect(10, 10, 20, 25)),
+                                      ('next-word', fitz.Rect(34, 12, 60, 28)),
+                                      ('other-note', fitz.Rect(110, 12, 150, 28))], fitz.Rect(0, 0, 600, 800))
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(groups[0][1].contains(fitz.Rect(10, 10, 60, 28)))
+
     def test_only_contiguous_same_color_passages_group(self):
         with letter_page() as doc:
             page = doc[0]

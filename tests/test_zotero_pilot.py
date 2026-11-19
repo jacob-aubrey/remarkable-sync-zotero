@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pymupdf
 
@@ -157,7 +157,18 @@ class ZoteroPilotTests(unittest.TestCase):
         self.run_publish()
         self.assertEqual(self.client.uploads, 1)
         self.assertEqual(self.client.refresh_reader.call_count, 2)
-        self.assertEqual(self.ledger.reader_revision(self.paper.source_id), self.paper.sha256)
+        self.assertTrue(self.ledger.reader_revision(self.paper.source_id).startswith(self.paper.sha256 + ':'))
+
+    def test_legacy_reader_receipt_refreshes_stale_images_without_uploading_unchanged_pdf(self):
+        self.client.can_refresh_reader = True
+        self.client.refresh_reader = Mock()
+        self.run_publish()
+        self.ledger.reader_revision(self.paper.source_id, self.paper.sha256)
+        self.run_publish()
+        self.run_publish()
+        self.assertEqual(self.client.uploads, 1)
+        self.assertEqual(self.client.refresh_reader.call_count, 2)
+        self.assertNotEqual(self.ledger.reader_revision(self.paper.source_id), self.paper.sha256)
 
     def test_uncertain_annotation_ownership_needs_support_extension(self):
         client = LocalZotero.__new__(LocalZotero)
@@ -165,6 +176,22 @@ class ZoteroPilotTests(unittest.TestCase):
         client.reader_annotations = Mock(return_value=[{"itemType": "annotation"}])
         with self.assertRaisesRegex(PilotError, "reMarkable Sync for Zotero"):
             client.native_annotation_count("SELECT23")
+
+    def test_reader_refresh_waits_for_images_and_reports_retryable_failure(self):
+        client = LocalZotero.__new__(LocalZotero)
+        client.endpoint, client.server_id = 'http://localhost:23119/api', 'synthetic'
+        client.zot = Mock(local_api_key='synthetic-key')
+        def reply(**data):
+            return Mock(status_code=200, json=Mock(return_value=data))
+        client.http = Mock()
+        client.http.post.return_value = reply(imagesReady=False)
+        client.http.get.side_effect = [reply(imagesReady=False), reply(imagesReady=True)]
+        with patch('note_organizer.zotero_pilot.time.sleep'):
+            client.refresh_reader('PDF23456')
+        self.assertEqual(client.http.get.call_count, 2)
+        client.http.post.return_value = reply(imagesReady=False, imagesFailed=True)
+        with self.assertRaisesRegex(PilotError, 'sync again to retry'):
+            client.refresh_reader('PDF23456')
 
     def test_deleted_item_is_not_recreated(self):
         key = self.run_publish()["papers"][0]["attachment_key"]

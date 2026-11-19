@@ -54,12 +54,11 @@ def _consecutive(left, right, lines, bounds):
         return False
     a, b = bounds[(lb, ll)], bounds[(rb, rl)]
     height = max(a.height, b.height)
-    column_left, column_right = bounds[lb]
+    column_left, _ = bounds[lb]
     # A close baseline, a wrapped line, and the same column are required.
     return (height * .55 <= b.y0 - a.y0 <= height * 1.55
             and b.x0 < a.x1 and a.x0 < b.x1
-            and b.x0 - column_left <= height * .85
-            and column_right - a.x1 <= height * 2)
+            and b.x0 - column_left <= height * .85)
 
 
 def _can_join(left, left_hit, right, right_hit, lines, bounds):
@@ -67,7 +66,9 @@ def _can_join(left, left_hit, right, right_hit, lines, bounds):
         return False
     if left.start is not None and right.start is not None:
         gap = right.start - left.start - left.length
-        if not 0 <= gap <= (1 if left_hit[:2] == right_hit[:2] else 2):
+        # The tablet can count a line break as CR, LF, and a separating space.
+        # Word adjacency above still prevents jumping over unhighlighted text.
+        if not 0 <= gap <= (1 if left_hit[:2] == right_hit[:2] else 4):
             return False
     if left_hit[:2] == right_hit[:2]:
         return right.rects[0].x0 - left.rects[-1].x1 <= bounds[left_hit[:2]].height * .5
@@ -125,30 +126,35 @@ def group_text_highlights(page, marks):
 def handwriting_regions(strokes, page):
     """Cover every visible freehand mark, including single strokes and figure outlines."""
     groups = []
-    for identity, rect in strokes:
-        members = [(identity, rect)]
+    for order, (identity, rect) in enumerate(strokes):
+        members = [(order, identity, rect)]
         combined = fitz.Rect(rect)
-        for index in range(len(groups) - 1, -1, -1):
-            other, boundary = groups[index]
-            extent = combined | boundary
-            if any(_near_ink(rect, existing) for _, existing in other):
-                members = other + members
-                combined = extent
-                groups.pop(index)
+        changed = True
+        while changed:
+            changed = False
+            for index in range(len(groups) - 1, -1, -1):
+                other, boundary = groups[index]
+                if (combined.contains(boundary) or boundary.contains(combined)
+                        or any(_near_ink(a, b) for _, _, a in members for _, _, b in other)):
+                    members = other + members
+                    combined |= boundary
+                    groups.pop(index)
+                    # A newly connected stroke can bridge an earlier component.
+                    changed = True
         groups.append((members, combined))
 
     regions = []
     for members, rect in groups:
         padded = (rect + (-4, -4, 4, 4)) & page
         if not padded.is_empty:
-            regions.append((members[0][0], padded))
+            regions.append((min(members, key=lambda member: member[0])[1], padded))
     return regions
 
 
 def _near_ink(a, b):
     dx = max(0, a.x0 - b.x1, b.x0 - a.x1)
     dy = max(0, a.y0 - b.y1, b.y0 - a.y1)
-    return dx <= 10 and dy <= 7 and dx + dy <= 12
+    return dx <= 14 and dy <= 10 and dx + dy <= 18
 
 
 def zotero_card_key(identity):

@@ -1163,7 +1163,7 @@ var NotableUI = {
       const connection = this.filingConnection();
       const previousInbox = checkingInbox ? this.inboxRows() : null;
       const result = checkingInbox ? await this.refreshInbox()
-        : await this.rpc(method, syncing && (this.helperLaunch || this.launching) ? {...params, monitor_inbox: false} : params);
+        : await this.rpc(method, method === 'sync' && (this.helperLaunch || this.launching) ? {...params, monitor_inbox: false} : params);
       this.adoptStatus(result.reviews ? result : await this.rpc('status'), syncing);
       if (result.intake_attachment) {
         const {reference, key} = result.intake_attachment;

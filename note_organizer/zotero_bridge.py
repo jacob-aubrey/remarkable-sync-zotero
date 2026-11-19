@@ -815,10 +815,10 @@ class Bridge:
                 from .zotero_tags import render_fingerprint
                 cached = row.get("rendered", {})
                 fingerprint = render_fingerprint(ck, retained_bundle)
-                first_publication = not (row.get("view_key") or row.get("revision") or cached)
-                # Grouping existing marks requires the separate manual repair.
-                # New links opt in and keep the choice on every later sync.
-                group_highlights = row.get("group_highlights", first_publication)
+                # Apply passage grouping to older links as well. Keep explicit
+                # manual repair selections, rather than the old implicit opt-out.
+                group_highlights = (row.get("group_highlights", False)
+                                    if row.get("highlight_repair") else True)
                 approved = row.get("approved_highlight_groups") or []
                 # Refresh old links as well: a renderer upgrade must recover
                 # image notes for ink previously omitted from the Notes pane.

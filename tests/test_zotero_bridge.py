@@ -227,6 +227,7 @@ class BridgeTests(unittest.TestCase):
         with patch("note_organizer.zotero_bridge.annotated_pdf", wraps=annotated_pdf) as render:
             self.engine.run(apply=True)
             self.assertTrue(render.call_args.kwargs['handwriting_cards'])
+            self.assertTrue(render.call_args.kwargs['group_highlights'])
             render.reset_mock()
             self.engine.run(apply=True)
             render.assert_not_called()
