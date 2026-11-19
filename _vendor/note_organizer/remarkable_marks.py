@@ -62,6 +62,15 @@ def _consecutive(left, right, lines, bounds):
 
 
 def _can_join(left, left_hit, right, right_hit, lines, bounds):
+    # reMarkable stores an accidental or intentional second pass as another
+    # GlyphRange.  Rectangular overlap is stronger evidence than pen color:
+    # it belongs to the same visual sentence, even when the two passes differ.
+    if left_hit[:2] == right_hit[:2]:
+        for left_rect in left.rects:
+            for right_rect in right.rects:
+                intersection = left_rect & right_rect
+                if not intersection.is_empty and intersection.width > .1 and intersection.height > .1:
+                    return True
     if left.stroke != right.stroke or not _consecutive(left_hit, right_hit, lines, bounds):
         return False
     if left.start is not None and right.start is not None:
@@ -112,11 +121,19 @@ def group_text_highlights(page, marks):
             continue
         text = run[0][0].text.strip()
         for (previous, hits), (mark, following) in zip(run, run[1:]):
+            mark_text = mark.text.strip()
+            normalized_text = ' '.join(text.split()).casefold()
+            normalized_mark = ' '.join(mark_text.split()).casefold()
+            if normalized_mark and normalized_mark in normalized_text:
+                continue
+            if normalized_text and normalized_text in normalized_mark:
+                text = mark_text
+                continue
             tail = lines[hits[-1][:2]][hits[-1][3]][4]
             wrapped = hits[-1][:2] != following[0][:2]
             hyphenated = wrapped and tail.endswith(('-', '\u00ad')) and (
                 previous.text.rstrip().endswith(tail) or previous.text.rstrip().endswith(tail[:-1]))
-            text += ('' if hyphenated else ' ') + mark.text.strip()
+            text += ('' if hyphenated else ' ') + mark_text
         groups.append(HighlightGroup(tuple(mark.id for mark, _ in run),
                                      tuple(rect for mark, _ in run for rect in mark.rects),
                                      text, run[0][0].stroke))
@@ -154,7 +171,7 @@ def handwriting_regions(strokes, page):
 def _near_ink(a, b):
     dx = max(0, a.x0 - b.x1, b.x0 - a.x1)
     dy = max(0, a.y0 - b.y1, b.y0 - a.y1)
-    return dx <= 14 and dy <= 10 and dx + dy <= 18
+    return dx <= 14 and dy <= 18 and dx + dy <= 24
 
 
 def zotero_card_key(identity):

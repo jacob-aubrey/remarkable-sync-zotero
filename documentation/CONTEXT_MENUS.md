@@ -1,6 +1,6 @@
 # Context-menu command audit
 
-Reviewed the workspace actions, native reader controls, worker dispatch methods, notebook collector, and annotation renderer for 0.19.30. The plugin owns a **reMarkable Sync →** submenu in Zotero’s item, collection, and PDF-reader context menus. The Tools command still opens the workspace.
+Reviewed the workspace actions, native reader controls, worker dispatch methods, notebook collector, and annotation renderer for 0.19.31. The plugin owns a **reMarkable Sync →** submenu in Zotero’s item, collection, and PDF-reader context menus. The Tools command still opens the workspace.
 
 ## Commands and scope
 
@@ -61,7 +61,7 @@ Regression checks cover all 16 drawing-tool variants, one-stroke outlines larger
 
 The packaged UI added the full-sync-only `monitor_inbox` argument to selected-sync requests. The worker correctly rejected that incompatible request signature, but the earlier transport test did not enable the packaged-helper branch. Only full sync now receives that argument. The regression checks exercise the managed UI branch, and the native smoke test sends an actual selected-sync request through the bundled helper to scope validation.
 
-Renderer revision 8 groups consecutive same-color passages on existing links as well as new links. Explicit manual repair selections remain intact. Tablet line breaks can occupy three character positions; the grouping accepts up to four whitespace positions between geometrically consecutive lines. Word adjacency, line order, column alignment, vertical spacing, and color equality still prevent merging omitted text, another column, a separate paragraph, or different colors. The old requirement that every wrapped line nearly reach the right edge rejected ordinary ragged text and has been removed. Original highlight quadrilaterals remain intact.
+Renderer revision 9 groups consecutive passages on existing links as well as new links. Explicit manual repair selections remain intact. Tablet line breaks can occupy three character positions; the grouping accepts up to four whitespace positions between geometrically consecutive lines. It also merges overlapping text passes on the same line even when reMarkable records them in different colors. Word adjacency, line order, column alignment, and vertical spacing still prevent merging omitted text or another column. The old requirement that every wrapped line nearly reach the right edge rejected ordinary ragged text and has been removed. Original highlight quadrilaterals remain intact.
 
 Freehand grouping revisits components after a connecting stroke joins them, includes small components contained within a larger note's bounds, and accepts slightly wider word and line spacing: horizontal gaps up to 14 points, vertical gaps up to 10 points, and a combined gap up to 18 points. It retains separate distant notes and every visible stroke. A retained problem page with 13 text highlights and seven handwriting cards regenerates as three same-color passages and four handwriting regions, with the interior word included. The private paper is not included in the repository; public regression fixtures use synthetic text and geometry.
 

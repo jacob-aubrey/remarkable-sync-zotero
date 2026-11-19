@@ -56,7 +56,7 @@ class AnnotationCardsTests(unittest.TestCase):
                    ('left', fitz.Rect(10, 20, 20, 80)),
                    ('right', fitz.Rect(60, 20, 70, 80)),
                    ('bottom', fitz.Rect(10, 70, 70, 80)),
-                   ('is', fitz.Rect(40, 40, 45, 45)),
+                   ('metrics', fitz.Rect(40, 40, 45, 45)),
                    ('separate', fitz.Rect(160, 150, 170, 160))]
         page = fitz.Rect(0, 0, 600, 800)
         expected = sorted(tuple(rect) for _, rect in handwriting_regions(strokes, page))
@@ -71,6 +71,7 @@ class AnnotationCardsTests(unittest.TestCase):
         from note_organizer.remarkable_marks import handwriting_regions
         groups = handwriting_regions([('first', fitz.Rect(10, 10, 20, 25)),
                                       ('next-word', fitz.Rect(34, 12, 60, 28)),
+                                      ('following-line', fitz.Rect(12, 44, 50, 58)),
                                       ('other-note', fitz.Rect(110, 12, 150, 28))], fitz.Rect(0, 0, 600, 800))
         self.assertEqual(len(groups), 2)
         self.assertTrue(groups[0][1].contains(fitz.Rect(10, 10, 60, 28)))
@@ -85,9 +86,21 @@ class AnnotationCardsTests(unittest.TestCase):
             self.assertEqual(group.rects, top.rects + middle.rects + last.rects)
             self.assertEqual(group.text, ' '.join((top.text, middle.text, last.text)))
             self.assertEqual(group_text_highlights(page, [top, last]), [])
-            self.assertEqual(group_text_highlights(page, [top, line_mark(page, 'pink', 1, stroke=(1, .4, .7))]), [])
             self.assertEqual(group_text_highlights(page, [top, line_mark(page, 'gap', 1, first=2)]), [])
             self.assertEqual(group_text_highlights(page, [top, column]), [])
+
+    def test_overlapping_different_color_word_pass_merges_with_whole_sentence(self):
+        with letter_page() as doc:
+            page = doc[0]
+            whole = line_mark(page, 'whole', 0)
+            words = [word for word in page.get_text('words') if tuple(word[5:7]) == (0, 0)]
+            word_rect = fitz.Rect(words[1][:4])
+            accidental = TextMark('accidental', (word_rect,), words[1][4],
+                                  (1, .4, .7), whole.start, len(words[1][4]))
+            [group] = group_text_highlights(page, [whole, accidental])
+            self.assertEqual(set(group.ids), {'whole', 'accidental'})
+            self.assertEqual(group.text, whole.text)
+            self.assertIn(word_rect, group.rects)
 
     def test_grouped_pdf_and_handwriting_cards_preserve_mark_geometry(self):
         item, bundle = fixture()
