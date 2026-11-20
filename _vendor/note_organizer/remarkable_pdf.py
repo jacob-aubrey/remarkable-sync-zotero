@@ -14,7 +14,8 @@ from .remarkable_cloud import trace_event
 from .remarkable_marks import TextMark, group_text_highlights, handwriting_regions, zotero_card_key
 
 
-RENDER_REVISION = 10
+RENDER_REVISION = 12
+BARE_PDF_RENDER_REVISION = 10
 
 
 class UnsupportedAnnotations(ValueError):
@@ -171,31 +172,154 @@ def _glyph_rect(box, point):
     return fitz.Rect(point(box.x, box.y), point(box.x + box.w, box.y + box.h)).normalize()
 
 
-def _highlight_groups(page, items, page_id, point, approved=None):
-    from rmscene.scene_items import GlyphRange
-    marks = [TextMark(f"remarkable-{page_id}-{identity}",
-                      tuple(_glyph_rect(box, point) for box in item.rectangles),
-                      item.text, color(item), item.start, item.length)
-             for identity, item in items if isinstance(item, GlyphRange)]
+def _stroke_width(item, scale):
+    from rmscene.scene_items import Pen
+
+    width = sum(p.width for p in item.points) / len(item.points)
+    if Pen.is_highlighter(item.tool):
+        return max(10, min(width * 2, 40)) * scale
+    return max(.5, min(width * .8, 5)) * scale
+
+
+def _freehand_highlight(item, identity, point, scale):
+    points = [point(p.x, p.y) for p in item.points]
+    if len(points) < 2:
+        return None
+    x0, x1 = min(p.x for p in points), max(p.x for p in points)
+    y0, y1 = min(p.y for p in points), max(p.y for p in points)
+    width = _stroke_width(item, scale)
+    span = x1 - x0
+    travel = sum(abs(b.x - a.x) for a, b in zip(points, points[1:]))
+    if span < 1 or y1 - y0 > min(3, span * .18) or travel > span * 1.25:
+        return None
+    y = (y0 + y1) / 2
+    return TextMark(identity, (fitz.Rect(x0, y - width / 2, x1, y + width / 2),),
+                    '', color(item), None, 0, freehand=True)
+
+
+def _highlight_groups(page, items, page_id, point, scale, approved=None):
+    from rmscene.scene_items import GlyphRange, Line, Pen
+    marks = []
+    for iid, item in items:
+        identity = f"remarkable-{page_id}-{iid}"
+        if isinstance(item, GlyphRange):
+            marks.append(TextMark(identity, tuple(_glyph_rect(box, point) for box in item.rectangles),
+                                  item.text, color(item), item.start, item.length))
+        elif isinstance(item, Line) and Pen.is_highlighter(item.tool):
+            mark = _freehand_highlight(item, identity, point, scale)
+            if mark:
+                marks.append(mark)
     if approved is None:
         return group_text_highlights(page, marks)
     by_id = {mark.id: mark for mark in marks}
     candidates = [group for members in dict.fromkeys(map(tuple, approved))
                   if all(identity in by_id for identity in members)
                   for group in group_text_highlights(page, [by_id[identity] for identity in members])
-                  if group.ids == members]
+                  if frozenset(group.ids) == frozenset(members)]
     memberships = Counter(identity for group in candidates for identity in group.ids)
     return [group for group in candidates if all(memberships[identity] == 1 for identity in group.ids)]
 
 
 def scene_highlight_groups(page, tree, page_id):
     """Preview groups on the original page without rendering or writing a PDF."""
-    point, _ = _scene_transform(page, tree)
-    return _highlight_groups(page, visible_items(tree.root), page_id, point)
+    point, scale = _scene_transform(page, tree)
+    return _highlight_groups(page, visible_items(tree.root), page_id, point, scale)
+
+
+def _subtract_rect(rect, other):
+    overlap = rect & other
+    if overlap.is_empty:
+        return [rect]
+    parts = (fitz.Rect(rect.x0, rect.y0, rect.x1, overlap.y0),
+             fitz.Rect(rect.x0, overlap.y1, rect.x1, rect.y1),
+             fitz.Rect(rect.x0, overlap.y0, overlap.x0, overlap.y1),
+             fitz.Rect(overlap.x1, overlap.y0, rect.x1, overlap.y1))
+    return [part for part in parts if part.width > .005 and part.height > .005]
+
+
+def _disjoint_quads(rects):
+    """Keep the reading order and cover each point only once in Zotero."""
+    quads = []
+    for rect in rects:
+        remaining = [rect]
+        for existing in quads:
+            remaining = [part for region in remaining for part in _subtract_rect(region, existing)]
+            if not remaining:
+                break
+        quads.extend(remaining)
+    return quads
+
+
+def _paint_once(covered, stroke, shape):
+    previous = covered.get(stroke)
+    if previous is None:
+        covered[stroke] = shape
+        return shape
+    covered[stroke] = previous.union(shape)
+    return shape.difference(previous)
+
+
+def _highlight_appearance(document, page, annotation, paints):
+    """Write source colors as disjoint coverage with a multiply blend."""
+    from shapely import get_parts, union_all
+
+    transform = ~page.transformation_matrix
+    by_color = {}
+    for stroke, shape in paints:
+        by_color.setdefault(stroke, []).append(shape)
+    commands = ['q', '/Highlighter gs']
+    for stroke, shapes in by_color.items():
+        polygons = [part for part in get_parts(union_all(shapes)) if part.geom_type == 'Polygon' and not part.is_empty]
+        if not polygons:
+            continue
+        commands.append(' '.join(f'{component:.5f}' for component in stroke) + ' rg')
+        for polygon in polygons:
+            for ring in (polygon.exterior, *polygon.interiors):
+                points = [fitz.Point(x, y) * transform for x, y in list(ring.coords)[:-1]]
+                for index, point in enumerate(points):
+                    commands.append(f'{point.x:.4f} {point.y:.4f} {"l" if index else "m"}')
+                commands.append('h')
+        commands.append('f*')
+    commands.append('Q')
+    _, bounds = document.xref_get_key(annotation.xref, 'Rect')
+    appearance = document.get_new_xref()
+    document.update_object(
+        appearance, f'<< /Type /XObject /Subtype /Form /BBox {bounds} '
+        '/Resources << /ExtGState << /Highlighter << /ca .35 /BM /Multiply >> >> >> >>')
+    document.update_stream(appearance, '\n'.join(commands).encode('ascii'))
+    document.xref_set_key(annotation.xref, 'AP/N', f'{appearance} 0 R')
+
+
+def _grouped_highlight(document, page, group, glyph_paints, offset, reader_paints):
+    rects = _disjoint_quads(fitz.Rect(rect.tl + offset, rect.br + offset) for rect in group.rects)
+    annotation = page.add_highlight_annot(rects)
+    annotation.set_info(subject="reMarkable highlight")
+    annotation.set_colors(stroke=group.stroke)
+    annotation.set_opacity(.35)
+    annotation.update()
+    paints = [glyph_paints[identity][1] for identity in group.ids if identity in glyph_paints]
+    _highlight_appearance(document, page, annotation, paints)
+    if reader_paints is not None and (group.ink_ids or len({stroke for stroke, _ in paints}) > 1):
+        transform = ~page.transformation_matrix
+
+        def position(regions):
+            return [[round(value, 3) for value in (rect * transform)] for rect in regions]
+
+        colors = {}
+        for identity in group.ids:
+            if identity in glyph_paints:
+                regions, (stroke, _) = glyph_paints[identity]
+                rgb = '#' + ''.join(f'{round(component * 255):02x}' for component in stroke)
+                colors.setdefault(rgb, []).extend(position(regions))
+        reader_paints.append({'rects': position(rects), 'colors': colors})
+    document.xref_set_key(annotation.xref, "RMQuote", fitz.get_pdf_str(group.text))
+    document.xref_set_key(annotation.xref, "RMMembers", fitz.get_pdf_str(json.dumps(group.ids)))
+    stamp_id(document, annotation, group.ids[0])
+    return annotation
 
 
 def apply_scene(document, page, page_id, tree, *, expand_margins=True,
-                group_highlights=False, handwriting_document=None, approved_highlight_groups=()):
+                group_highlights=False, handwriting_document=None, approved_highlight_groups=(), reader_paints=None):
     from rmscene.scene_items import Line, GlyphRange, Pen
     project, scale = _scene_transform(page, tree)
     bounds = page.rect * page.derotation_matrix
@@ -209,10 +333,12 @@ def apply_scene(document, page, page_id, tree, *, expand_margins=True,
         return project(x, y) + offset
 
     items = list(visible_items(tree.root))
-    groups = (_highlight_groups(page, items, page_id, project, approved_highlight_groups or None)
+    groups = (_highlight_groups(page, items, page_id, project, scale, approved_highlight_groups or None)
               if group_highlights or approved_highlight_groups else [])
     grouped = {group.ids[0]: group for group in groups}
     joined = {identity for group in groups for identity in group.ids[1:]}
+    grouped_ink = {identity for group in groups for identity in group.ink_ids}
+    glyphs = {f"remarkable-{page_id}-{iid}": item for iid, item in items if isinstance(item, GlyphRange)}
     strokes = []
     text = ""
     if tree.root_text:
@@ -257,30 +383,33 @@ def apply_scene(document, page, page_id, tree, *, expand_margins=True,
         offset = fitz.Point(left, top)
         bounds = page.rect
 
+    from shapely import LineString, box, union_all
+
+    covered, glyph_paints = {}, {}
+    for identity, item in glyphs.items():
+        rects = [_glyph_rect(rect, point) for rect in item.rectangles]
+        if not rects or any(rect.is_empty for rect in rects):
+            raise UnsupportedAnnotations("A text highlight has an invalid page region")
+        stroke = color(item)
+        shape = union_all([box(*rect) for rect in rects])
+        glyph_paints[identity] = (rects, (stroke, _paint_once(covered, stroke, shape)))
+
     for iid, item in items:
         identity = f"remarkable-{page_id}-{iid}"
+        group = grouped.get(identity)
+        if group:
+            require_visible(_grouped_highlight(document, page, group, glyph_paints, offset, reader_paints).rect)
         annot = None
+        paints = ()
         if isinstance(item, GlyphRange):
-            if identity in joined:
+            if group or identity in joined:
                 continue
-            rects = []
-            for box in item.rectangles:
-                rect = fitz.Rect(point(box.x, box.y), point(box.x + box.w, box.y + box.h))
-                rect.normalize()
-                if rect.is_empty:
-                    raise UnsupportedAnnotations("Invalid text highlight rectangle")
-                rects.append(rect)
-            if not rects:
-                raise UnsupportedAnnotations("A text highlight has no page region")
-            group = grouped.get(identity)
-            if group:
-                rects = [fitz.Rect(rect.tl + offset, rect.br + offset) for rect in group.rects]
-            annot = page.add_highlight_annot(rects)
+            rects, paint = glyph_paints[identity]
+            paints = (paint,)
+            annot = page.add_highlight_annot(_disjoint_quads(rects))
             annot.set_info(subject="reMarkable highlight")
             # Retain the selected quote without creating a viewer comment popup.
-            document.xref_set_key(annot.xref, "RMQuote", fitz.get_pdf_str(group.text if group else item.text))
-            if group:
-                document.xref_set_key(annot.xref, "RMMembers", fitz.get_pdf_str(json.dumps(group.ids)))
+            document.xref_set_key(annot.xref, "RMQuote", fitz.get_pdf_str(item.text))
             # Dark highlight colors must remain translucent over printed text.
             annot.set_opacity(.35)
         elif isinstance(item, Line):
@@ -292,20 +421,21 @@ def apply_scene(document, page, page_id, tree, *, expand_margins=True,
             if len(points) == 1:
                 points.append(points[0] + (.1, .1))
             annot = page.add_ink_annot([[tuple(p) for p in points]])
-            width = sum(p.width for p in item.points) / len(points)
-            width = max(.5, min(width * .8, 5)) * scale
+            width = _stroke_width(item, scale)
             if Pen.is_highlighter(item.tool):
-                width = max(10, min(sum(p.width for p in item.points) / len(points) * 2, 40)) * scale
                 annot.set_opacity(.35)
                 annot.set_blendmode("Multiply")
+                stroke = color(item)
+                shape = LineString([tuple(p) for p in points]).buffer(width / 2)
+                paints = ((stroke, _paint_once(covered, stroke, shape)),)
             annot.set_border(width=width)
             annot.set_info(subject="reMarkable pen")
             # GlyphRange above is snapped text. Every Line is freehand ink,
             # including highlighter outlines, dots, and large figure enclosures.
-            if handwriting_document:
+            if handwriting_document and identity not in grouped_ink:
                 radius = width / 2
                 strokes.append((iid, fitz.Rect(min(p.x for p in points) - radius, min(p.y for p in points) - radius,
-                                               max(p.x for p in points) + radius, max(p.y for p in points) + radius)))
+                                                max(p.x for p in points) + radius, max(p.y for p in points) + radius), points))
         else:
             raise UnsupportedAnnotations("Unsupported annotation scene item")
         # Partially visible strokes remain intact; wholly invisible marks would
@@ -314,6 +444,8 @@ def apply_scene(document, page, page_id, tree, *, expand_margins=True,
         annot.set_colors(stroke=color(item))
         stamp_id(document, annot, identity)
         annot.update()
+        if paints:
+            _highlight_appearance(document, page, annot, paints)
     for iid, region in handwriting_regions(strokes, page.rect * page.derotation_matrix):
         anchor = page.add_rect_annot(region)
         anchor.set_border(width=0)
@@ -553,7 +685,7 @@ def _annotated_pdf(item, bundle, cancelled=lambda: False, *, expand_margins=True
         known_highlights.update(item.id + ".highlights/" + pid + ".json" for pid in historical_ids if isinstance(pid, str))
         if any(".highlights/" in name and name.endswith(".json") and name not in known_highlights for name in bundle):
             raise UnsupportedAnnotations("Highlight data exists outside the PDF's page map")
-        labels = []
+        labels, reader_paints = [], {}
         for index, (pid, source_index) in enumerate(pages):
             if cancelled():
                 raise InterruptedError("reMarkable PDF conversion stopped")
@@ -581,9 +713,12 @@ def _annotated_pdf(item, bundle, cancelled=lambda: False, *, expand_margins=True
             labels.append({"startpage": index, "prefix": label, "style": ""})
             page = output[index]
             if tree:
+                page_paints = []
                 apply_scene(output, page, pid, tree, expand_margins=expand_margins, group_highlights=group_highlights,
                             handwriting_document=item.id if handwriting_cards else None,
-                            approved_highlight_groups=approved_highlight_groups)
+                            approved_highlight_groups=approved_highlight_groups, reader_paints=page_paints)
+                if page_paints:
+                    reader_paints[index] = page_paints
             legacy = bundle.get(item.id + ".highlights/" + pid + ".json")
             if legacy:
                 raise UnsupportedAnnotations("Legacy JSON highlights need an additional annotation adapter")
@@ -598,6 +733,9 @@ def _annotated_pdf(item, bundle, cancelled=lambda: False, *, expand_margins=True
         metadata = dict(original.metadata)
         metadata["keywords"] = (metadata.get("keywords", "") + "; reMarkable imported PDF").strip("; ")
         output.set_metadata(metadata)
+        if reader_paints:
+            info = int(output.xref_get_key(-1, "Info")[1].split()[0])
+            output.xref_set_key(info, "NotableHighlightPaints", fitz.get_pdf_str(json.dumps(reader_paints)))
         if cancelled():
             raise InterruptedError("reMarkable PDF conversion stopped")
         # Compact unused objects without the quadratic object/stream duplicate

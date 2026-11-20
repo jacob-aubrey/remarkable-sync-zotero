@@ -49,7 +49,8 @@ async function main() {
     NotableReadingStatus: {register() {}},
     NotableSyncColumn: {register() {}},
     NotableAnnotationJump: {register() {}},
-    NotableAnnotationRefresh: {register() {}, preserve: async () => {}}
+    NotableAnnotationRefresh: {register() {}, preserve: async () => {}},
+    NotableReaderHighlightPaint: {register() {}, attach() {}}
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../zotero-support/bootstrap.js'), 'utf8'), context);
   await context.startup({id: 'notable-companion@local.invalid', rootURI: 'resource://test/'});

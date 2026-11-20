@@ -332,7 +332,7 @@ var NotableUI = {
           // Raw stderr can contain PDF text or signed URLs. Retain bounded,
           // allowlisted diagnostic structure immediately, not document text.
           const sample = chunk.slice(0, 8192);
-          const knownModules = new Set(['pyzotero','httpx2','httpcore2','rapidocr','onnxruntime','numpy','pymupdf','rmscene','pypdf','PIL','cv2','anyio','sniffio','certifi','h11']);
+          const knownModules = new Set(['pyzotero','httpx2','httpcore2','rapidocr','onnxruntime','numpy','pymupdf','rmscene','shapely','pypdf','PIL','cv2','anyio','sniffio','certifi','h11']);
           const knownErrors = new Set(['ImportError','ModuleNotFoundError','ValueError','RuntimeError','TimeoutError','OSError','PermissionError','BrokenPipeError','ConnectionError','ReadTimeout','WriteTimeout','ConnectTimeout']);
           const modules = [...sample.matchAll(/No module named ['"]([A-Za-z0-9_.]+)['"]/g)].map(match => match[1]).filter(name => knownModules.has(name));
           const types = [...sample.matchAll(/\b([A-Za-z_]*(?:Error|Exception))\b/g)].map(match => match[1]).filter(name => knownErrors.has(name));

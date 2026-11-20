@@ -220,6 +220,7 @@ class BridgeTests(unittest.TestCase):
         row = links[item.id]
         row.pop("group_highlights")
         row.pop("handwriting_cards")
+        row["approved_highlight_groups"] = [["old-first", "old-second"]]
         row["rendered"]["input"] = row["rendered"]["input"][:2]
         self.state.write("documents", links)
 
@@ -228,6 +229,7 @@ class BridgeTests(unittest.TestCase):
             self.engine.run(apply=True)
             self.assertTrue(render.call_args.kwargs['handwriting_cards'])
             self.assertTrue(render.call_args.kwargs['group_highlights'])
+            self.assertEqual(render.call_args.kwargs['approved_highlight_groups'], [])
             render.reset_mock()
             self.engine.run(apply=True)
             render.assert_not_called()

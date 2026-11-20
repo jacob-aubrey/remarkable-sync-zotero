@@ -14,7 +14,7 @@ from urllib.parse import quote
 def validate_build_environment():
     """Fail before freezing when the private runtime is incomplete."""
     import importlib
-    required = ('pyzotero', 'httpx2', 'httpcore2', 'rapidocr', 'onnxruntime', 'numpy', 'pymupdf', 'rmscene', 'pypdf', 'PIL', 'docx', 'fontTools', 'yake')
+    required = ('pyzotero', 'httpx2', 'httpcore2', 'rapidocr', 'onnxruntime', 'numpy', 'pymupdf', 'rmscene', 'shapely', 'pypdf', 'PIL', 'docx', 'fontTools', 'yake')
     for name in required:
         try:
             importlib.import_module(name)

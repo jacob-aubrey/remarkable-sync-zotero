@@ -17,7 +17,7 @@ from zipfile import BadZipFile
 import pymupdf
 
 from .remarkable_cloud import CloudItem, CloudError, atomic_write
-from .remarkable_pdf import annotated_pdf, RENDER_REVISION, UnsupportedAnnotations
+from .remarkable_pdf import annotated_pdf, BARE_PDF_RENDER_REVISION, RENDER_REVISION, UnsupportedAnnotations
 from .remarkable_sources import save_source_bundle, source_bundle, source_info
 from .zotero_pilot import (AuthorizationRequired, Ledger, Paper, PilotError,
                            TransportInterrupted, publish, stable_key, marker)
@@ -231,8 +231,9 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def annotation_render_id(fingerprint, *, group_highlights=False, handwriting_cards=False, approved_highlight_groups=()):
-    identity = [fingerprint, RENDER_REVISION]
+def annotation_render_id(fingerprint, *, group_highlights=False, handwriting_cards=False,
+                         approved_highlight_groups=(), has_scene=True):
+    identity = [fingerprint, RENDER_REVISION if has_scene else BARE_PDF_RENDER_REVISION]
     if approved_highlight_groups:
         identity.append("approved-highlights-1:" + _sha(json.dumps(approved_highlight_groups).encode()))
     elif group_highlights:
@@ -817,14 +818,15 @@ class Bridge:
                 fingerprint = render_fingerprint(ck, retained_bundle)
                 # Apply passage grouping to older links as well. Keep explicit
                 # manual repair selections, rather than the old implicit opt-out.
-                group_highlights = (row.get("group_highlights", False)
-                                    if row.get("highlight_repair") else True)
-                approved = row.get("approved_highlight_groups") or []
+                manual_highlight_repair = bool(row.get("highlight_repair"))
+                group_highlights = not manual_highlight_repair or row.get("group_highlights", False)
+                approved = (row.get("approved_highlight_groups") or []) if manual_highlight_repair else []
                 # Refresh old links as well: a renderer upgrade must recover
                 # image notes for ink previously omitted from the Notes pane.
                 handwriting_cards = True
                 render_id = annotation_render_id(fingerprint, group_highlights=group_highlights,
-                                                 handwriting_cards=handwriting_cards, approved_highlight_groups=approved)
+                                                 handwriting_cards=handwriting_cards, approved_highlight_groups=approved,
+                                                 has_scene=any(name.endswith('.rm') for name in retained_bundle))
                 output = self.state.directory / "rendered" / (cached.get("sha256", "missing") + ".pdf")
                 if cached.get("input") == render_id and output.exists():
                     digest = cached["sha256"]
@@ -877,7 +879,7 @@ class Bridge:
                     save()
                 paper = Paper(ck, output, digest, {"title": row["name"]}, role=row.get("role", "main"), annotations=annotations,
                               source_attachment_key=row.get("source_key", "") if row.get("source_key") != row.get("view_key") else "",
-                              filename=row["name"] + ".pdf" if self.review_policy else "")
+                               filename=row["name"] + ".pdf" if self.review_policy else "", tablet_render=True)
                 parents = {ck: row["parent"]} if row.get("parent") else None
                 self.progress(f'Publishing {item.name} to Zotero [tablet item {ck}]…')
                 result = publish(self.zot, self.publisher, self.namespace, [paper], apply=True,

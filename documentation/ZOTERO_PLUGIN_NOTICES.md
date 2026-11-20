@@ -7,7 +7,8 @@ https://github.com/zotero/zotero
 The managed worker includes PyMuPDF (AGPL-3.0), rmscene (MIT), Pyzotero
 (BlueOak-1.0.0), Pillow (MIT-CMU), pypdf (BSD-3-Clause), fontTools (MIT),
 python-docx (MIT), RapidOCR (Apache-2.0), ONNX Runtime (MIT), and their
-runtime dependencies including NumPy (BSD-3-Clause) and OpenCV (Apache-2.0).
+runtime dependencies including NumPy (BSD-3-Clause), OpenCV (Apache-2.0),
+and Shapely (BSD-3-Clause).
 Installed distribution metadata, available license files
 and notices are copied into the worker package. PyInstaller's bootloader uses
 its GPL exception permitting bundled applications.

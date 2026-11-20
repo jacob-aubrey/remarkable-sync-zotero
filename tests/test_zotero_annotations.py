@@ -113,6 +113,73 @@ class AnnotationCardsTests(unittest.TestCase):
             self.assertEqual(group.text, 'A highlighted passage continues here')
             self.assertEqual(set(group.rects), set(left.rects + bridge.rects + right.rects))
 
+    def test_wrap_joins_across_pdf_blocks_and_retains_repeated_words(self):
+        with fitz.open() as doc:
+            page = doc.new_page()
+            page.insert_text((60, 100), 'A passage can end with a')
+            page.insert_text((63, 118), 'a word that starts the next line')
+            page.insert_text((63, 160), 'A separate paragraph')
+            a, b, c = (line_mark(page, str(i), 0, block=i) for i in range(3))
+            [group] = group_text_highlights(page, [c, b, a])
+            self.assertEqual(group.ids, ('0', '1'))
+            self.assertEqual(group.text, 'A passage can end with a a word that starts the next line')
+            page.set_rotation(90)
+            self.assertEqual(group_text_highlights(page, [c, b, a]), [group])
+
+    def test_whitespace_and_freehand_bridges_join_different_colors(self):
+        with letter_page() as doc:
+            page = doc[0]
+            left = line_mark(page, 'left', 0, first=0, last=2)
+            right = line_mark(page, 'right', 0, first=2, stroke=(1, .4, .7))
+            a, b = left.rects[0], right.rects[0]
+            gap = fitz.Rect(a.x1 - .35, a.y0 + 3, b.x0 + .35, a.y1 - 3)
+            for freehand in (False, True):
+                bridge = TextMark('bridge', (gap,), '', (0, 1, 0), None, 0, freehand)
+                [group] = group_text_highlights(page, [right, bridge, left])
+                self.assertEqual(group.ids, ('left', 'bridge', 'right'))
+                self.assertEqual(group.text, 'A highlighted passage continues here')
+                self.assertEqual(group.ink_ids, ('bridge',) if freehand else ())
+            self.assertEqual(group_text_highlights(page, [left, right]), [])
+
+    def test_multiline_selection_joins_an_overlay_on_its_middle_line(self):
+        with letter_page() as doc:
+            page = doc[0]
+            marks = [line_mark(page, str(i), i) for i in range(3)]
+            text = ' '.join(mark.text for mark in marks)
+            entire = TextMark('entire', tuple(mark.rects[0] for mark in marks), text, (1, 1, 0), None, 0)
+            middle = line_mark(page, 'middle', 1, first=1, last=4, stroke=(0, 1, 0))
+            [group] = group_text_highlights(page, [middle, entire])
+            self.assertEqual(group.ids, ('entire', 'middle'))
+            self.assertEqual(group.text, text)
+
+    def test_list_label_and_body_fragments_form_one_selection(self):
+        with fitz.open() as doc:
+            page = doc.new_page()
+            for point, text in (((60, 100), '1.'), ((82, 100), 'The first item wraps'),
+                                ((82, 113), 'to its next line.'), ((60, 126), '2.'),
+                                ((82, 126), 'Numbered item two')):
+                page.insert_text(point, text, fontsize=11)
+            labels = [line_mark(page, str(index), index) for index in range(5)]
+            intro = TextMark('intro', (labels[0].rects[0] | labels[1].rects[0],),
+                             '1. The first item wraps', (1, .84, 0), None, 0)
+            rest = TextMark('rest', tuple(mark.rects[0] for mark in labels[1:]),
+                            'The first item wraps to its next line. 2. Numbered item two', (1, .84, 0), None, 0)
+            [group] = group_text_highlights(page, [rest, intro])
+            self.assertEqual(group.text, '1. The first item wraps to its next line. 2. Numbered item two')
+
+    def test_column_wrap_requires_consecutive_tablet_offsets(self):
+        with fitz.open() as doc:
+            page = doc.new_page()
+            page.insert_text((55, 600), 'The selected phrase ends', fontsize=11)
+            page.insert_text((305, 115), 'in the second column.', fontsize=11)
+            left = line_mark(page, 'left', 0, start=10)
+            right = line_mark(page, 'right', 0, start=10 + left.length + 2, block=1)
+            [group] = group_text_highlights(page, [right, left])
+            self.assertEqual(group.ids, ('left', 'right'))
+            self.assertEqual(group.text, 'The selected phrase ends in the second column.')
+            unrelated = line_mark(page, 'right', 0, start=100, block=1)
+            self.assertEqual(group_text_highlights(page, [left, unrelated]), [])
+
     def test_grouped_pdf_and_handwriting_cards_preserve_mark_geometry(self):
         item, bundle = fixture()
         layer = next(name for name in bundle if name.endswith('.rm'))
@@ -178,6 +245,35 @@ class AnnotationCardsTests(unittest.TestCase):
 
         with rendered() as plain, rendered(handwriting_cards=True) as with_cards:
             self.assertEqual(plain[0].get_pixmap().samples, with_cards[0].get_pixmap().samples)
+        with rendered() as plain, rendered(group_highlights=True) as with_group:
+            before, grouped = plain[0].get_pixmap(), with_group[0].get_pixmap()
+            for x, y in ((65, 93), (65, 109), (65, 124), (30, 30)):
+                self.assertEqual(before.pixel(x, y), grouped.pixel(x, y))
+
+    def test_same_color_overlap_is_painted_once_and_different_colors_blend(self):
+        from shapely import box
+        from note_organizer.remarkable_pdf import _disjoint_quads, _highlight_appearance, _paint_once
+
+        a, b = fitz.Rect(10, 20, 70, 40), fitz.Rect(50, 20, 110, 40)
+        self.assertEqual(_disjoint_quads([a, b]), [a, fitz.Rect(70, 20, 110, 40)])
+        yellow, pink = (1, .84, 0), (1, .41, .71)
+        for second in (yellow, pink):
+            with self.subTest(second=second), fitz.open() as pdf:
+                page = pdf.new_page(width=130, height=80)
+                annotation = page.add_highlight_annot(_disjoint_quads([a, b]))
+                covered = {}
+                paints = [(stroke, _paint_once(covered, stroke, box(*rect)))
+                          for rect, stroke in ((a, yellow), (b, second))]
+                _highlight_appearance(pdf, page, annotation, paints)
+                with fitz.open(stream=pdf.tobytes(), filetype='pdf') as reopened:
+                    pixmap = reopened[0].get_pixmap()
+                    left, overlap, right = (pixmap.pixel(x, 30) for x in (25, 60, 90))
+                if second == yellow:
+                    self.assertEqual(left, overlap)
+                    self.assertEqual(right, overlap)
+                else:
+                    self.assertLess(overlap[1], min(left[1], right[1]))
+                    self.assertLess(overlap[2], min(left[2], right[2]))
 
     def test_every_drawing_tool_gets_a_card_without_changing_page_or_snapped_text(self):
         for tool in Pen:
@@ -214,3 +310,13 @@ class AnnotationCardsTests(unittest.TestCase):
         [(identity, region)] = handwriting_regions([('dot', fitz.Rect(40, 40, 41, 41))], page)
         self.assertEqual(identity, 'dot')
         self.assertTrue(region.contains(fitz.Rect(40, 40, 41, 41)))
+
+    def test_actual_stroke_path_distinguishes_diagonal_ink_from_enclosure(self):
+        from note_organizer.remarkable_marks import handwriting_regions
+        page = fitz.Rect(0, 0, 600, 800)
+        box = fitz.Rect(9, 9, 221, 221)
+        note = ('note', fitz.Rect(175, 45, 193, 55), [(176, 46), (187, 52), (192, 54)])
+        diagonal = ('diagonal', box, [(10, 10), (220, 220)])
+        enclosure = ('enclosure', box, [(10, 10), (220, 10), (220, 220), (10, 220), (10, 12)])
+        self.assertEqual([key for key, _ in handwriting_regions([diagonal, note], page)], ['diagonal', 'note'])
+        self.assertEqual([key for key, _ in handwriting_regions([enclosure, note], page)], ['enclosure'])

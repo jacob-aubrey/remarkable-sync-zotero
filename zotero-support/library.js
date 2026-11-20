@@ -746,6 +746,28 @@ function notableRegisterLibraryEndpoint(Base) {
         if (!parent || !parent.isRegularItem()) return reply(404, {error: 'Reference unavailable'});
         return reply(200, {inventory: await notableInventory(parent)});
       }
+      if (data.action === 'preflight_regroup') {
+        const item = await notableItem(data.key);
+        if (!item || item.deleted || !item.isPDFAttachment() || !item.getNote().includes('Notable pilot:')) {
+          return reply(409, {error: 'Managed PDF unavailable'});
+        }
+        if (typeof data.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(data.sha256)) {
+          return reply(400, {error: 'Invalid regrouped PDF digest'});
+        }
+        try {
+          let state = PathUtils.join(Zotero.Profile.dir, 'notable');
+          const config = await IOUtils.readJSON(PathUtils.join(state, 'config.json'));
+          if (/^[a-f0-9]{32}$/.test(config.connection_id || '')) {
+            state = PathUtils.join(state, 'connections', config.connection_id);
+          }
+          const path = PathUtils.join(state, 'bridge', 'rendered', data.sha256 + '.pdf');
+          await NotableAnnotationRefresh.plan(item, path, data.image_replacements);
+          return reply(200, {checked: true});
+        } catch (error) {
+          Zotero.logError(error);
+          return reply(409, {error: 'Existing annotation metadata needs review before regrouping.'});
+        }
+      }
       if (data.action === 'prepare_upload') {
         const item = await notableItem(data.key);
         if (!item || item.deleted || !item.isFileAttachment() || !item.isStoredFileAttachment()) {

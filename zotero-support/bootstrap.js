@@ -17,6 +17,8 @@ async function startup({id, rootURI}) {
     .registerChrome(Services.io.newURI(rootURI + 'manifest.json'), [['content', 'notable', rootURI]]);
   Services.scriptloader.loadSubScript(rootURI + 'library.js', globalThis);
   Services.scriptloader.loadSubScript(rootURI + 'annotation-refresh.js', globalThis);
+  Services.scriptloader.loadSubScript(rootURI + 'reader-highlight-paint.js', globalThis);
+  NotableReaderHighlightPaint.register(id);
   NotableAnnotationRefresh.register();
   // Root inherits Zotero's local API enablement, Host/browser restrictions,
   // server-ID validation and normal local-write authorization. The inherited
@@ -48,7 +50,10 @@ async function startup({id, rootURI}) {
         if (native) return [409, 'text/plain', 'Independent reader annotations require review'];
         const isHandwritingCard = annotation => annotation.annotationIsExternal && !annotation.deleted
           && annotation.annotationType === 'image' && annotation.annotationComment === 'Handwritten note';
-        try { await NotableAnnotationRefresh.preserve(item); }
+        try {
+          const data = typeof request.data === 'string' ? JSON.parse(request.data) : request.data;
+          await NotableAnnotationRefresh.preserve(item, data?.image_replacements);
+        }
         catch (error) {
           Zotero.logError(error);
           return [409, 'text/plain', 'Existing annotation metadata could not be preserved. Review before regrouping.'];
@@ -65,6 +70,7 @@ async function startup({id, rootURI}) {
         for (const reader of Zotero.Reader._readers.filter(reader => reader.itemID === item.id)) {
           await reader._initPromise;
           await reader.reload();
+          NotableReaderHighlightPaint.attach(reader);
           readersRefreshed++;
         }
         const handwriting = all.filter(isHandwritingCard);
@@ -143,6 +149,7 @@ async function startup({id, rootURI}) {
 }
 
 async function shutdown() {
+  globalThis.NotableReaderHighlightPaint?.unregister();
   globalThis.NotableAnnotationRefresh?.unregister();
   globalThis.NotableAnnotationJump?.unregister();
   NotableReadingStatus?.unregister();

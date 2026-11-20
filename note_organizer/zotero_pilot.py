@@ -15,7 +15,7 @@ import time
 import uuid
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
-from .remarkable_cloud import trace_event
+from .remarkable_cloud import atomic_write, trace_event
 
 INDEX_REVISION = 2
 READER_REVISION = 2
@@ -64,6 +64,7 @@ class Paper:
     annotations: tuple = ()
     source_attachment_key: str = ""
     filename: str = ""
+    tablet_render: bool = False
 
     @property
     def reference(self):
@@ -362,8 +363,9 @@ class LocalZotero:
         response.raise_for_status()
         return response.json().get("nativeText", [])
 
-    def refresh_reader(self, key):
-        response = self.http.post(f"{self.endpoint}/notable/annotations/{key}", json={},
+    def refresh_reader(self, key, *, image_replacements=()):
+        response = self.http.post(f"{self.endpoint}/notable/annotations/{key}",
+            json={'image_replacements': image_replacements} if image_replacements else {},
             headers={"Zotero-Server-ID": self.server_id, "Zotero-API-Key": self.zot.local_api_key},
             timeout=ZOTERO_REQUEST_TIMEOUT)
         if response.status_code in {401, 403}:
@@ -386,6 +388,11 @@ class LocalZotero:
             response = self.http.get(f"{self.endpoint}/notable/annotations/{key}",
                 headers={"Zotero-Server-ID": self.server_id}, timeout=ZOTERO_REQUEST_TIMEOUT)
             response.raise_for_status()
+
+    def preflight_regroup(self, key, sha256, image_replacements):
+        if self.can_refresh_reader and not self.review_action('preflight_regroup', {
+                'key': key, 'sha256': sha256, 'image_replacements': image_replacements}).get('checked'):
+            raise PilotError('Zotero could not verify existing annotation metadata before regrouping.')
 
     def update(self, record):
         if not self.zot.update_item(record):
@@ -417,6 +424,8 @@ class LocalZotero:
                 if response.status_code in {401, 403}:
                     raise AuthorizationRequired('Zotero permission is unavailable. Connect again from reMarkable Sync settings.')
                 if response.status_code == 409:
+                    if action == 'preflight_regroup':
+                        raise ReviewChanged('Existing annotation metadata needs review before regrouping. The current PDF was retained.')
                     if action == 'create_collection':
                         raise PilotError('The collection could not be created. Refresh folders and retry.')
                     if action == 'trash_linked_collection':
@@ -631,6 +640,32 @@ def searchable_content(path, saved_annotations=(), *, printed_ocr=None, handwrit
     return "\n".join(texts), count, empty
 
 
+def _image_card_positions(path):
+    import pymupdf
+
+    positions = {}
+    duplicates = set()
+    with pymupdf.open(path) as pdf:
+        for page in pdf:
+            transform = ~page.transformation_matrix
+            for annotation in page.annots(types=[pymupdf.PDF_ANNOT_SQUARE]) or ():
+                identity = annotation.info['id']
+                if not identity.startswith('remarkable-handwriting-'):
+                    continue
+                if identity in positions:
+                    duplicates.add(identity)
+                positions[identity] = {'pageIndex': page.number, 'rects': [list(annotation.rect * transform)]}
+    return {identity: position for identity, position in positions.items() if identity not in duplicates}
+
+
+def _image_replacements(previous, incoming):
+    before, after = _image_card_positions(previous), _image_card_positions(incoming)
+    # A split can shrink the old crop. Its stamp follows the original tablet
+    # stroke so the Zotero item and its saved links can follow the same drawing.
+    return [{'before': position, 'after': after[identity]} for identity, position in before.items()
+            if identity in after and position != after[identity]]
+
+
 def stage(ledger, paper):
     from .remarkable_cloud import atomic_write
     import pymupdf
@@ -772,6 +807,17 @@ def publish(client, ledger, namespace, papers, *, apply=False, collection_key=No
                     result["applied"] = True
                     continue
             write_permission()
+            regroup_path = path.with_name('regroup.json')
+            image_replacements = []
+            if paper.tablet_render and hasattr(client, 'preflight_regroup'):
+                if current and current != wanted:
+                    image_replacements = _image_replacements(client.file_path(key), path)
+                    client.preflight_regroup(key, paper.sha256, image_replacements)
+                    atomic_write(regroup_path, json.dumps({'attachment': key, 'images': image_replacements}).encode())
+                elif needs_reader and regroup_path.exists():
+                    saved_regroup = json.loads(regroup_path.read_bytes())
+                    if saved_regroup.get('attachment') == key:
+                        image_replacements = saved_regroup['images']
             if not root:
                 root = client.create("collection", {"key": root_key, "name": "Notable Pilot"})
                 if not root:
@@ -800,7 +846,10 @@ def publish(client, ledger, namespace, papers, *, apply=False, collection_key=No
             upload_attachment(client, ledger, paper.source_id, key, path, current, wanted)
             ledger.save(paper.source_id, published=1, md5=wanted, pending_md5="")
             if needs_reader:
-                client.refresh_reader(key)
+                if image_replacements:
+                    client.refresh_reader(key, image_replacements=image_replacements)
+                else:
+                    client.refresh_reader(key)
                 ledger.reader_revision(paper.source_id, reader_token)
             # Retry indexing independently after a crash or failed API response.
             result["pages_without_text"] = client.index(key, path, paper.annotations)

@@ -381,7 +381,7 @@ class Worker:
         """Read-only packaged-runtime check; never connects or starts OCR."""
         import importlib
         required, extras = {}, {}
-        for name in ('pyzotero', 'httpx2', 'httpcore2', 'pymupdf', 'rmscene', 'pypdf'):
+        for name in ('pyzotero', 'httpx2', 'httpcore2', 'pymupdf', 'rmscene', 'shapely', 'pypdf'):
             try:
                 importlib.import_module(name)
                 required[name] = {'available': True}
