@@ -2926,8 +2926,8 @@ class Worker:
         finally:
             client.close()
 
-    def _filename_cleanup_plans(self, client, links, identities):
-        from .zotero_filenames import PLACEHOLDER, citation_filename, citation_snapshot
+    def _filename_cleanup_plans(self, client, links):
+        from .zotero_filenames import PLACEHOLDER, available_pdf_stem, citation_filename, citation_snapshot
         from .sorting.core_logic import validate_document_filename
 
         maps = self.state.read('folders', {})
@@ -2935,9 +2935,15 @@ class Worker:
         conflicts = {r['identity'] for r in self.review.rows() if r['kind'] == 'conflict'}
         catalog = client.review_action('catalog')
         attachments = {entry['data']['key']: entry for entry in catalog['attachments']}
+        occupied = {}
+        for identity, row in links.items():
+            folder = row.get('tablet_parent') or maps.get(row.get('collection'), {}).get('cloud')
+            if folder and row.get('name') and not row.get('unavailable'):
+                occupied.setdefault((folder, row['name'].casefold()), set()).add(identity)
+            if pending := row.get('filename_cleanup'):
+                occupied.setdefault((pending['tablet_parent'], pending['target'].casefold()), set()).add(identity)
         plans = {}
-        for identity in identities:
-            row = links.get(identity, {})
+        for identity, row in sorted(links.items()):
             tablet = row.get('name', '')
             desktop = row.get('desktop_name', '')
             parent = catalog['parents'].get(row.get('parent'))
@@ -2961,8 +2967,13 @@ class Worker:
                                                      supplement=row.get('role') == 'si')
             if not filename:
                 continue
+            folder = maps[home]['cloud']
             try:
                 filename = validate_document_filename(filename, '.pdf')
+                base = Path(filename).stem
+                target = available_pdf_stem(base, lambda stem: not (
+                    occupied.get((folder, stem.casefold()), set()) - {identity}))
+                filename = target + '.pdf'
                 files = []
                 for key in sorted({row.get('source_key'), row.get('view_key')} - {None, ''}):
                     entry = attachments.get(key)
@@ -2980,19 +2991,20 @@ class Worker:
             except (OSError, ValueError):
                 continue
             plan = {'identity': identity, 'parent': parent['key'], 'title': parent.get('title', ''),
-                    'desktop': desktop, 'tablet': tablet, 'target': Path(filename).stem, 'basis': basis,
-                    'home': home, 'tablet_parent': maps[home]['cloud'], 'citation': citation_snapshot(parent),
+                    'desktop': desktop, 'tablet': tablet, 'target': target, 'target_base': base, 'basis': basis,
+                    'home': home, 'tablet_parent': folder, 'citation': citation_snapshot(parent),
                     'source_key': row.get('source_key'), 'view_key': row.get('view_key'),
                     'files': files}
             plan['token'] = fingerprint([self.config.get('connection_id'), self.config.get('tablet_root'), plan])
             plans[identity] = plan
+            occupied.setdefault((folder, target.casefold()), set()).add(identity)
         return plans
 
     def preview_filename_cleanup(self):
         links = self.state.read('documents', {})
         client = self.zotero()
         try:
-            plans = self._filename_cleanup_plans(client, links, links)
+            plans = self._filename_cleanup_plans(client, links)
             return {'papers': [{**plan, 'files': [{k: entry[k] for k in ('before', 'filename')} for entry in plan['files']]}
                                for plan in sorted(plans.values(), key=lambda row: row['title'].casefold())]}
         finally:
@@ -3008,7 +3020,7 @@ class Worker:
         try:
             with self.state.lock():
                 links = self.state.read('documents', {})
-                plans = self._filename_cleanup_plans(client, links, [row['identity'] for row in selected])
+                plans = self._filename_cleanup_plans(client, links)
                 queued, skipped = [], []
                 for selection in selected:
                     if self.stop.is_set():

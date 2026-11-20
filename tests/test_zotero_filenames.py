@@ -109,6 +109,47 @@ class FilenameCleanupTests(unittest.TestCase):
         self.worker.cancel_filename_cleanup(item.id)
         self.assertNotIn('filename_cleanup', self.worker.state.read('documents')[item.id])
 
+    def test_preview_reserves_known_names_and_sync_skips_new_collisions(self):
+        item, path = self.setup_link()
+        base = 'Taylor_Radiology_2024'
+        contents = path.read_bytes()
+        existing = self.cloud.upload_pdf(contents, base.lower(), item.parent, str(uuid.uuid4()), self.croot.id)
+        links = self.worker.state.read('documents')
+        links[existing.id] = {'name': existing.name, 'tablet_parent': item.parent}
+        links['other-folder'] = {'name': base + '_1', 'tablet_parent': 'another-folder'}
+        self.worker.state.write('documents', links)
+
+        preview, selection = self.preview()
+        self.assertEqual(preview['target'], base + '_1')
+        self.assertEqual(self.worker.queue_filename_cleanup([selection])['queued'], [item.id])
+
+        self.cloud.upload_pdf(contents, base + '_1', item.parent, str(uuid.uuid4()), self.croot.id)
+        occupied_path = path.with_name(base + '_2.pdf')
+        occupied_path.write_bytes(b'another file')
+        links = self.worker.state.read('documents')
+        row = links[item.id]
+        bridge = Bridge(self.zot, self.cloud, self.worker.state, 'ROOT2345', self.croot.id)
+        changed = bridge._apply_filename_cleanup(row, self.zot.get('item', 'PARENT23'), item, 'ROOT2345',
+                                                 self.cloud.library(), lambda: self.worker.state.write('documents', links))
+        self.assertEqual(changed.name, base + '_3')
+        self.assertEqual(row['filename_repair']['target'], changed.name)
+        self.assertEqual(self.zot.file_path('SOURCE23').read_bytes(), contents)
+        self.assertEqual(occupied_path.read_bytes(), b'another file')
+        self.assertEqual(next(other.name for other in self.cloud.library() if other.id == existing.id), base.lower())
+
+    def test_pending_rename_saved_before_numbering_resumes_with_suffix(self):
+        item, path = self.setup_link()
+        preview, selection = self.preview()
+        self.worker.queue_filename_cleanup([selection])
+        self.cloud.upload_pdf(path.read_bytes(), preview['target'], item.parent, str(uuid.uuid4()), self.croot.id)
+        row = self.worker.state.read('documents')[item.id]
+        row['filename_cleanup'].pop('target_base')
+        bridge = Bridge(self.zot, self.cloud, self.worker.state, 'ROOT2345', self.croot.id)
+        changed = bridge._apply_filename_cleanup(row, self.zot.get('item', 'PARENT23'), item, 'ROOT2345',
+                                                 self.cloud.library(), lambda: None)
+        self.assertEqual(changed.name, preview['target'] + '_1')
+        self.assertEqual(self.zot.file_path('SOURCE23').stem, changed.name)
+
     def test_missing_citation_uses_title_and_keeps_si_suffix(self):
         record = {'itemType': 'journalArticle', 'title': 'A <i>readable</i> title', 'publicationTitle': 'Radiology'}
         self.assertEqual(citation_filename(record, {}, supplement=True), ('A_readable_title_SI.pdf', 'Zotero title'))

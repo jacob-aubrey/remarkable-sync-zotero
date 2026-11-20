@@ -788,6 +788,7 @@ var NotableUI = {
           job.paperProgress = {checked: Number(count[2]) - (count[1] === 'Received tablet PDF' ? 0 : 1),
             total: Number(count[3])};
         }
+        job.onProgress?.(job.detail, job.paperProgress);
       }
       this.updateActivity();
     } else if (checkingZoteroFiles && this.operation?.detail === message) this.operation.updated = Date.now();
@@ -1106,7 +1107,7 @@ var NotableUI = {
       if (this.tagEditor === context && this.tab === 'tags' && this.view?.document && !this.view.closed) this.render();
     }
   },
-  async action(method, params = {}, render = true) {
+  async action(method, params = {}, render = true, onProgress) {
     if (this.canCheckDuringSync()) {
       if (method === 'recheck_keyword_warnings') return this.recheckKeywordsDuringSync(params, render);
       if (method === 'check_inbox') {
@@ -1124,6 +1125,7 @@ var NotableUI = {
     if (this.inboxChecking) { try { await this.inboxRequest; } catch (_) {} }
     const scopedSync = method === 'sync_selected';
     const syncing = method === 'sync' || scopedSync;
+    if (scopedSync && this.stopped) return;
     if (syncing && (params.automatic ? !this.automaticAllowed() : !this.canSync())) return;
     if (syncing && !scopedSync && !params.automatic && !this.busy && this.syncDecisions.some(job => !job.error)) {
       await this.drainSyncDecisions();
@@ -1168,10 +1170,12 @@ var NotableUI = {
     this.operation = {method: syncing ? 'sync' : method, scoped: scopedSync, targetCount: params.targets?.length,
       automatic: !!params.automatic, title: labels[method] || 'Updating your setup',
       started: Date.now(), updated: Date.now(), detail};
+    if (scopedSync) this.operation.onProgress = onProgress;
     if (syncing) this.badge();
     else if (!checkingInbox) this.message(detail);
     this.disable(true);
     try {
+      this.operation.onProgress?.(detail);
       const previousSyncFailure = this.syncFailure;
       const connection = this.filingConnection();
       const previousInbox = checkingInbox ? this.inboxRows() : null;
@@ -4075,10 +4079,19 @@ var NotableUI = {
       }
       for (const issue of warnings) {
         const link = issue.cloud && this.latest.links?.find(row => row.cloud === issue.cloud);
+        const oldRenameCollision = issue.reason === 'The proposed name is already used in this tablet folder. Review the queued rename in Linked papers.';
+        const rename = (issue.kind === 'filename_cleanup' || oldRenameCollision) && link?.filename_cleanup;
         const card = this.el('section', '', group, {class: 'sync-decision-item'});
         const title = issue.title || (issue.attachment ? 'Zotero attachment ' + issue.attachment : link?.name) || 'Sync warning';
         this.el('h3', issue.merge ? 'Zotero merge or attachment change: ' + title : title, card);
-        this.el('p', issue.reason, card);
+        if (rename) this.el('p', `Proposed replacement · ${rename.target}.pdf`, card);
+        this.el('p', rename && oldRenameCollision
+          ? 'Another item already uses the proposed replacement name in this reMarkable folder.' : issue.reason, card);
+        if (rename) this.button('Review queued rename in Linked papers', card, () => {
+          Object.assign(this.paperSearchState(), {view: 'linked', query: '', appliedQuery: '', waitingForEnter: false,
+            reading: 'all', limit: 25, contextClouds: [link.cloud]});
+          this.openTab('links');
+        }).dataset.browse = 'true';
         if (issue.kind === 'keywords') {
           const pdf = issue.parent && link?.parent === issue.parent && (link.view_key || link.source_key);
           if (pdf) this.reviewNavigationButton('Open PDF in Zotero', card, 'pdf', [pdf], {expectedParent: issue.parent});
@@ -5190,7 +5203,7 @@ var NotableUI = {
     const received = activeLinks.filter(row => row.revision).length;
     this.el('h2', 'Linked papers', content);
     if (contextClouds) {
-      this.el('p', 'Showing links for your Zotero selection.', content, {role: 'status'});
+      this.el('p', 'Showing selected linked papers.', content, {role: 'status'});
       this.button('Show all linked papers', content, () => { delete state.contextClouds; this.render(); }).dataset.browse = 'true';
     }
     const render = () => { if (this.tab === 'links' && this.view?.document) this.render(); };

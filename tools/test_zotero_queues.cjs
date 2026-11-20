@@ -153,6 +153,20 @@ const reference = (id, payload = {}) => ({...paper(id, 'reference'), payload: {t
 
 
 async function clearActionScopeChecks() {
+  {
+    const rename = viewFixture();
+    rename.ui.latest.links = [{cloud: 'target-cloud', name: 'Taylor_UnknownYear', parent: 'PARENT23',
+      filename_cleanup: {target: 'Taylor_Radiology_2024'}}];
+    rename.ui.latest.status = {result: {review: [{cloud: 'target-cloud',
+      reason: 'The proposed name is already used in this tablet folder. Review the queued rename in Linked papers.'}]}};
+    const page = rename.node();
+    rename.ui.renderReview(page, 'sync-review');
+    assert.match(nodeText(page), /Taylor_UnknownYear.*Proposed replacement · Taylor_Radiology_2024\.pdf.*Another item already uses/);
+    rename.ui.openTab = tab => { rename.ui.tab = tab; };
+    await rename.buttons.get('Review queued rename in Linked papers')[0].click();
+    assert.equal(rename.ui.tab, 'links');
+    assert.deepEqual(Array.from(rename.ui.paperSearch.contextClouds), ['target-cloud']);
+  }
   const f = viewFixture(), calls = [];
   f.ui.latest.reviews = [];
   f.ui.latest.local_deletions = [{id: 'local-trash', payload: {title: 'Kept tablet paper'}}];

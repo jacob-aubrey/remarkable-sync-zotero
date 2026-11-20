@@ -277,7 +277,7 @@ class Bridge:
             return self._run(apply)
 
     @contextmanager
-    def _document_errors(self, reviews, *, cloud=None, attachment=None, suspended=None):
+    def _document_errors(self, reviews, *, cloud=None, attachment=None, suspended=None, kind=None):
         """Keep a damaged or unavailable paper from blocking unrelated work."""
         try:
             yield
@@ -291,6 +291,8 @@ class Bridge:
             if isinstance(error, CloudError) and "authorization expired" in str(error).lower():
                 raise
             identity = {"cloud": cloud} if cloud else {"attachment": attachment}
+            if kind:
+                identity['kind'] = kind
             reviews.append({**identity, "reason": str(error) or "This paper could not be processed. Its source was retained."})
             if cloud and suspended is not None:
                 suspended.add(cloud)
@@ -566,7 +568,10 @@ class Bridge:
                         if not apply:
                             suspended.add(identity)
                             continue
-                        changed = self._apply_filename_cleanup(row, parent, item, home, catalog, save)
+                        with self._document_errors(reviews, cloud=identity, suspended=suspended, kind='filename_cleanup'):
+                            changed = self._apply_filename_cleanup(row, parent, item, home, catalog, save)
+                        if identity in suspended:
+                            continue
                         catalog[catalog.index(item)] = changed
                         item = changed
                         path = self.zot.file_path(key)
@@ -917,7 +922,7 @@ class Bridge:
                 "folder_issues": blocked['issues'], "folders": len({**saved_maps, **maps}), "documents": len(documents)}
 
     def _apply_filename_cleanup(self, row, parent, item, home, catalog, save):
-        from .zotero_filenames import citation_snapshot
+        from .zotero_filenames import available_pdf_stem, citation_snapshot
 
         plan = row['filename_cleanup']
         target = plan['target']
@@ -926,12 +931,12 @@ class Bridge:
                 or item.name not in old_names or citation_snapshot(parent) != plan['citation']
                 or any(row.get(key) != plan[key] for key in ('source_key', 'view_key'))):
             raise PilotError('The citation or linked location changed after the filename preview. Check the queued rename in Linked papers.')
-        if (item.name != target and any(other.id != item.id and not other.deleted and other.parent == item.parent
-                                       and other.name.casefold() == target.casefold() for other in catalog)):
-            raise PilotError('The proposed name is already used in this tablet folder. Review the queued rename in Linked papers.')
+        sibling_names = {other.name.casefold() for other in catalog
+                         if other.id != item.id and not other.deleted and other.parent == item.parent}
         if item.hash != row.get('revision'):
             if _sha(self.cloud.pdf_bundle(item)[item.id + '.pdf']) != row['baseline']:
                 raise PilotError('The tablet PDF changed editions. Review the queued rename in Linked papers.')
+        files = []
         for entry in plan['files']:
             attachment = self.zot.get('item', entry['key'])
             path = self.zot.file_path(entry['key'])
@@ -941,8 +946,30 @@ class Bridge:
             if (not attachment or attachment.get('deleted') or attachment.get('parentItem') != parent['key']
                     or path.name not in allowed or digest != entry['md5']):
                 raise PilotError('A linked PDF changed after the filename preview. Check the queued rename in Linked papers.')
-            if path.name.casefold() != entry['filename'].casefold() and path.with_name(entry['filename']).exists():
-                raise PilotError('The proposed filename already exists in Zotero storage. Check the queued rename in Linked papers.')
+            files.append((entry, path, attachment.get('linkMode') == 'linked_file'))
+
+        tablet_collision = item.name != target and target.casefold() in sibling_names
+        storage_collision = any(path.name.casefold() != entry['filename'].casefold()
+                                and path.with_name(entry['filename']).exists() for entry, path, _ in files)
+        if tablet_collision or storage_collision:
+            if plan.get('started') or plan.get('undo'):
+                if tablet_collision:
+                    raise PilotError('Another item already uses the proposed replacement name in this reMarkable folder.')
+                raise PilotError('Another file already uses the proposed replacement name in Zotero storage.')
+            if any(linked for _, _, linked in files):
+                raise PilotError('A numbered replacement would require renaming an external Zotero file.')
+            base = plan.get('target_base', target)
+
+            def is_available(stem):
+                filename = stem + '.pdf'
+                return stem.casefold() not in sibling_names and not any(
+                    path.name.casefold() != filename.casefold() and path.with_name(filename).exists()
+                    for _, path, _ in files)
+
+            target = available_pdf_stem(base, is_available)
+            plan = {**plan, 'target': target, 'target_base': base,
+                    'files': [{**entry, 'filename': target + '.pdf'} for entry in plan['files']]}
+            row['filename_cleanup'] = plan
         plan['started'] = True
         save()
         for entry in plan['files']:

@@ -4,13 +4,23 @@ const {join} = require('node:path');
 const vm = require('node:vm');
 
 async function test() {
-  const registrations = [], removed = [], calls = [], prompts = [], readerHooks = new Map();
+  const registrations = [], removed = [], calls = [], prompts = [], updates = [], readerHooks = new Map();
   let confirm = true;
   const scope = {Zotero: {
     Libraries: {userLibraryID: 1},
     MenuManager: {registerMenu: data => registrations.push(data), unregisterMenu: id => removed.push(id)},
     Reader: {registerEventListener(type, listener) { readerHooks.set(type, listener); }, unregisterEventListener(type) { readerHooks.delete(type); }},
-    ProgressWindow: class {changeHeadline() {} addDescription() {} show() {} startCloseTimer() {} close() {}},
+    ProgressWindow: class {
+      ItemProgress = class {
+        constructor(_type, text) { updates.push(text); }
+        setText(text) { updates.push(text); }
+        setProgress(value) { updates.push(value); }
+        setError() { updates.push('error'); }
+      };
+      changeHeadline() {}
+      show() { updates.push('shown'); }
+      startCloseTimer() {}
+    },
     logError: error => { throw error; },
   }, Services: {prompt: {alert: assert.fail, confirm(window, title, message) { prompts.push({title, message}); return confirm; }}},
   notableReviewItemInTrash: item => !!(item.deleted || item.parentItem?.deleted)};
@@ -22,7 +32,14 @@ async function test() {
     open: () => calls.push(['open']), openSetup() {}, openContextTab: tab => calls.push(['tab', tab]),
     paperSearchState() { return this.search ||= {}; }, canSync: () => true, canCheckDuringSync: () => false,
     filingConnection: () => JSON.stringify(['connection', 'zotero', 'root']),
-    action: async (method, params) => calls.push([method, params]),
+    async action(method, params, render, onProgress) {
+      calls.push([method, params]);
+      if (onProgress) {
+        onProgress('Starting…');
+        onProgress('Publishing a paper to Zotero [tablet item fixture]…', {checked: 1, total: 2});
+      }
+      return {status: {message: 'Selected sync complete.'}};
+    },
   };
   const paper = (id, key, options = {}) => ({id, key, libraryID: 1, isRegularItem: () => true,
     isPDFAttachment: () => false, isEditable: () => true, getAttachments: () => [id + 1], ...options});
@@ -94,8 +111,33 @@ async function test() {
   assert.equal(readerMenus[0].groups[0][0].label, 'Sync this PDF now');
   await readerMenus[0].groups[0][0].onCommand();
   assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a']);
-  const count = calls.length;
   ui.busy = true;
+  ui.inboxChecking = true;
+  const selectedPapers = context([aPDF, b]);
+  const papersCommand = find('Sync selected papers now');
+  papersCommand.onShowing(null, selectedPapers);
+  assert.equal(selectedPapers.enabled, true, 'A quiet Inbox check leaves the selected-paper command available');
+  await papersCommand.onCommand(null, selectedPapers);
+  assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a', 'cloud-b']);
+  const folderRow = items => ({isCollection: () => true, ref: {getChildItems: () => items, getChildCollections: () => []}});
+  const selectedFolders = {...context(), collectionTreeRows: [folderRow([a]), folderRow([a, b])]};
+  const folderCommand = collectionMenu.menus[0];
+  collectionMenu.onShowing(null, selectedFolders);
+  assert.equal(selectedFolders.visible, true);
+  folderCommand.onShowing(null, selectedFolders);
+  assert.equal(selectedFolders.enabled, true);
+  await folderCommand.onCommand(null, selectedFolders);
+  assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a', 'cloud-b']);
+  readerMenus.length = 0;
+  readerHooks.get('createViewContextMenu')({reader: {itemID: aPDF.id, _window: {}}, params: {}, append: menu => readerMenus.push(menu)});
+  assert.equal(readerMenus[0].groups[0][0].disabled, false);
+  updates.length = 0;
+  await readerMenus[0].groups[0][0].onCommand();
+  assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a']);
+  assert.deepEqual(updates, ['Waiting for the Inbox check before syncing 1 selected PDF…', 'shown',
+    'Syncing 1 selected PDF…', 'Publishing a paper to Zotero…', 50, 'Selected sync complete.', 100]);
+  ui.inboxChecking = false;
+  const count = calls.length;
   await find('Pause paper link (keep both copies)').onCommand(null, context([a]));
   assert.equal(calls.length, count, 'A busy worker must not receive another mutation');
   ui.busy = false; ui.latest.links = [];

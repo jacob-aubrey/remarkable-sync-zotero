@@ -1,5 +1,6 @@
 """Names proposed from a Zotero citation, with no PDF or network lookup."""
 import html
+from itertools import count
 import re
 
 from .sorting.core_logic import (
@@ -8,6 +9,16 @@ from .sorting.core_logic import (
 from .zotero_review import fingerprint
 
 PLACEHOLDER = re.compile(r'(?<![a-z0-9])unknown[ _-]?(?:journal|year|author)(?![a-z0-9])', re.I)
+
+
+def available_pdf_stem(base, is_available):
+    if is_available(base):
+        return base
+    for index in count(1):
+        suffix = f'_{index}'
+        stem = base[:236 - len(suffix)].rstrip(' .') + suffix
+        if is_available(stem):
+            return stem
 
 
 def citation_snapshot(record):
