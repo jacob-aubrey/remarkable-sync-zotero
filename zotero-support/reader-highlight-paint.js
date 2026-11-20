@@ -21,7 +21,7 @@ var NotableReaderHighlightPaint = {
     const paint = this;
     state.render = function (...args) {
       paint.updateView(this, state);
-      return state.original.apply(this, args);
+      return Reflect.apply(state.original, this, args);
     };
     view._render = state.render;
     this.views.set(view, state);
@@ -87,8 +87,12 @@ var NotableReaderHighlightPaint = {
         painted.push(...parts);
         fresh.push(...parts);
       }
-      if (fresh.length) original.call(page, items, {...annotation, color,
-        position: {pageIndex, rects: fresh}});
+      if (fresh.length) {
+        // Native PDF rendering reads the replacement geometry in its own window.
+        const local = Components.utils.cloneInto({color, position: {pageIndex, rects: fresh}},
+          Components.utils.getGlobalForObject(page));
+        original.call(page, items, local);
+      }
     }
   },
   subtract(rect, other) {

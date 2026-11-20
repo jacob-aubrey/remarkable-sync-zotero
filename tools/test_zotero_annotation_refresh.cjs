@@ -3,7 +3,11 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 async function main() {
-  const context = {};
+  const readerWindow = {};
+  const context = {Components: {utils: {
+    getGlobalForObject: () => readerWindow,
+    cloneInto: (value, target) => {assert.equal(target, readerWindow); return structuredClone(value);},
+  }}};
   vm.createContext(context);
   vm.runInContext(fs.readFileSync('zotero-support/annotation-refresh.js', 'utf8'), context);
   const refresh = context.NotableAnnotationRefresh;
@@ -55,6 +59,12 @@ async function main() {
   assert.equal(refresh.covered([10, 20, 80, 30], [[10, 20, 80, 24], [10, 24, 80, 30]]), true);
   vm.runInContext(fs.readFileSync('zotero-support/reader-highlight-paint.js', 'utf8'), context);
   const paint = context.NotableReaderHighlightPaint;
+  let renders = 0;
+  const render = () => ++renders;
+  render.apply = () => { throw Error('The reader cannot read an argument array from another window'); };
+  const view = {_render: render, _pages: []};
+  paint.wrapView(view);
+  assert.equal(view._render(), 2);
   const page = {_pageIndex: 3};
   const collect = (items, annotation) => items.push(annotation);
   const base = {isExternal: true, color: '#ffd600', position: {pageIndex: 3, rects: [[10, 20, 80, 30]]}};
