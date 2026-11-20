@@ -82,9 +82,8 @@ def name_review(worker, *, selected=None, dismiss=None):
                 queue.setdefault(match['key'], {**match, 'queued_at': now()})
             write_json(path, queues)
         rows = [{**match, 'queued': key in queue} for key, match in matches.items()]
-        queued = [{**(matches.get(key) or saved), 'queued_at': saved['queued_at'],
-                   'status': 'needs_review' if key in matches else 'no_longer_matches'}
-                  for key, saved in queue.items()]
+        queued = [{**match, 'queued_at': queue[key]['queued_at'], 'status': 'needs_review'}
+                  for key, match in matches.items() if key in queue]
         return {'matches': sorted(rows, key=lambda row: row['title'].casefold()),
                 'queued': sorted(queued, key=lambda row: row['title'].casefold())}
     finally:

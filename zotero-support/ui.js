@@ -778,8 +778,17 @@ var NotableUI = {
     const checkingZoteroFiles = /^Checking Zotero file \d+ of \d+:/.test(response.message);
     const message = checkingZoteroFiles ? 'Checking Zotero for new papers…' : response.message;
     if (this.operation?.method === 'sync') {
-      this.operation.updated = Date.now();
-      if (message !== 'Still working...') this.operation.detail = message;
+      const job = this.operation;
+      job.updated = Date.now();
+      if (message !== 'Still working...') {
+        job.detail = message;
+        // Use the tablet sweep's count across all steps for the same paper.
+        const count = /^(Syncing linked paper|Checking new tablet paper|Received tablet PDF) (\d+) of (\d+)(?=[:…])/.exec(message);
+        if (count && Number(count[3]) > 0) {
+          job.paperProgress = {checked: Number(count[2]) - (count[1] === 'Received tablet PDF' ? 0 : 1),
+            total: Number(count[3])};
+        }
+      }
       this.updateActivity();
     } else if (checkingZoteroFiles && this.operation?.detail === message) this.operation.updated = Date.now();
     else this.message(message);
@@ -1699,14 +1708,12 @@ var NotableUI = {
       if (detail.textContent !== step) detail.textContent = step;
       const progress = doc.getElementById('notable-sync-progress');
       if (progress) {
-        const count = step.match(/(\d+) of (\d+)/);
-        if (count && Number(count[2]) > 0) {
-          progress.hidden = false;
-          progress.max = Number(count[2]);
-          progress.value = Number(count[1]);
-          progress.setAttribute('aria-valuetext', `${count[1]} of ${count[2]}`);
+        const papers = syncing ? job.paperProgress : null;
+        if (papers) {
+          progress.max = papers.total;
+          progress.value = papers.checked;
+          progress.setAttribute('aria-valuetext', `${papers.checked} of ${papers.total} tablet papers checked`);
         } else {
-          progress.hidden = true;
           progress.removeAttribute('value');
           progress.removeAttribute('aria-valuetext');
         }
@@ -2326,8 +2333,8 @@ var NotableUI = {
     const syncDetails = this.el('details', '', status, {id: 'notable-sync-details'});
     syncDetails.open = !!syncDetailsOpen;
     this.el('summary', 'Sync details', syncDetails);
+    this.el('progress', '', syncDetails, {id: 'notable-sync-progress', 'aria-label': 'Sync progress'});
     this.el('p', '', syncDetails, {id: 'notable-sync-step', tabindex: '0'});
-    this.el('progress', '', syncDetails, {id: 'notable-sync-progress', 'aria-label': 'Sync paper progress'});
     const activity = this.el('section', '', status, {id: 'activity', class: 'activity', 'aria-label': 'Current activity'});
     this.el('span', '', activity, {class: 'activity-spinner', 'aria-hidden': 'true'});
     const info = this.el('div', '', activity, {class: 'activity-content'});
@@ -5202,9 +5209,6 @@ var NotableUI = {
       byPaper.get(key).push(row);
     }
     const matches = new Map((state.names?.matches || []).map(row => [row.key, row]));
-    for (const row of state.names?.queued || []) {
-      if (!matches.has(row.key)) matches.set(row.key, {...row, queued: true});
-    }
     for (const [key, rows] of byPaper) {
       if (!key || matches.has(key) || !rows.some(row => row.filename_cleanup || renames.has(row.cloud))) continue;
       matches.set(key, {key, title: rows[0].name, findings: [], reference: !!rows[0].parent});
@@ -5254,7 +5258,7 @@ var NotableUI = {
         const linked = byPaper.get(key) || [];
         if (reviewing) {
           if (state.scope === 'linked' && !linked.length) return false;
-          if (state.status === 'needs' && (!row.findings.length || row.status === 'no_longer_matches')) return false;
+          if (state.status === 'needs' && !row.findings.length) return false;
           if (state.status === 'available' && !linked.some(link => renames.has(link.cloud))) return false;
           if (state.status === 'queued' && !linked.some(link => link.filename_cleanup)) return false;
           if (state.status === 'saved' && !row.queued) return false;
@@ -5302,7 +5306,6 @@ var NotableUI = {
           this.el('p', `${label} · ${finding.name}`, card);
           if (finding.attachment) this.reviewNavigationButton('Show attachment in Zotero', card, 'attachment', [finding.attachment]);
         }
-        if (row.status === 'no_longer_matches') this.el('p', 'The flagged name no longer appears in Zotero or in the saved reMarkable link.', card);
         if (row.queued) this.button('Remove from name review', card, () => saveReview({dismiss: row.key}));
         else if (row.token) this.button('Queue for review', card, () => saveReview({selected: [{key: row.key, token: row.token}]}));
         for (const link of byPaper.get(row.key) || []) {

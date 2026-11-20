@@ -127,9 +127,12 @@ async function main() {
     reference: true, findings: [{where: 'Zotero filename', name: 'Gurevich_et_al_UnknownJournal_2025.pdf', attachment: 'FILE2345'}]};
   const unlinked = {key: 'PAPER567', title: 'An unknown effect', token: 'other',
     reference: true, findings: [{where: 'Zotero title', name: 'An unknown effect'}]};
+  const resolved = {key: 'PAPER890', title: 'Paper with a corrected name', reference: true,
+    status: 'no_longer_matches', findings: [{where: 'Zotero filename', name: 'Old_UnknownJournal.pdf'}]};
   const rename = {identity: 'LINK', token: 'fresh', title: match.title, tablet: 'Gurevich_UnknownJournal_2025',
     target: 'Gurevich_Radiology_2025', files: [{before: match.findings[0].name, filename: 'Gurevich_Radiology_2025.pdf'}]};
-  ui.latest.links = [{cloud: 'LINK', name: rename.tablet, parent: match.key}];
+  ui.latest.links = [{cloud: 'LINK', name: rename.tablet, parent: match.key},
+    {cloud: 'RESOLVED', name: 'Corrected_Radiology_2025', parent: resolved.key}];
   const metadata = new Map([[match.key, {title: match.title, citation: [match.title, 'Gurevich', '2025'],
     files: [match.findings[0].name], fields: ['Vascular Imaging']}]]);
   ui.paperSearchMetadata = async () => metadata;
@@ -144,7 +147,8 @@ async function main() {
     if (method === 'queue_filename_cleanup') {
       ui.latest.links[0].filename_cleanup = {target: rename.target}; return {queued: ['LINK'], skipped: []};
     }
-    return {matches: [{...match, queued: !!params.selected}, unlinked], queued: params.selected ? [match] : []};
+    return {matches: [{...match, queued: !!params.selected}, unlinked],
+      queued: params.selected ? [match, resolved] : [resolved]};
   };
   const find = text => names.all().find(item => item.textContent === text);
   const control = label => names.all().find(item => item['aria-label'] === label);
@@ -177,6 +181,8 @@ async function main() {
   await find('Review paper names').click();
   await tick();
   assert.ok(find(unlinked.title), 'All Zotero papers includes unlinked records');
+  assert.equal(find(resolved.title), undefined, 'Old worker snapshots cannot bring corrected papers back into review');
+  assert.ok(find('2 of 2 papers to review'));
   const scopeField = control('Paper scope');
   scopeField.value = 'linked'; scopeField.fire('change');
   assert.equal(find(unlinked.title), undefined);
@@ -192,6 +198,7 @@ async function main() {
   await find('Queue for review').click();
   assert.equal(callsForNames[2][1].selected[0].token, match.token);
   await searchTick();
+  assert.ok(find('Remove from name review'), 'Current issues retain their saved review status');
   await find('Queue rename').click();
   assert.equal(callsForNames[3][1].selected[0].identity, rename.identity);
   assert.equal(callsForNames[3][1].selected[0].token, rename.token);

@@ -35,11 +35,18 @@ class MaintenanceTests(unittest.TestCase):
         entry = next(row for row in result['matches'] if row['key'] == 'PAPER234')
         self.assertEqual({finding['where'] for finding in entry['findings']},
                          {'Zotero filename', 'Saved reMarkable name'})
-        self.assertEqual(len(name_review(self.worker, selected=[entry])['queued']), 1)
+        self.assertEqual(len(name_review(self.worker, selected=result['matches'])['queued']), 2)
         self.client.update.assert_not_called()
-        catalog['attachments'].clear()
+        catalog['attachments'][0]['path'] = str(self.root / 'Gurevich_et_al_Radiology_2025.pdf')
         with self.assertRaisesRegex(PilotError, 'changed'):
             name_review(self.worker, selected=[entry])
+        queued = next(row for row in name_review(self.worker)['queued'] if row['key'] == 'PAPER234')
+        self.assertEqual([finding['where'] for finding in queued['findings']], ['Saved reMarkable name'])
+
+        self.worker.state.write('documents', {'tablet': {'parent': 'PAPER234', 'name': 'Paper_2025'}})
+        result = name_review(self.worker)
+        self.assertEqual([row['key'] for row in result['matches']], ['PAPER235'])
+        self.assertEqual([row['key'] for row in result['queued']], ['PAPER235'])
 
     def test_lost_tag_response_can_be_undone_without_dropping_manual_tags(self):
         before = [{'tag': 'Manual', 'type': 0}, {'tag': 'Models and', 'type': 1}]

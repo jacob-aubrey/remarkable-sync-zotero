@@ -54,8 +54,10 @@ async function main() {
   assert.deepEqual(settlingChecks, [true, true], 'Unsettled native files trigger another discovery on the next idle poll');
   assert.equal(ui.zoteroInboxDirty, false, 'A settled follow-up ends fast discovery');
   const panel = {}, message = {}, attrs = {}, label = {}, syncStatus = {}, syncDetails = {}, syncStep = {};
+  const syncProgress = {hidden: false, setAttribute(key, value) {this[key] = value;}, removeAttribute(key) {delete this[key];}};
   ui.view.document = {querySelectorAll, getElementById: id => ({activity: panel, message,
     'notable-sync-status': syncStatus, 'notable-sync-details': syncDetails, 'notable-sync-step': syncStep,
+    'notable-sync-progress': syncProgress,
     app: {setAttribute: (key, value) => {attrs[key] = value;}},
     'notable-pause': {querySelector: () => label}}[id])};
   let finish;
@@ -92,9 +94,25 @@ async function main() {
   assert.equal(label.textContent, 'Pause sync');
   assert.equal(syncDetails.hidden, false);
   assert.equal(syncStatus.textContent, 'Syncing with reMarkable…');
-  ui.receiveProgress({message: 'Importing paper 2 of 3'});
+  assert.equal(syncProgress.hidden, false, 'The progress bar is visible from the start');
+  assert.equal(syncProgress.value, undefined, 'The bar is indeterminate until the tablet paper count is known');
+  ui.receiveProgress({message: 'Checking Zotero paper 8 of 10…'});
+  assert.equal(syncProgress.value, undefined, 'Preflight counts are separate from the tablet paper count');
+  ui.receiveProgress({message: 'Syncing linked paper 2 of 3: A sample paper…'});
+  assert.equal(syncProgress.max, 3);
+  assert.equal(syncProgress.value, 1);
+  const publishing = 'Publishing Results 4 of 9 to Zotero…';
+  ui.receiveProgress({message: publishing});
   ui.receiveProgress({message: 'Still working...'});
-  assert.equal(syncStep.textContent, 'Importing paper 2 of 3', 'A heartbeat keeps the meaningful step visible');
+  assert.equal(syncStep.textContent, publishing, 'A heartbeat keeps the meaningful step visible');
+  assert.equal(syncProgress.hidden, false, 'The same bar stays visible while publishing');
+  assert.equal(syncProgress.max, 3, 'Numbers in a title do not change the paper count');
+  assert.equal(syncProgress.value, 1, 'The bar holds until the paper is finished');
+  ui.receiveProgress({message: 'Received tablet PDF 2 of 3…'});
+  assert.equal(syncProgress.value, 2);
+  const nextPaper = 'Checking new tablet paper 3 of 3: Another paper…';
+  ui.receiveProgress({message: nextPaper});
+  assert.equal(syncProgress.value, 2, 'Starting the next paper does not move the bar backward');
   const renderIdle = ui.render;
   ui.render = () => {assert.equal(ui.operation.method, 'sync'); renders++;};
   ui.latest.reviews = [{id: 'reference', kind: 'reference'}, {id: 'decision', kind: 'conflict'}];
@@ -107,7 +125,7 @@ async function main() {
   assert.equal(ui.latest.reviews[0].intake_pdf.id, 'download');
   assert.equal(ui.latest.reviews[1].id, 'decision', 'Download discovery preserves unrelated review rows');
   assert.equal(ui.latest.reviews[2].id, 'download');
-  assert.equal(syncStep.textContent, 'Importing paper 2 of 3', 'Inbox discovery leaves the sync step visible');
+  assert.equal(syncStep.textContent, nextPaper, 'Inbox discovery leaves the sync step visible');
   const reference = ui.latest.reviews[0], messagesBeforeDismissal = messages;
   ui.rpc = (method, params) => {
     assert.equal(method, 'dismiss_reference');
@@ -126,6 +144,7 @@ async function main() {
   ui.busy = false; ui.operation = null; ui.updateActivity();
   assert.equal(syncDetails.hidden, true);
   assert.equal(syncDetails.open, false);
+  assert.equal(syncProgress.value, undefined, 'A subsequent sync starts with a fresh progress bar');
   ui.syncFailure = 'Tablet unavailable'; ui.latest.config.sync_paused = false; ui.latest.config.automatic = true;
   ui.updateActivity();
   assert.equal(syncStatus.textContent, 'Sync waiting to retry');
