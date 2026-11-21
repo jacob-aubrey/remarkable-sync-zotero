@@ -2,6 +2,7 @@
 var NotableContextMenu = {
   menuIDs: ['notable-context-items', 'notable-context-collection'],
   windows: new Map(),
+  syncProgress: new Map(),
 
   items(context) {
     const items = context.items || [];
@@ -21,7 +22,7 @@ var NotableContextMenu = {
     return !!items.length && items.every(item => item.libraryID === Zotero.Libraries.userLibraryID && item.isEditable());
   },
   idle(ui) { return !ui.busy && !ui.pausing && !ui.changingFolder && !ui.stopped; },
-  canSyncSelection(ui) { return (!ui.busy || ui.inboxChecking) && !ui.stopped && ui.canSync(); },
+  canSyncSelection(ui) { return !this.syncingSelection && (!ui.busy || ui.inboxChecking) && !ui.stopped && ui.canSync(); },
   window(context) { return context.menuElem.ownerGlobal; },
   async report(window, label, action, ui) {
     try {
@@ -57,38 +58,84 @@ var NotableContextMenu = {
       }, ui);
     }};
   },
+  showSyncProgress(window, detail) {
+    const owner = window && !window.closed ? window : Zotero.getMainWindow();
+    if (!owner || owner.closed) return;
+    this.syncProgress.get(owner)?.();
+    const doc = owner.document;
+    const html = 'http://www.w3.org/1999/xhtml';
+    const panel = doc.createElementNS(html, 'section');
+    panel.id = 'notable-selected-sync-progress';
+    // Keep the notice inside the library or reader instead of opening a
+    // separate native window that can steal focus or be covered.
+    Object.assign(panel.style, {
+      position: 'fixed', right: '16px', bottom: '16px', zIndex: '10000',
+      boxSizing: 'border-box', width: 'min(320px, calc(100vw - 32px))',
+      padding: '10px 12px', border: '1px solid var(--stroke-secondary, GrayText)',
+      borderRadius: '6px', background: 'var(--material-background, Canvas)',
+      color: 'var(--fill-primary, CanvasText)', boxShadow: '0 3px 12px #0005',
+      font: 'message-box', fontSize: '13px', lineHeight: '1.4',
+      overflowWrap: 'anywhere', pointerEvents: 'none',
+    });
+    const title = doc.createElementNS(html, 'strong');
+    title.textContent = 'reMarkable Sync';
+    const status = doc.createElementNS(html, 'div');
+    status.setAttribute('role', 'status');
+    status.textContent = detail;
+    const meter = doc.createElementNS(html, 'progress');
+    Object.assign(meter.style, {display: 'block', width: '100%', height: '6px', marginTop: '6px'});
+    meter.setAttribute('aria-label', 'Selected PDF sync progress');
+    meter.max = 100;
+    panel.append(title, status, meter);
+    doc.documentElement.append(panel);
+
+    let timer;
+    const close = () => {
+      clearTimeout(timer);
+      owner.removeEventListener('unload', close);
+      panel.remove();
+      this.syncProgress.delete(owner);
+    };
+    owner.addEventListener('unload', close, {once: true});
+    this.syncProgress.set(owner, close);
+    return {
+      update(message, papers) {
+        status.textContent = message;
+        if (papers) meter.value = Math.min(99, Math.floor(100 * papers.checked / papers.total));
+      },
+      finish(message, failed = false) {
+        if (!panel.isConnected) return;
+        if (failed) {
+          status.setAttribute('role', 'alert');
+          meter.remove();
+        } else meter.value = 100;
+        status.textContent = message;
+        timer = setTimeout(close, failed ? 12000 : 6000);
+      },
+    };
+  },
   async syncTargets(ui, window, links) {
-    // Let Zotero dismiss the native menu before opening another window.
-    await new Promise(resolve => setTimeout(resolve, 0));
     if (ui.stopped) return;
     if (!this.canSyncSelection(ui)) throw Error('Wait for the current operation to finish before syncing these PDFs.');
     const targets = [...new Map(links.map(link => [link.cloud, Object.fromEntries(
       ['cloud', 'parent', 'source_key', 'view_key'].map(key => [key, link[key] || '']))])).values()];
     if (!targets.length) throw Error('Choose a linked paper or PDF to sync.');
-    const owner = window?.closed ? Zotero.getMainWindow() : window;
-    const progress = new Zotero.ProgressWindow({window: owner, closeOnClick: false});
-    progress.changeHeadline('reMarkable Sync');
     const selection = `${targets.length} selected ${targets.length === 1 ? 'PDF' : 'PDFs'}`;
-    const line = new progress.ItemProgress('attachmentPDF',
+    const progress = this.showSyncProgress(window,
       ui.inboxChecking ? `Waiting for the Inbox check before syncing ${selection}…` : `Syncing ${selection}…`);
-    progress.show();
+    this.syncingSelection = true;
     try {
       const result = await ui.action('sync_selected', {targets, connection: JSON.parse(ui.filingConnection())},
         true, (detail, papers) => {
-          line.setText(detail === 'Starting…' ? `Syncing ${selection}…` : detail.replace(/ \[tablet item [^\]]+\]/, ''));
-          if (papers) line.setProgress(Math.min(99, Math.floor(100 * papers.checked / papers.total)));
+          progress?.update(detail === 'Starting…' ? `Syncing ${selection}…` : detail.replace(/ \[tablet item [^\]]+\]/, ''), papers);
         });
       if (!result) throw Error('Another operation started. Choose Sync again when it finishes.');
-      line.setText(result.status?.message || 'Selected PDF sync finished.');
-      line.setProgress(100);
-      progress.startCloseTimer(6000);
+      progress?.finish(result.status?.message || 'Selected PDF sync finished.');
       return result;
     } catch (error) {
       Zotero.logError(error);
-      line.setText(error.message);
-      line.setError();
-      progress.startCloseTimer(12000);
-    }
+      progress?.finish(error.message, true);
+    } finally { this.syncingSelection = false; }
   },
   showLinks(ui, links) {
     Object.assign(ui.paperSearchState(), {view: 'linked', query: '', appliedQuery: '', waitingForEnter: false,
@@ -288,6 +335,7 @@ var NotableContextMenu = {
     this.windows.set(window, {nodes, contextmenu, showing});
   },
   detach(window) {
+    this.syncProgress.get(window)?.();
     const state = this.windows.get(window);
     if (!state) return;
     window.document.removeEventListener('contextmenu', state.contextmenu, true);
@@ -302,5 +350,6 @@ var NotableContextMenu = {
     }
     this.readerTagMenu = null;
     for (const window of this.windows.keys()) this.detach(window);
+    for (const close of this.syncProgress.values()) close();
   },
 };

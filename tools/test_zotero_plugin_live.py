@@ -91,7 +91,17 @@ async function startup({rootURI}) {
               await reader._initPromise;
               await wait(() => reader._internalReader?._primaryView?._iframeWindow?.PDFViewerApplication?.pdfDocument,
                 'The reader did not open the test PDF');
-              const previous = ui.action, requests = [];
+              const previous = ui.action, checkInbox = ui.checkInbox, requests = [];
+              // The synthetic links must survive while the reader is opening.
+              ui.checkInbox = async () => {};
+              await wait(() => !ui.inboxChecking, 'The existing local Inbox check did not finish');
+              const notice = () => win.document.getElementById('notable-selected-sync-progress');
+              const noticeGeometry = () => {
+                const panel = notice();
+                return {visible: panel?.checkVisibility(), text: panel?.textContent,
+                  rect: panel?.getBoundingClientRect().toJSON(), viewport: [win.innerWidth, win.innerHeight],
+                  busy: ui.busy, inboxChecking: ui.inboxChecking, canSync: ui.canSync(), links: ui.latest.links?.length};
+              };
               const scope = () => {
                 ui.latest.config = {...ui.latest.config, connection_id: 'reader-scope', zotero_root: 'ROOT2345',
                   tablet_root: 'a989c1c3-8726-4f82-ad3f-1063f9ee31cb', sync_paused: true, automatic: false};
@@ -102,10 +112,16 @@ async function startup({rootURI}) {
                 if (method !== 'sync_selected') throw Error('A context sync invoked a whole-library action');
                 const selected = params.targets.length;
                 const message = `Syncing ${selected} selected ${selected === 1 ? 'PDF' : 'PDFs'}…`;
-                await wait(() => [...Services.wm.getEnumerator(null)].some(popup =>
-                  popup.opener === win && popup.location.href === 'chrome://zotero/content/progressWindow.xhtml'
-                  && popup.document.getElementById('zotero-progress-text-box')?.textContent.includes(message)),
-                  'The native progress popup did not appear for ' + selected + ' selected PDFs');
+                await wait(() => {
+                  const panel = notice();
+                  if (!panel?.textContent.includes(message)) return false;
+                  const rect = panel.getBoundingClientRect();
+                  const style = win.getComputedStyle(panel);
+                  return style.position === 'fixed' && style.visibility === 'visible' && panel.checkVisibility()
+                    && rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.left >= 0
+                    && Math.abs(win.innerWidth - rect.right - 16) < 2
+                    && Math.abs(win.innerHeight - rect.bottom - 16) < 2;
+                }, () => 'The selected sync notice did not render inside the source window: ' + JSON.stringify(noticeGeometry()));
                 requests.push(params);
                 return {...ui.latest, status: {state: 'ready', message: 'Selected PDFs synced.'}};
               };
@@ -121,7 +137,8 @@ async function startup({rootURI}) {
                 sub.dispatchEvent(new win.Event('popupshowing', {bubbles: true}));
                 const sync = sub.querySelector('menuitem[label="Sync selected papers now"]');
                 if (!sync || sync.disabled) throw Error('The reference selection has no usable scoped sync');
-                sync.doCommand(); await wait(() => requests.length === 1, 'Reference sync did not execute');
+                sync.doCommand(); await wait(() => requests.length === 1,
+                  () => 'Reference sync did not execute: ' + JSON.stringify(noticeGeometry()));
                 win.Zotero_Tabs.select(reader.tabID);
                 const pdfWindow = reader._internalReader._primaryView._iframeWindow;
                 const target = await wait(() => pdfWindow.document.querySelector('.page[data-page-number="2"]'), 'The reading page did not render');
@@ -144,9 +161,12 @@ async function startup({rootURI}) {
                     () => 'The PDF view has no branded reMarkable Sync submenu. ' + JSON.stringify({contextEvents,
                       labels: [...reader._popupset.querySelectorAll('menu, menuitem')].map(node => node.getAttribute('label'))}));
                 } finally { Zotero.Reader._dispatchEvent = dispatch; }
-                scope(); command.doCommand(); await wait(() => requests.length === 2, 'Reader sync did not execute');
+                scope(); command.doCommand(); await wait(() => requests.length === 2,
+                  () => 'Reader sync did not execute: ' + JSON.stringify(noticeGeometry()));
                 for (const popup of reader._popupset.querySelectorAll('menupopup')) popup.hidePopup();
-              } finally { ui.action = previous; }
+                await wait(() => notice()?.querySelector('progress')?.value === 100
+                  && notice()?.textContent.includes('Selected PDFs synced.'), 'The selected sync result disappeared too soon');
+              } finally { ui.action = previous; ui.checkInbox = checkInbox; }
               if (requests[0].targets.length !== 2 || requests[1].targets.length !== 1
                   || requests[1].targets[0].view_key !== pdfs[0].key) throw Error('The native context menu sent the wrong PDF scope');
               const app = reader._internalReader._primaryView._iframeWindow.PDFViewerApplication;
@@ -2084,7 +2104,7 @@ def reader_sync_checks(client, root, checked):
         live = command(root, 'reader_sync_state', key=key, expected=f'Live tablet update {revision}')['live']
         assert live['page'] == 2 and abs(live['scale'] - 1.25) < .01, live
         assert client.file_path(sibling).read_bytes() == before_sibling
-    checked('reference_selection_and_branded_reader_submenu_send_only_exact_selected_PDFs')
+    checked('reference_selection_and_reader_menus_show_in_window_progress_for_exact_selected_PDFs')
     checked('every_published_PDF_update_reloads_the_existing_reader_and_live_annotation_sidebar')
     checked('repeated_live_refresh_preserves_reading_page_zoom_and_unrelated_PDF_bytes')
 

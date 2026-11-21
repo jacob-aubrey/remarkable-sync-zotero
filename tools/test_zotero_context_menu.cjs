@@ -4,24 +4,13 @@ const {join} = require('node:path');
 const vm = require('node:vm');
 
 async function test() {
-  const registrations = [], removed = [], calls = [], prompts = [], updates = [], popupOptions = [], readerHooks = new Map();
+  const registrations = [], removed = [], calls = [], prompts = [], updates = [], readerHooks = new Map(), timers = new Map();
   let confirm = true;
-  const scope = {setTimeout, Zotero: {
+  const scope = {setTimeout: (callback, delay) => { const token = Symbol(); timers.set(token, {callback, delay}); return token; },
+    clearTimeout: token => timers.delete(token), Zotero: {
     Libraries: {userLibraryID: 1},
     MenuManager: {registerMenu: data => registrations.push(data), unregisterMenu: id => removed.push(id)},
     Reader: {registerEventListener(type, listener) { readerHooks.set(type, listener); }, unregisterEventListener(type) { readerHooks.delete(type); }},
-    ProgressWindow: class {
-      constructor(options) { popupOptions.push(options); }
-      ItemProgress = class {
-        constructor(_type, text) { updates.push(text); }
-        setText(text) { updates.push(text); }
-        setProgress(value) { updates.push(value); }
-        setError() { updates.push('error'); }
-      };
-      changeHeadline() {}
-      show() { updates.push('shown'); }
-      startCloseTimer() {}
-    },
     logError: error => { throw error; },
   }, Services: {prompt: {alert: assert.fail, confirm(window, title, message) { prompts.push({title, message}); return confirm; }}},
   notableReviewItemInTrash: item => !!(item.deleted || item.parentItem?.deleted)};
@@ -29,6 +18,23 @@ async function test() {
     vm.runInNewContext(readFileSync(join(__dirname, '../zotero-support', file), 'utf8'), scope);
   }
   const menu = scope.NotableContextMenu, notebook = scope.NotableNotebook;
+  function windowFixture() {
+    function element(tag) {
+      return {children: [], style: {}, attributes: {},
+        setAttribute(key, value) { this.attributes[key] = value; },
+        set textContent(value) { this.text = value; if (tag === 'div') updates.push(value); },
+        set value(value) { this.progress = value; updates.push(value); },
+        append(...children) {
+          for (const child of children) { child.parent = this; child.isConnected = true; }
+          this.children.push(...children);
+          if (tag === 'window') updates.push('shown');
+        },
+        remove() { this.parent.children = this.parent.children.filter(child => child !== this); this.isConnected = false; },
+      };
+    }
+    return {document: {documentElement: element('window'), createElementNS: (_namespace, tag) => element(tag)},
+      addEventListener() {}, removeEventListener() {}};
+  }
   const ui = {id: 'plugin', shortName: 'reMarkable Sync', latest: {config: {tablet_root: 'root'}, links: []},
     open: () => calls.push(['open']), openSetup() {}, openContextTab: tab => calls.push(['tab', tab]),
     paperSearchState() { return this.search ||= {}; }, canSync: () => true, canCheckDuringSync: () => false,
@@ -56,7 +62,7 @@ async function test() {
   assert.equal(itemMenu.menuType, 'submenu');
   assert.equal(collectionMenu.menuType, 'submenu');
   function context(items = []) {
-    return {items, menuElem: {ownerGlobal: {}, setAttribute(key, value) { this[key] = value; }},
+    return {items, menuElem: {ownerGlobal: windowFixture(), setAttribute(key, value) { this[key] = value; }},
       setVisible(value) { this.visible = value; }, setEnabled(value) { this.enabled = value; }};
   }
   const visible = items => itemMenu.menus.filter(command => {
@@ -103,21 +109,28 @@ async function test() {
   const beforeSyncPrompts = prompts.length;
   const selectedContext = context([a, b, aPDF]);
   const pending = find('Sync selected papers now').onCommand(null, selectedContext);
-  assert.equal(popupOptions.length, 0, 'Let the native menu dismiss before opening the progress window');
+  const [panel] = selectedContext.menuElem.ownerGlobal.document.documentElement.children;
+  assert.equal(panel.id, 'notable-selected-sync-progress', 'Show selected progress inside the library immediately');
+  assert.equal(panel.style.pointerEvents, 'none');
+  assert.equal(menu.canSyncSelection(ui), false, 'A duplicate command cannot replace an active notice');
   await pending;
-  assert.equal(popupOptions[0].window, selectedContext.menuElem.ownerGlobal);
-  assert.equal(popupOptions[0].closeOnClick, false, 'A menu click cannot dismiss an active sync popup');
+  assert.equal(panel.children[2].progress, 100);
+  const [completion] = timers.values();
+  assert.equal(completion.delay, 6000, 'Keep the result visible when the worker finishes');
+  completion.callback();
+  assert.equal(panel.isConnected, false);
   assert.equal(calls.at(-1)[0], 'sync_selected');
   assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a', 'cloud-b']);
   assert.equal(prompts.length, beforeSyncPrompts, 'Ordinary selected sync does not need a destructive-action confirmation');
   scope.Zotero.Items = {get: () => aPDF};
   const readerMenus = [];
-  const readerWindow = {};
+  const readerWindow = windowFixture();
   readerHooks.get('createViewContextMenu')({reader: {itemID: aPDF.id, _window: readerWindow}, params: {}, append: menu => readerMenus.push(menu)});
   assert.equal(readerMenus[0].label, 'reMarkable Sync');
   assert.equal(readerMenus[0].groups[0][0].label, 'Sync this PDF now');
   await readerMenus[0].groups[0][0].onCommand();
-  assert.equal(popupOptions.at(-1).window, readerWindow, 'The popup follows the window that owns the PDF reader');
+  const [readerPanel] = readerWindow.document.documentElement.children;
+  assert.equal(readerPanel.id, 'notable-selected-sync-progress', 'Place progress inside the window that owns the PDF reader');
   assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a']);
   ui.busy = true;
   ui.inboxChecking = true;
@@ -137,13 +150,15 @@ async function test() {
   await folderCommand.onCommand(null, selectedFolders);
   assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a', 'cloud-b']);
   readerMenus.length = 0;
-  readerHooks.get('createViewContextMenu')({reader: {itemID: aPDF.id, _window: {}}, params: {}, append: menu => readerMenus.push(menu)});
+  readerHooks.get('createViewContextMenu')({reader: {itemID: aPDF.id, _window: readerWindow}, params: {}, append: menu => readerMenus.push(menu)});
   assert.equal(readerMenus[0].groups[0][0].disabled, false);
   updates.length = 0;
   await readerMenus[0].groups[0][0].onCommand();
   assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a']);
   assert.deepEqual(updates, ['Waiting for the Inbox check before syncing 1 selected PDF…', 'shown',
-    'Syncing 1 selected PDF…', 'Publishing a paper to Zotero…', 50, 'Selected sync complete.', 100]);
+    'Syncing 1 selected PDF…', 'Publishing a paper to Zotero…', 50, 100, 'Selected sync complete.']);
+  assert.equal(readerPanel.isConnected, false, 'A second sync replaces the previous result');
+  assert.equal(readerWindow.document.documentElement.children.length, 1);
   ui.inboxChecking = false;
   const count = calls.length;
   await find('Pause paper link (keep both copies)').onCommand(null, context([a]));
@@ -152,6 +167,7 @@ async function test() {
   await find('Pause paper link (keep both copies)').onCommand(null, context([a]));
   assert.equal(calls.length, count, 'A removed link must not run a stale menu command');
   menu.unregister();
+  assert.equal(timers.size, 0, 'Unloading removes scheduled notices from all windows');
   assert.equal(readerHooks.size, 0);
   assert.deepEqual(removed, [...menu.menuIDs]);
   console.log('Context menus: selection scope, exact PDF links, batches, Trash, groups, busy state, and cleanup passed.');
