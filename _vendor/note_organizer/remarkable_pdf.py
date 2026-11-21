@@ -14,7 +14,7 @@ from .remarkable_cloud import trace_event
 from .remarkable_marks import TextMark, group_text_highlights, handwriting_regions, zotero_card_key
 
 
-RENDER_REVISION = 12
+RENDER_REVISION = 13
 BARE_PDF_RENDER_REVISION = 10
 
 
@@ -178,7 +178,8 @@ def _stroke_width(item, scale):
     width = sum(p.width for p in item.points) / len(item.points)
     if Pen.is_highlighter(item.tool):
         return max(10, min(width * 2, 40)) * scale
-    return max(.5, min(width * .8, 5)) * scale
+    # rmscene stores widths in quarter canvas units. PDF ink has one width per stroke.
+    return (width / 4 if width else .5) * scale
 
 
 def _freehand_highlight(item, identity, point, scale):
@@ -353,11 +354,12 @@ def apply_scene(document, page, page_id, tree, *, expand_margins=True,
                 padding = max(2, rect.height / 4)
                 extent |= fitz.Rect(rect.x0 - padding, rect.y0 - padding,
                                     rect.x1 + padding, rect.y1 + padding)
-        elif isinstance(item, Line):
+        elif isinstance(item, Line) and item.points:
+            padding = max(8, _stroke_width(item, scale) / 2)
             for pen_point in item.points:
                 position = point(pen_point.x, pen_point.y)
-                # Include the stroke's appearance, rather than only its centerline.
-                extent |= fitz.Rect(position.x - 8, position.y - 8, position.x + 8, position.y + 8)
+                extent |= fitz.Rect(position.x - padding, position.y - padding,
+                                    position.x + padding, position.y + padding)
     if text:
         anchor = point(tree.root_text.pos_x, tree.root_text.pos_y)
         extent |= fitz.Rect(anchor.x, anchor.y, anchor.x + 20, anchor.y + 20)

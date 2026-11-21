@@ -32,6 +32,44 @@ def line_mark(page, identity, line, start=None, stroke=(1, .84, 0), *, block=0, 
 
 
 class AnnotationCardsTests(unittest.TestCase):
+    def test_pdf_ink_preserves_drawing_widths_on_both_coordinate_grids(self):
+        for paper_size, scale in (((1404, 1872), .3177), ((1620, 2160), .3144)):
+            with self.subTest(paper_size=paper_size):
+                item, bundle = fixture(paper_size=paper_size)
+                layer = next(name for name in bundle if name.endswith('.rm'))
+                blocks = [block for block in read_blocks(BytesIO(bundle[layer]))
+                          if not isinstance(block, SceneLineItemBlock)]
+                previous = CrdtId(1, 100)
+                for index, width in enumerate((8, 16, 24)):
+                    y = 500 + index * 100
+                    line = Line(PenColor.BLACK, Pen.FINELINER_2,
+                                [Point(x, y, 0, 0, width, 90) for x in (100, 300)], 2, 0)
+                    identity = CrdtId(1, 101 + index)
+                    blocks.append(SceneLineItemBlock(CrdtId(0, 11),
+                                  CrdtSequenceItem(identity, previous, CrdtId(0, 0), 0, line)))
+                    previous = identity
+
+                stream = BytesIO()
+                write_blocks(stream, blocks, options={'version': '3.3'})
+                bundle[layer] = stream.getvalue()
+
+                with fitz.open(stream=annotated_pdf(item, bundle), filetype='pdf') as pdf:
+                    page = pdf[0]
+                    ink = sorted(page.annots(types=[fitz.PDF_ANNOT_INK]),
+                                 key=lambda mark: mark.vertices[0][0][1])
+                    self.assertEqual(len(ink), 3)
+                    coverage = []
+                    for mark, width in zip(ink, (2, 4, 6)):
+                        self.assertAlmostEqual(mark.border['width'], width * scale, places=5)
+                        (x0, y), (x1, _) = mark.vertices[0]
+                        x = (x0 + x1) / 2
+                        pixmap = page.get_pixmap(matrix=fitz.Matrix(8, 8), colorspace=fitz.csGRAY,
+                                                 clip=fitz.Rect(x - 1, y - 4, x + 1, y + 4))
+                        coverage.append(sum(255 - value for value in pixmap.samples))
+                    self.assertGreater(coverage[0], 0)
+                    self.assertLess(coverage[0], coverage[1])
+                    self.assertLess(coverage[1], coverage[2])
+
     def test_wrapped_text_groups_across_tablet_crlf_gaps_and_ragged_line_ends(self):
         with fitz.open() as doc:
             page = doc.new_page(width=600, height=800)
