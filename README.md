@@ -29,7 +29,9 @@ Right-click a tag in Zotero’s tag selector, a reference’s Tags pane, the rea
 
 Choose **Sync selected papers now** to update the linked PDFs for the selected references. A PDF selection offers **Sync this PDF now** or **Sync selected PDFs now** for those exact attachment links. Collections offer **Sync collection and subcollection papers now**. These actions preserve the global pause setting and leave unrelated filing, deletion, tag-edit, and folder-sync work pending. Papers that need linking or approval still go through Inbox.
 
-In an open linked PDF, right-click and choose **reMarkable Sync → Sync this PDF now**. Every sync refreshes an updated linked PDF in its existing reader, including its annotation sidebar, while retaining the reading page and zoom. New tablet notes appear once the tablet has uploaded them to reMarkable Cloud and the plugin receives them. The workspace’s **Sync now** command still checks the whole connection.
+In an open linked PDF, right-click and choose **reMarkable Sync → Sync this PDF now**. Selected syncs show progress in Zotero’s bottom-right popup. Every sync refreshes an updated linked PDF in its existing reader, including its annotation sidebar, while retaining the reading page and zoom. New tablet notes appear once the tablet has uploaded them to reMarkable Cloud and the plugin receives them.
+
+The workspace’s **Sync now** button checks the whole connection and changes to **Pause sync** during the check. Once the check pauses safely, choose **Resume sync** to check again. If automatic sync is on, the next scheduled check starts on its own, normally after 30 minutes. Right-click sync keeps the workspace button’s current label.
 
 Existing papers receive the same passage grouping as new papers: consecutive highlighted text of one color becomes one annotation. Handwriting regions include contained words and use more forgiving spacing. Annotation tags, saved note content, and old source links are preserved during regrouping, and stale image thumbnails are rebuilt before the sync is recorded as complete.
 
@@ -70,7 +72,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.30.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.42.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

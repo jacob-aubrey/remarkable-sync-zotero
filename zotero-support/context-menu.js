@@ -58,11 +58,15 @@ var NotableContextMenu = {
     }};
   },
   async syncTargets(ui, window, links) {
+    // Let Zotero dismiss the native menu before opening another window.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    if (ui.stopped) return;
     if (!this.canSyncSelection(ui)) throw Error('Wait for the current operation to finish before syncing these PDFs.');
     const targets = [...new Map(links.map(link => [link.cloud, Object.fromEntries(
       ['cloud', 'parent', 'source_key', 'view_key'].map(key => [key, link[key] || '']))])).values()];
     if (!targets.length) throw Error('Choose a linked paper or PDF to sync.');
-    const progress = new Zotero.ProgressWindow({window});
+    const owner = window?.closed ? Zotero.getMainWindow() : window;
+    const progress = new Zotero.ProgressWindow({window: owner, closeOnClick: false});
     progress.changeHeadline('reMarkable Sync');
     const selection = `${targets.length} selected ${targets.length === 1 ? 'PDF' : 'PDFs'}`;
     const line = new progress.ItemProgress('attachmentPDF',

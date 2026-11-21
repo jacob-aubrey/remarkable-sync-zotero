@@ -4,13 +4,14 @@ const {join} = require('node:path');
 const vm = require('node:vm');
 
 async function test() {
-  const registrations = [], removed = [], calls = [], prompts = [], updates = [], readerHooks = new Map();
+  const registrations = [], removed = [], calls = [], prompts = [], updates = [], popupOptions = [], readerHooks = new Map();
   let confirm = true;
-  const scope = {Zotero: {
+  const scope = {setTimeout, Zotero: {
     Libraries: {userLibraryID: 1},
     MenuManager: {registerMenu: data => registrations.push(data), unregisterMenu: id => removed.push(id)},
     Reader: {registerEventListener(type, listener) { readerHooks.set(type, listener); }, unregisterEventListener(type) { readerHooks.delete(type); }},
     ProgressWindow: class {
+      constructor(options) { popupOptions.push(options); }
       ItemProgress = class {
         constructor(_type, text) { updates.push(text); }
         setText(text) { updates.push(text); }
@@ -100,16 +101,23 @@ async function test() {
   assert.equal(calls.at(-1)[0], 'link');
   assert.equal(calls.at(-1)[1].identity, 'cloud-a');
   const beforeSyncPrompts = prompts.length;
-  await find('Sync selected papers now').onCommand(null, context([a, b, aPDF]));
+  const selectedContext = context([a, b, aPDF]);
+  const pending = find('Sync selected papers now').onCommand(null, selectedContext);
+  assert.equal(popupOptions.length, 0, 'Let the native menu dismiss before opening the progress window');
+  await pending;
+  assert.equal(popupOptions[0].window, selectedContext.menuElem.ownerGlobal);
+  assert.equal(popupOptions[0].closeOnClick, false, 'A menu click cannot dismiss an active sync popup');
   assert.equal(calls.at(-1)[0], 'sync_selected');
   assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a', 'cloud-b']);
   assert.equal(prompts.length, beforeSyncPrompts, 'Ordinary selected sync does not need a destructive-action confirmation');
   scope.Zotero.Items = {get: () => aPDF};
   const readerMenus = [];
-  readerHooks.get('createViewContextMenu')({reader: {itemID: aPDF.id, _window: {}}, params: {}, append: menu => readerMenus.push(menu)});
+  const readerWindow = {};
+  readerHooks.get('createViewContextMenu')({reader: {itemID: aPDF.id, _window: readerWindow}, params: {}, append: menu => readerMenus.push(menu)});
   assert.equal(readerMenus[0].label, 'reMarkable Sync');
   assert.equal(readerMenus[0].groups[0][0].label, 'Sync this PDF now');
   await readerMenus[0].groups[0][0].onCommand();
+  assert.equal(popupOptions.at(-1).window, readerWindow, 'The popup follows the window that owns the PDF reader');
   assert.deepEqual(Array.from(calls.at(-1)[1].targets, target => target.cloud), ['cloud-a']);
   ui.busy = true;
   ui.inboxChecking = true;

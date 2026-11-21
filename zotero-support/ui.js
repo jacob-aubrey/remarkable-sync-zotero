@@ -491,6 +491,7 @@ var NotableUI = {
     const sameConnection = current?.config?.connection_id === result.config?.connection_id
       && current?.config?.zotero_root === result.config?.zotero_root
       && current?.config?.tablet_root === result.config?.tablet_root;
+    if (!sameConnection) this.syncPausedForCycle = false;
     if (sameConnection && (current?.review_revision ?? -1) > (result.review_revision ?? -1)) {
       Object.assign(result, this.reviewSnapshot(current));
     } else if (sameConnection && result.reviews) {
@@ -781,6 +782,8 @@ var NotableUI = {
       const job = this.operation;
       job.updated = Date.now();
       if (message !== 'Still working...') {
+        job.receivedProgress = true;
+        if (job.pauseRequested && !job.cancelSent) this.cancelSyncForPause(job);
         job.detail = message;
         // Use the tablet sweep's count across all steps for the same paper.
         const count = /^(Syncing linked paper|Checking new tablet paper|Received tablet PDF) (\d+) of (\d+)(?=[:…])/.exec(message);
@@ -851,7 +854,7 @@ var NotableUI = {
     const mode = job?.yielding ? 'Finishing the current paper before filing…'
       : this.pausing || job?.stopping ? 'Stopping sync…'
       : job?.scoped ? 'Syncing selected PDFs with reMarkable…' : job ? 'Syncing with reMarkable…'
-      : config.sync_paused ? 'Sync paused'
+      : config.sync_paused || this.syncPausedForCycle ? 'Sync paused'
       : this.syncFailure && config.automatic ? 'Sync waiting to retry'
       : this.syncFailure || this.latest?.status?.state === 'needs_attention' ? 'Sync needs attention'
       : this.syncReviewAvailable() ? 'Sync needs review'
@@ -992,14 +995,47 @@ var NotableUI = {
     // not change automatic-sync settings or start another sync afterwards.
     operation.stopping = true; operation.yielding = true;
     this.updateActivity(); this.badge();
-    this.recordTransport('cancel_requested', {helper_id: this.processTrace(this.process).id, reason: 'filing_priority'});
-    try { await this.process.stdin.write(JSON.stringify({method: 'cancel'}) + '\n'); }
+    try { await this.requestSyncCancel('filing_priority'); }
     catch (error) { this.message(error.message, true); }
+  },
+  requestSyncCancel(reason) {
+    const process = this.process;
+    this.recordTransport('cancel_requested', {helper_id: this.processTrace(process).id, reason});
+    return process.stdin.write(JSON.stringify({method: 'cancel'}) + '\n');
   },
   canSync() { return !!this.latest?.config?.tablet_root && !this.changingFolder && !this.setupDirty
     && !this.disconnectPreview && !this.pausing && !this.drainingSyncDecisions; },
+  syncControlLabel() {
+    const job = this.operation;
+    if (this.pausing) return 'Stopping…';
+    if (job?.method === 'sync' && !job.scoped) return job.stopping ? 'Stopping…' : 'Pause sync';
+    return this.syncPausedForCycle ? 'Resume sync' : 'Sync now';
+  },
+  toggleSync() {
+    const label = this.syncControlLabel();
+    if (label === 'Stopping…') return;
+    if (label !== 'Pause sync') return this.action('sync');
+    const job = this.operation;
+    job.stopping = true;
+    job.pauseRequested = true;
+    this.updateActivity(); this.badge();
+    if (job.receivedProgress) return this.cancelSyncForPause(job);
+  },
+  async cancelSyncForPause(job) {
+    // The helper clears its stop flag at startup. Wait for progress from
+    // this check before sending the existing safe-stop command.
+    job.cancelSent = true;
+    try {
+      await this.requestSyncCancel('sync_pause');
+    } catch (error) {
+      if (this.operation !== job) return;
+      job.stopping = job.pauseRequested = false;
+      this.message(error.message, true); this.badge();
+    }
+  },
   async pauseSync() {
     if (this.pausing) return;
+    this.syncPausedForCycle = false;
     this.pausing = true; clearTimeout(this.timer); this.timer = null;
     this.cancelAfterSync('Sync was paused. Review the item and choose the action again.', true);
     this.filingQueuePaused = true;
@@ -1149,7 +1185,10 @@ var NotableUI = {
     }
     clearTimeout(this.timer);
     this.timer = null;
-    if (syncing && !scopedSync) this.syncDue = null;
+    if (syncing && !scopedSync) {
+      this.syncDue = null;
+      this.syncPausedForCycle = false;
+    }
     this.busy = true;
     const reviewChangeSerial = this.reviewChangeSerial || 0;
     const checkingInbox = method === 'check_inbox';
@@ -1182,6 +1221,7 @@ var NotableUI = {
       const result = checkingInbox ? await this.refreshInbox()
         : await this.rpc(method, method === 'sync' && (this.helperLaunch || this.launching) ? {...params, monitor_inbox: false} : params);
       this.adoptStatus(result.reviews ? result : await this.rpc('status'), syncing);
+      if (this.operation.pauseRequested && result.status?.state === 'paused') this.syncPausedForCycle = true;
       if (result.intake_attachment) {
         const {reference, key} = result.intake_attachment;
         if (this.inboxReferenceSelection?.id === reference) this.inboxReferenceSelection.attachment = key;
@@ -1240,6 +1280,7 @@ var NotableUI = {
         return;
       }
       if (syncing) {
+        if (!scopedSync) this.syncPausedForCycle = false;
         this.failures = (this.failures || 0) + 1;
         this.syncFailure = error.message;
         this.cancelAfterSync('Sync stopped before the current state could be checked. Review the item and choose the action again.', true);
@@ -1640,7 +1681,7 @@ var NotableUI = {
     const syncing = value && this.operation?.method === 'sync' && !this.pausing;
     if (this.view && !this.view.closed) for (const button of this.view.document.querySelectorAll('button')) {
       if (button.closest?.('.sync-decision-dialog')) continue;
-      if (button.id === 'notable-pause') { button.disabled = !!this.pausing; continue; }
+      if (button.id === 'notable-sync' || button.id === 'notable-stop') continue;
       if (button.dataset.browse === 'true') { button.disabled = false; continue; }
       if (button.dataset.queue === 'true') {
         button.disabled = !!this.pausing || button.dataset.invalid === 'true'
@@ -1648,9 +1689,9 @@ var NotableUI = {
         if (button.dataset.approve === 'true') button.querySelector('.button-label').textContent = value ? 'Add to filing queue' : button.dataset.idleLabel || 'Approve & file';
         continue;
       }
-      button.disabled = (this.acquiringPDF && (button.dataset.pdfAcquisition === 'true' || button.id === 'notable-sync'))
-        || (value && (!syncing || button.dataset.exclusive === 'true' || button.id === 'notable-sync'))
-        || !!this.pausing || button.dataset.invalid === 'true' || (button.id === 'notable-sync' && !this.canSync());
+      button.disabled = (this.acquiringPDF && button.dataset.pdfAcquisition === 'true')
+        || (value && (!syncing || button.dataset.exclusive === 'true'))
+        || !!this.pausing || button.dataset.invalid === 'true';
     }
     if (this.view && !this.view.closed) for (const field of this.view.document.querySelectorAll('input, select, textarea')) {
       if (field.closest?.('.sync-decision-dialog')) continue;
@@ -1728,8 +1769,19 @@ var NotableUI = {
     panel.hidden = !visibleBusy;
     const message = doc.getElementById('message'); if (message) message.hidden = visibleBusy;
     doc.getElementById('app').setAttribute('aria-busy', String(visibleBusy));
-    const stop = doc.getElementById('notable-pause');
-    if (stop) stop.querySelector('.button-label').textContent = this.pausing ? 'Stopping…' : visibleBusy ? 'Stop' : 'Pause sync';
+    const control = doc.getElementById('notable-sync');
+    if (control) {
+      const label = this.syncControlLabel();
+      const caption = control.querySelector('.button-label');
+      if (caption.textContent !== label) {
+        caption.textContent = label;
+        this.setButtonHelp(control, this.buttonHelp(label));
+      }
+      control.disabled = label === 'Stopping…' || (label !== 'Pause sync'
+        && (this.busy || this.acquiringPDF || !this.canSync()));
+    }
+    const stop = doc.getElementById('notable-stop');
+    if (stop) stop.disabled = !!this.pausing || !!job?.stopping;
     if (!job || !visibleBusy) return;
     const seconds = Math.floor((Date.now() - job.started) / 1000);
     const title = job.yielding ? 'Finishing the current paper so filing can continue…' : job.stopping ? 'Stopping the current check…' : job.title;
@@ -1794,7 +1846,8 @@ var NotableUI = {
     parent?.appendChild(node); return node;
   },
   buttonIcons: {
-    'Sync now': 'refresh-cw', 'Stop': 'x', 'Import library': 'folder-input',
+    'Sync now': 'refresh-cw', 'Resume sync': 'refresh-cw', 'Stopping…': 'refresh-cw',
+    'Stop': 'x', 'Import library': 'folder-input',
     'Review': 'file-search', 'Inbox': 'folder-input', 'Library Issues': 'file-search', 'Sync Conflicts': 'sync-conflict', 'Tags': 'tag', 'Linked papers': 'link', 'Setup': 'settings',
     'Combine current tags and retry': 'refresh-cw', 'Remove tags from that unavailable page': 'trash-2',
     'Add tag': 'tag', 'Save tags': 'save', 'Close page editor': 'x',
@@ -1811,7 +1864,7 @@ var NotableUI = {
     'Browse all papers': 'file-search', 'Show only papers needing attention': 'file-search',
     'Find papers': 'search', 'Find keywords and suggest tags': 'tag', 'Add keywords and selected tags': 'save',
     'Change folder': 'folder-open', 'Disconnect folder': 'unlink', 'Confirm disconnect': 'unlink',
-    'Cancel change': 'x', 'Cancel': 'x', 'Pause sync': 'x'
+    'Cancel change': 'x', 'Cancel': 'x', 'Pause sync': 'refresh-cw'
   },
   buttonHelp(text, itemSelection = false) {
     if (itemSelection) return 'Select this item to inspect its details. Selection does not approve, merge, or transfer it.';
@@ -1832,7 +1885,10 @@ var NotableUI = {
       'Tags': 'Find and edit paper or page tags.', 'Import library': 'Preview a Windows library before importing selected papers.',
       'Setup': 'Configure the connected folders, local processing, and account connections.',
       'Sync now': 'Check both devices and transfer approved papers and notes. This can change both libraries.',
-      'Pause sync': 'Stop after the current safe step and pause automatic syncing. Completed work is retained.',
+      'Pause sync': 'Stop the current check safely. The next scheduled check can still run if automatic sync is on.',
+      'Resume sync': 'Check both devices now. Completed sync work is retained.',
+      'Stopping…': 'Waiting for the current sync check to stop safely.',
+      'Stop': 'Stop after the current safe step and pause automatic syncing. Completed work is retained.',
       'Recheck Zotero': 'Reread local Zotero items and files without syncing or applying queued filings.',
       'Check Inbox': 'Look for new papers and PDFs, and refresh existing Inbox reviews. This check runs on your computer.',
       'Check my Zotero library': 'Search your Zotero library for another reference with the same DOI or title. View its attachments and collections before deciding what to do.',
@@ -2313,9 +2369,8 @@ var NotableUI = {
     const root = this.view.document.getElementById('app'); root.replaceChildren();
     const head = this.el('header', '', root); const title = this.el('div', '', head);
     this.el('h1', this.shortName, title); this.el('p', 'Sync papers, handwriting, and tags with Zotero.', title);
-    const sync = this.button('Sync now', head, () => this.action('sync'), true);
-    sync.id = 'notable-sync'; sync.disabled = this.busy || !this.canSync();
-    const pause = this.button('Pause sync', head, () => this.pauseSync()); pause.id = 'notable-pause'; pause.disabled = !!this.pausing;
+    const sync = this.button(this.syncControlLabel(), head, () => this.toggleSync(), true);
+    sync.id = 'notable-sync';
     const nav = this.el('nav', '', root, {'aria-label': this.shortName + ' sections'});
     for (const [tab, label] of [['inbox', 'Inbox'], ['library', 'Library Issues'], ['sync-review', 'Sync Conflicts'], ['links', 'Linked papers'], ['tags', 'Tags'], ['import', 'Import library'], ['setup', 'Setup']]) {
       const count = ['inbox', 'library', 'sync-review'].includes(tab) ? this.queueRows(tab).length
@@ -2347,6 +2402,7 @@ var NotableUI = {
     this.el('p', '', announcement, {id: 'activity-detail', tabindex: '0'});
     this.el('progress', '', announcement, {id: 'activity-progress', 'aria-label': 'Current step progress'});
     this.el('small', '', info, {id: 'activity-time', 'aria-live': 'off', tabindex: '0'});
+    this.button('Stop', activity, () => this.pauseSync()).id = 'notable-stop';
     this.renderFilingQueue(root);
     this.el('p', '', root, {id: 'notable-after-sync', class: 'hint', role: 'status'});
     this.el('p', '', root, {id: 'notable-keyword-activity', class: 'hint', role: 'status'});

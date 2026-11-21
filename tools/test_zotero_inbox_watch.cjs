@@ -55,11 +55,12 @@ async function main() {
   assert.equal(ui.zoteroInboxDirty, false, 'A settled follow-up ends fast discovery');
   const panel = {}, message = {}, attrs = {}, label = {}, syncStatus = {}, syncDetails = {}, syncStep = {};
   const syncProgress = {hidden: false, setAttribute(key, value) {this[key] = value;}, removeAttribute(key) {delete this[key];}};
+  const syncButton = {dataset: {}, setAttribute() {}, querySelector: () => label};
   ui.view.document = {querySelectorAll, getElementById: id => ({activity: panel, message,
     'notable-sync-status': syncStatus, 'notable-sync-details': syncDetails, 'notable-sync-step': syncStep,
     'notable-sync-progress': syncProgress,
     app: {setAttribute: (key, value) => {attrs[key] = value;}},
-    'notable-pause': {querySelector: () => label}}[id])};
+    'notable-sync': syncButton}[id])};
   let finish;
   ui.rpc = () => new Promise(resolve => {finish = resolve;});
   now += 15000;
@@ -75,14 +76,16 @@ async function main() {
   assert.equal(panel.hidden, true, 'Background polling must never show the loading panel');
   assert.equal(message.hidden, false, 'Ready status must remain visible');
   assert.equal(attrs['aria-busy'], 'false');
-  assert.equal(label.textContent, 'Pause sync');
+  assert.equal(label.textContent, 'Sync now');
+  assert.equal(syncButton.disabled, true, 'The sync control waits for the Inbox check to finish');
   const beforeUnchangedCheck = renders;
   finish(ui.latest); await check;
   assert.equal(renders, beforeUnchangedCheck, 'An unchanged scan keeps the active form');
   assert.ok(referenceActions.every(button => !button.disabled), 'The existing PDF and Dismiss buttons are re-enabled');
   ui.busy = true; ui.updateActivity();
   assert.equal(panel.hidden, false, 'User operations retain the loading panel');
-  assert.equal(label.textContent, 'Stop');
+  assert.equal(label.textContent, 'Sync now');
+  assert.equal(syncButton.disabled, true, 'The sync control stays unavailable during other work');
   assert.equal(attrs['aria-busy'], 'true');
   ui.busy = false; ui.updateActivity();
   assert.equal(panel.hidden, true);
@@ -92,6 +95,7 @@ async function main() {
   assert.equal(message.hidden, false);
   assert.equal(attrs['aria-busy'], 'false', 'Background sync does not mark the workspace inaccessible');
   assert.equal(label.textContent, 'Pause sync');
+  assert.equal(syncButton.disabled, false);
   assert.equal(syncDetails.hidden, false);
   assert.equal(syncStatus.textContent, 'Syncing with reMarkable…');
   assert.equal(syncProgress.hidden, false, 'The progress bar is visible from the start');

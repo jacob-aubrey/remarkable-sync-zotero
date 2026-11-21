@@ -100,6 +100,12 @@ async function startup({rootURI}) {
               };
               ui.action = async (method, params) => {
                 if (method !== 'sync_selected') throw Error('A context sync invoked a whole-library action');
+                const selected = params.targets.length;
+                const message = `Syncing ${selected} selected ${selected === 1 ? 'PDF' : 'PDFs'}…`;
+                await wait(() => [...Services.wm.getEnumerator(null)].some(popup =>
+                  popup.opener === win && popup.location.href === 'chrome://zotero/content/progressWindow.xhtml'
+                  && popup.document.getElementById('zotero-progress-text-box')?.textContent.includes(message)),
+                  'The native progress popup did not appear for ' + selected + ' selected PDFs');
                 requests.push(params);
                 return {...ui.latest, status: {state: 'ready', message: 'Selected PDFs synced.'}};
               };
@@ -1196,6 +1202,8 @@ async function startup({rootURI}) {
             const settle = () => Zotero.Promise.delay(100);
             try {
               ui.latest = command.snapshot; ui.tab = 'import'; ui.showAllReviews = false; ui.render();
+              const syncButton = () => ui.view.document.getElementById('notable-sync');
+              ensure(syncButton().textContent === 'Sync now' && !syncButton().disabled, 'Full-sync button did not start idle');
               ui.schedule(); ensure(!!ui.timer && ui.automaticAllowed(), 'Open workspace suppressed automatic sync');
               ui.rpc = async method => { requests.push(method); if (method === 'scan_library') return gate; if (method === 'status') return command.snapshot; throw new Error('Unexpected request: ' + method); };
               Zotero.launchFile = file => { launches.push(file.path); };
@@ -1203,6 +1211,7 @@ async function startup({rootURI}) {
               ui.message('Scanning file 12 of 537: Example paper.pdf'); ui.operation.started -= 65000; ui.updateActivity();
               const doc = ui.view.document;
               ensure(!doc.getElementById('activity').hidden, 'No working indicator');
+              ensure(!doc.getElementById('notable-stop').disabled && syncButton().disabled, 'Other work lost its Stop control');
               ensure(doc.getElementById('activity-progress').value === 12 && doc.getElementById('activity-progress').max === 537, 'Progress count missing');
               ensure(doc.getElementById('activity-time').textContent.includes('1 min'), 'Elapsed time missing');
               ensure([...doc.querySelectorAll('nav button')].every(b => !b.disabled), 'Navigation locked during scan');
@@ -1219,6 +1228,7 @@ async function startup({rootURI}) {
               const syncing = new Promise(resolve => { release = resolve; });
               ui.rpc = async method => { ensure(method === 'sync', 'Unexpected request: ' + method); return syncing; };
               job = ui.action('sync', {automatic: true}, false); await settle();
+              ensure(syncButton().textContent === 'Pause sync' && !syncButton().disabled, 'Running sync did not expose Pause sync');
               ensure(doc.getElementById('activity').hidden, 'Sync displayed the spinner panel');
               const details = doc.getElementById('notable-sync-details');
               ensure(!details.hidden && !details.open, 'Sync details expanded automatically');
@@ -1230,6 +1240,7 @@ async function startup({rootURI}) {
               ensure(ui.busy && ui.tab === 'links' && filter, 'Sync blocked local navigation or filtering');
               release(command.snapshot); await job; job = null;
               ensure(doc.getElementById('notable-sync-details').hidden && !ui.busy, 'Sync status remained active after completion');
+              ensure(syncButton().textContent === 'Sync now' && !syncButton().disabled, 'Full-sync button did not return to idle');
               response.passed = ['automatic checks can run with workspace open', 'navigation stays available during work',
                 'visible scan progress and elapsed time', 'local paper opens without approval or import',
                 'routine papers can be browsed', 'sync details stay collapsed until requested', 'local filtering stays available during sync'];
