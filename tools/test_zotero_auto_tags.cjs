@@ -23,7 +23,8 @@ ui.filingConnection = () => 'saved-connection';
 ui.latest = {config: {}, reviews: [{id: 'review', digest: 'sha1', status: 'pending', payload: {path: 'paper.pdf'}}]};
 ui.view = {closed: false};
 const scope = {identity: 'review'};
-const proposal = {target: 'review:review', token: 'proposal-token', keywords: [{tag: 'Keywords', source: 'Paper'}],
+const proposal = {target: 'review:review', token: 'proposal-token', tags: [{tag: 'Already filed'}],
+  keywords: [{tag: 'Keywords', source: 'Paper'}, {tag: 'Already Filed', source: 'Paper'}],
   suggestions: [{tag: 'Topic', source: 'YAKE', evidence: 'Topic'}], selected: [], notice: 'Local only'};
 const root = node('root');
 const buttons = () => root.all().filter(item => item.tag === 'button');
@@ -39,7 +40,7 @@ async function main() {
       kind: 'paper', values: savedTags || [], tagKey: ui.filingTagKey,
       onChange(tags) { savedTags = tags; savedDefaults = [...defaults]; changes++; }
     });
-    ui.paperTagPanel(root, scope, {editor, defaults});
+    ui.paperTagPanel(root, scope, {editor, defaults, inboxFiling: true});
     return editor;
   }
   let editor = mountFilingTags();
@@ -50,15 +51,25 @@ async function main() {
   assert.equal(calls.length, 1); assert.equal(calls[0][0], 'suggest_paper_tags'); assert.equal(calls[0][1].quiet, true);
   assert.equal(ui.busy, false, 'Automatic suggestions never activate global progress');
   assert.equal(timers.size, 0, 'A completed analysis does not poll or rerender repeatedly');
-  const box = tag => root.all().find(item => item.tag === 'checkbox' && item.textContent === tag);
-  assert.equal(box('Keywords').checked, true);
-  assert.equal(box('Topic').checked, false);
-  assert.deepEqual([...editor.tags], ['Keywords']);
+  const choice = tag => buttons().find(item => item['aria-label'] === `Add ${tag} to paper tags`);
+  const applied = tag => buttons().find(item => item['aria-label'] === `Remove ${tag} from paper tags`);
+  const suggestionHint = 'Click a suggested tag to add it.';
+  const suggestionGroup = () => root.all().find(item => item.children.some(child => child.textContent === suggestionHint));
+  assert.equal(root.all().some(item => item.tag === 'checkbox'), false);
+  assert.equal(root.all().some(item => item.textContent.includes('Stated keywords appear above')), false);
+  assert.equal(suggestionGroup().hidden, false);
+  assert.equal(choice('Keywords').hidden, true);
+  assert.equal(choice('Topic').hidden, false);
+  assert.deepEqual([...editor.tags], ['Keywords', 'Already Filed']);
+  assert.ok(applied('Already Filed'), 'The Inbox shows stated keywords that are already on the reference');
   assert.equal(changes, 0, 'Loading defaults does not create a user-edited filing draft');
-  box('Topic').checked = true; box('Topic').fire('change');
-  assert.deepEqual([...editor.tags], ['Keywords', 'Topic']);
-  await buttons().find(item => item['aria-label'] === 'Remove Keywords from paper tags').click();
-  assert.equal(box('Keywords').checked, false, 'Removing a chip unchecks its keyword');
+  await choice('Topic').click();
+  assert.deepEqual([...editor.tags], ['Keywords', 'Already Filed', 'Topic']);
+  assert.equal(choice('Topic').hidden, true);
+  assert.equal(suggestionGroup().hidden, true, 'The hint hides after the last available suggestion is selected');
+  assert.ok(applied('Topic'));
+  await applied('Keywords').click();
+  assert.equal(choice('Keywords').hidden, false, 'Removing a keyword makes it available to add again');
   assert.equal(buttons().some(item => item.textContent === 'Use these tags when filing'), false);
   assert.equal(calls.length, 1, 'Tag selections stay in the filing draft');
   const priorEntry = ui.paperTagEntry(scope);
@@ -66,12 +77,16 @@ async function main() {
   root.replaceChildren();
   editor = mountFilingTags(); await ui.preparePaperTags();
   assert.equal(calls.length, 1, 'The same paper analysis is reused');
-  assert.equal(box('Keywords').checked, false, 'The declined default stays unchecked across renders');
-  assert.equal(box('Topic').checked, true, 'Draft choices survive rerender');
+  assert.equal(applied('Keywords'), undefined, 'The declined default stays removed across renders');
+  assert.ok(applied('Topic'), 'Draft choices survive rerender');
   editor.add('keywords');
-  assert.equal(box('Keywords').checked, true, 'An equivalent manually entered chip checks the option');
-  box('Keywords').checked = false; box('Keywords').fire('change');
-  assert.deepEqual([...editor.tags], ['Topic']);
+  assert.equal(choice('Keywords').hidden, true, 'An equivalent manually entered chip suppresses the option');
+  await applied('keywords').click();
+  await applied('Topic').click();
+  assert.equal(choice('Topic').hidden, false, 'Removing a selected suggestion makes it available again');
+  assert.equal(suggestionGroup().hidden, false);
+  await choice('Topic').click();
+  assert.deepEqual([...editor.tags], ['Already Filed', 'Topic']);
   assert.equal(priorEntry.outputs.size, 1, 'Detached output nodes are pruned from the cache');
   assert.equal(priorEntry.listeners.size, 1, 'Detached panel callbacks do not retain old DOM trees');
   ui.paperTagEvidenceSerial = 1;
@@ -88,12 +103,18 @@ async function main() {
   assert.equal(ui.busy, false);
   finish({proposal}); await pending;
   assert.equal(ui.paperTagChecking, false);
-  assert.equal(root.all().filter(item => item.tag === 'checkbox').at(-1).checked, true, 'Retry preserves approved/manual draft choices');
+  assert.ok(applied('Topic'), 'Retry preserves approved/manual draft choices');
   ui.latest.reviews[0].digest = 'new-content'; savedTags = savedDefaults = undefined;
   root.replaceChildren(); mountFilingTags();
   const changedEntry = ui.paperTagEntry(scope); assert.equal(changedEntry.draft.selected.size, 0, 'New document bytes get a fresh draft');
   ui.busy = true; const before = changedEntry.state; await ui.preparePaperTags(); assert.equal(changedEntry.state, before, 'User operations have priority');
   ui.stopped = true; ui.schedulePaperTags(); assert.equal(timers.size, 0);
+  const emptyTags = node('root');
+  const emptyEditor = ui.renderTagEntry(emptyTags, {kind: 'paper', values: [], onChange() {}});
+  ui.renderFilingTagOptions(emptyTags, {keywords: [], suggestions: []},
+    {editor: emptyEditor, defaults: new Map(), inboxFiling: true});
+  assert.ok(emptyTags.all().some(item => item.textContent === 'No author-provided keywords detected.'));
+  assert.equal(emptyTags.all().some(item => item.textContent === suggestionHint), false);
   const cleanup = node('root');
   ui.setButtonHelp = () => {};
   const cleanupCalls = [];

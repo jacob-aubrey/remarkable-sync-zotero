@@ -4,9 +4,10 @@ import re
 import unicodedata
 from pathlib import Path
 
-VERSION = 4
-PROPOSAL_VERSION = 5
-HEADING = re.compile(r"^\s*(?:(?:author(?:s)?['’]?\s+)?key[ -]?words?|index\s+terms)\s*(?:[:：—–-]\s*(.*))?$", re.I)
+VERSION = 5
+PROPOSAL_VERSION = 6
+HEADING = re.compile(r"^\s*(?:(?:author(?:s)?['’]?\s+)?key[ -]?words?|index\s+terms)"
+                     r"(?:(?:\s*[:：—–-]\s*|[ \t]*[\u2002\u2003\u2009\u00a0]\s*)(.*))?\s*$", re.I)
 STOP = re.compile(r'^\s*(?:abstract|introduction|background|references|acknowledg|copyright|received|accepted|\d+[.\s]+[A-Z])', re.I)
 GENERIC = {'paper', 'study', 'results', 'research', 'article', 'copyright', 'elsevier', 'springer', 'abstract', 'introduction', 'conclusion',
            'in', 'and', 'the', 'of', 'with', 'remarkable imported pdf', 'remarkable', 'pdf'}
@@ -25,6 +26,10 @@ DATE = re.compile(
     r'\b(?:\d{1,2}\s+[A-Za-z]{3,9}\s+(?:19|20)\d{2}|'
     r'(?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2})\b', re.I)
 AFFILIATION = re.compile(r'\b(?:university|hospital|department of)\b', re.I)
+DOCUMENT_LABEL = re.compile(r'(?<=[a-z0-9])(?:Author|RENSSELAER|POLYTECHNIC)\b|'
+                            r'(?<=[A-Za-z0-9])Manuscript\b|^(?:OPEN ACCESS\s|(?:Received|Revised|Accepted):)')
+DOCUMENT_LABELS = {'lww', 'remarkable imported pdf'}
+DOCUMENT_LABEL_REASON = 'This label contains an importer marker, publisher header, or watermark.'
 METADATA = 'PDF/document keyword metadata'
 PRINTED = 'Printed keyword/index-term section'
 KEYWORD_LIST_MARKER = re.compile(r'^\s*([A-Z])\.\s+')
@@ -69,6 +74,8 @@ def fragment_reason(tag):
     tag = tag.strip()
     if not tag or not any(char.isalpha() for char in tag):
         return 'This label contains no keyword text.'
+    if normal(tag) in DOCUMENT_LABELS or DOCUMENT_LABEL.search(tag):
+        return DOCUMENT_LABEL_REASON
     if '\ufffd' in tag or '©' in tag or REFERENCE.search(tag):
         return 'This label appears to contain a citation, a list marker, or damaged text.'
     if BODY_FRAGMENT.search(tag):
@@ -132,6 +139,9 @@ def keyword_candidates(front, metadata='', vocabulary=(), *, clean_printed_lists
 
     def add(text, source, evidence):
         # Publisher metadata can encode keyword bullets as font control bytes.
+        # In printed text some PDFs encode hyphens with a control byte instead.
+        if source == PRINTED:
+            text = text.replace('\x01', '-')
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ';', text)
         text = re.sub(r'(\w)-\s*\n(\w)', r'\1\2', text)
         text = re.sub(r'\s*\n\s*', ' ', text)
@@ -176,7 +186,16 @@ def keyword_candidates(front, metadata='', vocabulary=(), *, clean_printed_lists
             if parts and following.lstrip().startswith(tuple(BULLETS + '·')):
                 parts.append(following)
                 continue
-            if STOP.match(following) or len(following) > 200 or following.strip().endswith('.') or BODY_FRAGMENT.search(following):
+            continuation = parts and parts[-1].rstrip().endswith('\x01')
+            end_of_list = following.rstrip().endswith('.')
+            if STOP.match(following) or len(following) > 200 or BODY_FRAGMENT.search(following):
+                break
+            if continuation:
+                parts.append(following.rstrip().removesuffix('.'))
+                if end_of_list:
+                    break
+                continue
+            if end_of_list:
                 break
             if (parts and not re.search(SEPARATORS, following)
                     and not parts[-1].rstrip().endswith((',', ';', '；', ' .'))
@@ -228,9 +247,9 @@ def document_keywords(path, vocabulary=()):
 def keyword_report(path, vocabulary=()):
     try:
         text, front, metadata = read_document(path)
-        rows = stated_keywords(front, metadata, vocabulary)
+        rows, review = keyword_candidates(front, metadata, vocabulary)
         return {'keywords': rows, 'status': 'found' if rows else 'no_stated_keywords' if text.strip() else 'needs_text_recognition',
-                'version': VERSION}
+                'version': VERSION, 'cleanup': review}
     except Exception as error:
         return {'keywords': [], 'status': 'extraction_failed', 'detail': str(error)[:240], 'version': VERSION}
 
@@ -384,7 +403,8 @@ def backfill_keywords(client, parent, path, row, save, *, add_keywords=True):
         record['tags'] = tags
         client.authorize()
         client.update(record)
-    cleanup = [value for key, value in cleanup_candidates(previous).items() if key not in reported and key in current]
+    candidates = {**cleanup_candidates(report), **cleanup_candidates(previous)}
+    cleanup = [value for key, value in candidates.items() if key not in reported and key in current]
     updated = {**report, 'title': record.get('title', ''), 'cleanup': cleanup}
     review = row.pop('keyword_review', None)
     unavailable = row.pop('keyword_parent_unavailable', None)
@@ -400,7 +420,7 @@ def analyse(path, vocabulary=(), existing=()):
     vocabulary = sorted(set(vocabulary))
     keywords, review = keyword_candidates(front, metadata, vocabulary, clean_printed_lists=True)
     excluded = {normal(tag) for tag in existing} | {normal(row['tag']) for row in keywords}
-    suggestions = [row for row in review if normal(row['tag']) not in excluded]
+    suggestions = [row for row in review if row['reason'] != DOCUMENT_LABEL_REASON and normal(row['tag']) not in excluded]
     seen = excluded | {normal(row['tag']) for row in suggestions}
     review_count = len(suggestions)
     folded = normal(text)

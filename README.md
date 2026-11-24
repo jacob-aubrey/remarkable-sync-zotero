@@ -19,6 +19,8 @@ In **Linked papers**, the citation, fields and tags, and full-text modes use Zot
 
 In **Tags**, type to narrow the list of tag names, then select tags to filter results as you go. Paper tags are shared with the Zotero reference. **Show Zotero tags** opens the reference’s native Tags section. Page tags are saved for individual pages of linked PDFs. Use the tag button in the PDF reader to edit paper and page tags together.
 
+Inbox filing starts new papers with a removable `unread` tag alongside their keywords. In Zotero, right-click a paper or PDF and choose **Mark as read** or **Mark as unread** to switch its tag. Filter by reading status in **Linked papers**, or select the `read` or `unread` tag in Zotero.
+
 Select one tag and choose **Generate Word notebook…** to save a snapshot of its PDF annotations. Paper tags include the matching papers’ annotations, and page tags include the tagged pages. You can also right-click a collection in Zotero and choose **reMarkable Sync → Generate Word notebook…**, with the option to include subcollections. The export uses the Reading layout and links back to the relevant pages in Zotero. The Windows helper already bundles the MIT-licensed [python-docx](https://github.com/python-openxml/python-docx) writer.
 
 ### Right-click shortcuts
@@ -72,7 +74,7 @@ $python = '.\.venv\Scripts\python.exe'
 & $python tools/verify_vendored_core.py
 $env:NOTABLE_BUILD_RESOURCES = (Resolve-Path './ocr-build-resources').Path
 & $python -m PyInstaller --noconfirm --distpath build/runtime 'Notable Zotero Worker.spec'
-& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.43.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
+& $python tools/build_zotero_support.py --output dist/reMarkable-Sync-for-Zotero-0.19.44.xpi --runtime build/runtime/notable-worker.exe --verify-runtime --update-manifest
 ```
 
 The build generates `updates.json` beside the XPI. For a release, tag the matching source, attach both files and the corresponding source to the GitHub release, and verify the downloads before publishing it as the latest release. Keep the version in the filename and the plugin manifest in sync.

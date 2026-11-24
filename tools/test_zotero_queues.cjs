@@ -209,6 +209,31 @@ async function clearActionScopeChecks() {
 
 async function applyingRecoveryChecks() {
   await clearActionScopeChecks();
+  {
+    const f = viewFixture(), row = paper('incoming', 'inbox'), approvals = [];
+    f.ui.latest.reviews = [row];
+    f.ui.queueFiling = async (_method, params) => approvals.push(params);
+    f.ui.renderReview(f.node(), 'inbox');
+    const approve = () => f.buttons.get('Approve & file').at(-1).click();
+    assert.equal(f.buttons.get('unread ×').length, 1);
+    await approve();
+    assert.deepEqual(Array.from(approvals[0].tags), ['unread']);
+    assert.equal(approvals[0].keyword_tags.length, 0);
+    f.buttons.get('unread ×')[0].click();
+    f.ui.renderReview(f.node(), 'inbox');
+    assert.equal(f.buttons.get('unread ×').length, 1, 'A removed filing default stays removed after rerender');
+    await approve();
+    assert.equal(approvals[1].tags.length, 0);
+  }
+  {
+    const f = viewFixture({notableItem: async () => ({getTags: () => [{tag: 'Read'}]})});
+    const row = paper('known-paper', 'zotero');
+    row.payload.parent = 'PARENT23';
+    f.ui.latest.reviews = [row];
+    f.ui.queueFiling = async (_method, params) => assert.equal(params.tags.length, 0);
+    f.ui.renderReview(f.node(), 'inbox');
+    await f.buttons.get('Approve for reMarkable')[0].click();
+  }
   const interrupted = () => ({...paper('interrupted', 'zotero'), status: 'applying',
     approval: {title: 'Saved title', filename: 'Chosen filename.pdf', document_type: 'journal_article',
       parent: 'PARENT23', collection: 'Z', research: ['RESEARCH'], match: 'existing-tablet'}});

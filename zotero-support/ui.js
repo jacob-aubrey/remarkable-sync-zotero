@@ -4409,10 +4409,13 @@ var NotableUI = {
       if (row.payload.parent) this.reviewNavigationButton('Open reference in Zotero', citation, 'references', [row.payload.parent]);
     }
     const tagDetails = this.el('details', '', filing, {'data-review-detail': 'paper-tags'});
+    const inboxFiling = queue === 'inbox';
+    tagDetails.open = inboxFiling;
     this.el('summary', 'Paper tags', tagDetails);
     this.el('p', 'Filing adds the tags shown here to the Zotero reference.', tagDetails, {class: 'hint'});
-    const tagDefaults = new Map(draft.tag_defaults || []);
-    const paperTags = this.renderTagEntry(tagDetails, {kind: 'paper', values: draft.tags || [], inputValue: draft.tag_input || '',
+    const tagDefaults = new Map((draft.tag_defaults || []).map(([tag, stated]) => [this.filingTagKey(tag), stated]));
+    const initialTags = draft.tags ?? (inboxFiling && main.panel.hidden ? ['unread'] : []);
+    const paperTags = this.renderTagEntry(tagDetails, {kind: 'paper', values: initialTags, inputValue: draft.tag_input || '',
       list: this.tagSuggestions(tagDetails, 'paper'),
       empty: 'No tags added to this filing.', onChange: () => saveDraft(), tagKey: this.filingTagKey});
     if (this.isInboxOfficeFile(row)) this.el('p', 'This Office file can be filed in Zotero.', filing, {class: 'hint'});
@@ -4423,12 +4426,22 @@ var NotableUI = {
       if (!main.panel.hidden && !main.select.value) throw Error('Choose the main paper in Zotero for this supporting information.');
       if (['waiting', 'loading'].includes(tagReview?.state)) throw Error('Wait for the paper keywords to appear, then approve.');
       paperTags.add();
+      const mainReference = main.panel.hidden ? '' : main.select.value;
       const tags = [...paperTags.tags];
-      const keywordTags = tags.filter(tag => tagDefaults.get(tag) === true);
+      const unreadIndex = inboxFiling ? tags.findIndex(tag => this.filingTagKey(tag) === 'unread') : -1;
+      if (mainReference && unreadIndex !== -1) tags.splice(unreadIndex, 1);
+      else if (unreadIndex !== -1) {
+        const matchedPDF = row.kind === 'cloud' && match?.value ? await notableItem(match.value) : null;
+        const parent = matchedPDF?.parentKey || row.payload.parent;
+        const current = parent ? await notableItem(parent) : null;
+        const alreadyRead = current?.getTags().some(({tag}) => this.filingTagKey(tag) === 'read');
+        if (alreadyRead || tags.some(tag => this.filingTagKey(tag) === 'read')) tags.splice(unreadIndex, 1);
+      }
+      const keywordTags = tags.filter(tag => tagDefaults.get(this.filingTagKey(tag)) === true);
       await this.queueFiling('approve', {identity: row.id, digest: row.digest, filename: filename.value, title: title.value,
         document_type: type.value, collection: home.value, research: Array.from(research.selectedOptions, o => o.value), match: match?.value || '', review_token: row.payload.review_token || '',
         citation: citationEdits(), tags: tags.filter(tag => !keywordTags.includes(tag)), keyword_tags: keywordTags,
-        main_reference: main.panel.hidden ? '' : main.select.value,
+        main_reference: mainReference,
         main_reference_metadata: main.panel.hidden ? null : JSON.parse(main.select.selectedOptions[0].dataset.metadata)});
     }, true); approve.dataset.queue = 'true'; approve.dataset.approve = 'true';
     if (queue === 'inbox') {
@@ -4443,7 +4456,7 @@ var NotableUI = {
       tags: [...paperTags.tags], tag_input: paperTags.input.value, tag_defaults: [...tagDefaults],
       collection: home.value, research: Array.from(research.selectedOptions, o => o.value), match: match?.value || '',
       main_reference: main.select.value, main_query: main.query.value});
-    const tagReview = this.paperTagPanel(tagDetails, {identity: row.id}, {editor: paperTags, defaults: tagDefaults});
+    const tagReview = this.paperTagPanel(tagDetails, {identity: row.id}, {editor: paperTags, defaults: tagDefaults, inboxFiling});
     for (const [field, name] of [[title, 'title'], [filename, 'filename'], [type, 'document_type']]) {
       const edited = () => { editedFields.add(name); if (name === 'filename') { generatedFilename = false; needsFilenamePreview = false; } };
       field.addEventListener('input', edited);
@@ -4827,46 +4840,56 @@ var NotableUI = {
     } catch (error) {entry.state = 'failed'; entry.error = error.message;}
     finally {this.paperTagChecking = false; this.paperTagBackground = false; notify(); this.schedulePaperTags();}
   },
-  renderFilingTagOptions(output, proposal, {editor, defaults}) {
+  renderFilingTagOptions(output, proposal, {editor, defaults, inboxFiling}) {
     const key = this.filingTagKey;
-    const selected = tag => [...editor.tags].find(value => key(value) === key(tag));
+    const selected = new Map([...editor.tags].map(tag => [key(tag), tag]));
     const existing = new Set((proposal.tags || []).map(row => key(row.tag)));
     const additions = new Set(editor.tags);
+    if (inboxFiling && (existing.has('read') || existing.has('unread'))) additions.delete(selected.get('unread'));
+    const canAdd = (tag, stated) => (!inboxFiling || tag !== 'unread')
+      && (!existing.has(tag) || (inboxFiling && stated));
     const addDefaults = (tags, stated) => {
       for (const tag of tags) {
-        if (defaults.has(tag)) continue;
-        defaults.set(tag, stated);
-        if (!existing.has(key(tag)) && !selected(tag)) additions.add(tag);
+        const id = key(tag);
+        if (!canAdd(id, stated)) continue;
+        if (!defaults.has(id) && !selected.has(id)) {
+          additions.add(tag);
+          selected.set(id, tag);
+        }
+        if (stated || !defaults.has(id)) defaults.set(id, stated);
       }
     };
     addDefaults(proposal.keywords.map(row => row.tag), true);
     addDefaults(proposal.selected || [], false); // Restore choices saved before the shared tag editor.
     editor.setTags(additions, false);
-    const controls = [];
-    const options = (title, rows, empty) => {
-      this.el('h3', title, output);
-      if (!rows.length) this.el('p', empty, output, {class: 'hint'});
-      for (const row of rows) {
-        if (existing.has(key(row.tag))) {
-          this.el('p', `${row.tag} · Already in Zotero · ${row.source}`, output, {class: 'hint'});
-          continue;
-        }
-        const input = this.checkbox(row.tag, output, !!selected(row.tag));
-        controls.push([row.tag, input]);
-        input.addEventListener('change', () => {
-          const next = new Set(editor.tags);
-          if (input.checked) next.add(row.tag);
-          else for (const tag of next) { if (key(tag) === key(row.tag)) next.delete(tag); }
-          editor.setTags(next);
-        });
-        this.el('p', row.reason ? `${row.source} · ${row.reason}` : row.source, output, {class: 'hint'});
+    const options = (title, rows, stated, empty) => {
+      const group = this.el('div', '', output);
+      this.el('h3', title, group);
+      if (!rows.length) this.el('p', empty, group, {class: 'hint'});
+      else if (!stated) this.el('p', 'Click a suggested tag to add it.', group, {class: 'hint'});
+      const chips = this.el('div', '', group, {class: 'tag-chips'});
+      const offered = new Map();
+      for (const {tag, source, reason} of rows) {
+        const id = key(tag);
+        if (!canAdd(id, stated) || offered.has(id)) continue;
+        const chip = this.button(tag, chips, () => { editor.add(tag); editor.input.focus(); }, false, null, {help: false});
+        chip.dataset.browse = 'true';
+        chip.setAttribute('aria-label', `Add ${tag} to paper tags`);
+        chip.setAttribute('title', reason ? `${source} · ${reason}` : source);
+        offered.set(id, chip);
+      }
+      return {group, offered, hasRows: !!rows.length};
+    };
+    const groups = [options('Stated keywords', proposal.keywords, true, 'No author-provided keywords detected.'),
+      options('Suggested tags', proposal.suggestions, false, 'No additional tags suggested.')];
+    editor.onTagsChange = () => {
+      const chosen = new Set([...editor.tags].map(key));
+      for (const {group, offered, hasRows} of groups) {
+        for (const [id, chip] of offered) chip.hidden = chosen.has(id);
+        group.hidden = hasRows && [...offered.values()].every(chip => chip.hidden);
       }
     };
-    options('Stated keywords', proposal.keywords, 'No reliable keyword list found.');
-    options('Suggested tags', proposal.suggestions, 'No additional tags suggested.');
-    editor.onTagsChange = () => {
-      for (const [tag, input] of controls) input.checked = !!selected(tag);
-    };
+    editor.onTagsChange();
   },
   paperTagPanel(parent, scope, filing) {
     const entry = this.paperTagEntry(scope), draft = entry.draft;
@@ -4876,8 +4899,7 @@ var NotableUI = {
     panel.open = draft.open;
     panel.addEventListener('toggle', () => {draft.open = panel.open;});
     this.el('summary', 'Paper keywords and suggested tags', panel);
-    this.el('p', filing ? 'Stated keywords start checked. Check or uncheck any tag to update the list above.'
-      : 'Keywords and topic suggestions are prepared automatically. Review them before adding tags.', panel);
+    if (!filing) this.el('p', 'Keywords and topic suggestions are prepared automatically. Review them before adding tags.', panel);
     const output = this.el('div', '', panel);
     entry.outputs.add(output);
     const render = () => {
@@ -5139,7 +5161,8 @@ var NotableUI = {
         } else if (item.isRegularItem()) {
           const record = records.get(item.key);
           record.title = item.getField('title');
-          record.read = item.getTags().some(tag => tag.tag === 'Read');
+          const tags = item.getTags().map(({tag}) => this.filingTagKey(tag));
+          record.reading = tags.includes('read') ? 'read' : tags.includes('unread') ? 'unread' : '';
         }
       }
       return records;
@@ -5333,7 +5356,7 @@ var NotableUI = {
           if (state.status === 'saved' && !row.queued) return false;
         }
         const record = metadata.get(key);
-        if (!reviewing && state.reading !== 'all' && record?.read !== (state.reading === 'read')) return false;
+        if (!reviewing && state.reading !== 'all' && record?.reading !== state.reading) return false;
         if (!words.length) return true;
         const findings = row.findings || [];
         if (state.mode === 'files') {

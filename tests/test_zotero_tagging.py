@@ -68,6 +68,20 @@ class PaperTagTests(unittest.TestCase):
         self.assertEqual([row['tag'] for row in keywords], ['CT', 'Tin filtration', '1.5 T MRI', 'E. coli'])
         self.assertEqual(review, [])
 
+    def test_printed_keywords_allow_typographic_space_and_encoded_hyphens(self):
+        rows = stated_keywords('Keywords\u2002Spectral CT, meso\x01\nmorphic state, X\x01ray dif\x01\n'
+                               'fraction analysis.\n\nIntroduction')
+        self.assertEqual([row['tag'] for row in rows], ['Spectral CT', 'mesomorphic state', 'X-ray diffraction analysis'])
+
+    def test_document_labels_are_evidence_for_cleanup_but_never_suggestions(self):
+        metadata = 'LWW; CNRManuscript; high photon fluxAuthor; spectral CT; reMarkable imported PDF'
+        with patch('note_organizer.zotero_tagging.read_document', return_value=('', '', metadata)):
+            report = keyword_report('fixture.pdf')
+            proposal = analyse('fixture.pdf')
+        self.assertEqual([row['tag'] for row in report['keywords']], ['spectral CT'])
+        self.assertEqual(set(cleanup_candidates(report)), {'lww', 'cnrmanuscript', 'high photon fluxauthor'})
+        self.assertEqual(proposal['suggestions'], [])
+
     def test_lettered_printed_keywords_omit_list_markers(self):
         keywords, review = keyword_candidates(
             'Keywords: A. Metal-matrix composites (NMCs); B. Mechanical properties; '
@@ -322,6 +336,12 @@ class TagWorkflowTests(unittest.TestCase):
         report = backfill_keywords(self.zot, 'PARENT23', path, row, lambda: None)
         self.assertEqual([entry['tag'] for entry in report['cleanup']], ['Models and'])
         self.assertEqual([tag['tag'] for tag in self.zot.items['PARENT23']['tags']], ['Models and', 'nanoparticles'])
+
+    def test_cleanup_detects_legacy_document_labels_without_saved_keyword_evidence(self):
+        record = {'tags': [{'tag': 'high photon fluxAuthor', 'type': 1}, {'tag': 'LWW', 'type': 1},
+                           {'tag': 'OPEN ACCESS Diagnostic performance', 'type': 0}, {'tag': 'Spectral CT', 'type': 1}]}
+        self.assertEqual([row['tag'] for row in self.worker._keyword_cleanup_rows(record, [])],
+                         ['high photon fluxAuthor', 'LWW'])
 
     def test_backfill_preserves_reference_edits_made_while_reading(self):
         path = self.add_pdf()

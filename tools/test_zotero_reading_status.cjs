@@ -27,6 +27,7 @@ async function test() {
     return {
       id, tags: new Set(tags), saves: 0,
       isPDFAttachment: () => false, isRegularItem: () => true, isEditable: () => true,
+      getTags() { return [...this.tags].map(tag => ({tag})); },
       hasTag(tag) { return this.tags.has(tag); },
       addTag(tag) { this.tags.add(tag); },
       removeTag(tag) { this.tags.delete(tag); },
@@ -44,8 +45,8 @@ async function test() {
       setVisible(visible) { this.visible = visible; },
     };
   }
-  const unread = paper(1, ['Spectral CT']);
-  const read = paper(2, ['Read', 'Methods']);
+  const unread = paper(1, ['Spectral CT', 'unread']);
+  const read = paper(2, ['read', 'Methods']);
   const attachment = {isPDFAttachment: () => true, parentItem: unread};
   const [markRead, markUnread] = registration.menus;
   const selection = menuContext([unread, read, attachment]);
@@ -55,14 +56,14 @@ async function test() {
   }
   assert.equal(selection.menuElem.label, 'Mark as unread');
   await markRead.onCommand(null, selection);
-  assert.deepEqual([...unread.tags], ['Spectral CT', 'Read']);
+  assert.deepEqual([...unread.tags], ['Spectral CT', 'read']);
   assert.equal(unread.saves, 1);
   assert.equal(read.saves, 0);
   markRead.onShowing(null, selection);
   assert.equal(selection.visible, false);
   await markUnread.onCommand(null, selection);
-  assert.deepEqual([...unread.tags], ['Spectral CT']);
-  assert.deepEqual([...read.tags], ['Methods']);
+  assert.deepEqual([...unread.tags], ['Spectral CT', 'unread']);
+  assert.deepEqual([...read.tags], ['Methods', 'unread']);
   assert.equal(unread.saves, 2);
   assert.equal(read.saves, 1);
 
@@ -70,7 +71,15 @@ async function test() {
   markRead.onShowing(null, pdfOnly);
   assert.equal(pdfOnly.visible, true);
   await markRead.onCommand(null, pdfOnly);
-  assert.ok(unread.hasTag('Read'));
+  assert.ok(unread.hasTag('read'));
+
+  const legacy = paper(4, ['Read', 'unread', 'Reading list']);
+  await markRead.onCommand(null, menuContext([legacy]));
+  assert.deepEqual([...legacy.tags], ['Reading list', 'read']);
+
+  const untagged = paper(5);
+  await markUnread.onCommand(null, menuContext([untagged]));
+  assert.deepEqual([...untagged.tags], ['unread']);
 
   for (const unsupported of [paper(3, [], {deleted: true}), paper(3, [], {isFeedItem: true}),
     paper(3, [], {isEditable: () => false}), {...attachment, parentItem: undefined}]) {

@@ -1,7 +1,10 @@
-/* A manual paper tag is shared with reMarkable by ordinary whole-paper sync. */
+/* Manual paper tags are shared with reMarkable by ordinary whole-paper sync. */
 var NotableReadingStatus = {
-  tag: 'Read',
   menuID: 'notable-reading-status',
+
+  tags(paper) {
+    return paper.getTags().map(row => row.tag).filter(tag => /^(read|unread)$/i.test(tag));
+  },
 
   papers(items) {
     const papers = new Map();
@@ -17,20 +20,24 @@ var NotableReadingStatus = {
   register(pluginID) {
     Zotero.MenuManager.registerMenu({
       menuID: this.menuID, pluginID, target: 'main/library/item',
-      menus: [true, false].map(read => ({
+      menus: ['read', 'unread'].map(status => ({
         menuType: 'menuitem',
         onShowing: (_, context) => {
-          context.menuElem.setAttribute('label', read ? 'Mark as read' : 'Mark as unread');
-          context.setVisible(this.papers(context.items).some(paper => paper.hasTag(this.tag) !== read));
+          context.menuElem.setAttribute('label', `Mark as ${status}`);
+          context.setVisible(this.papers(context.items).some(paper => {
+            const tags = this.tags(paper);
+            return tags.length !== 1 || tags[0] !== status;
+          }));
         },
         onCommand: async (_, context) => {
           const window = context.menuElem.ownerDocument.defaultView;
           try {
             await Zotero.DB.executeTransaction(async () => {
               for (const paper of this.papers(context.items)) {
-                if (paper.hasTag(this.tag) === read) continue;
-                if (read) paper.addTag(this.tag);
-                else paper.removeTag(this.tag);
+                const tags = this.tags(paper);
+                if (tags.length === 1 && tags[0] === status) continue;
+                for (const tag of tags) if (tag !== status) paper.removeTag(tag);
+                paper.addTag(status);
                 await paper.save();
               }
             });

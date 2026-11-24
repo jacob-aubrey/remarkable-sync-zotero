@@ -570,9 +570,9 @@ async function startup({rootURI}) {
               status.value = value; status.dispatchEvent(new ui.view.Event('change'));
             };
             selectStatus('read');
-            if (!contains(command.title) || contains(command.unreadTitle)) throw Error('Read did not match only the exact Read tag');
+            if (!contains(command.title) || contains(command.unreadTitle)) throw Error('Read did not match the reading-status tag');
             selectStatus('unread');
-            if (contains(command.title) || !contains(command.unreadTitle)) throw Error('Unread did not find the unmarked paper');
+            if (contains(command.title) || !contains(command.unreadTitle)) throw Error('Unread did not find the explicitly tagged paper');
             const unread = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, command.unread);
             unread.addTag('Read');
             await unread.saveTx();
@@ -1308,24 +1308,33 @@ async function startup({rootURI}) {
               response.expanded = sizes();
               ensure(Math.abs(response.expanded.list - response.expanded.detail) < 2, 'List failed to follow expanded details');
               await ui.preparePaperTags(); await settle();
-              const checks = [...doc.querySelector('.paper-tag-proposal').querySelectorAll('input[type="checkbox"]')];
+              const unread = '[aria-label="Remove unread from paper tags"]';
+              ensure(doc.querySelector(unread), 'Inbox did not put unread alongside its keyword tags');
+              doc.querySelector(unread).click();
+              await settle();
+              ensure(!doc.querySelector(unread), 'Removing unread did not update the filing draft');
+              ui.render(); await settle();
+              ensure(!doc.querySelector(unread), 'Rerender restored a declined unread tag');
               const keywordCount = command.proposal.keywords.length;
-              ensure(checks.slice(0, keywordCount).every(input => input.checked), 'Stated keywords did not start checked');
-              ensure(checks.slice(keywordCount).length && checks.slice(keywordCount).every(input => !input.checked),
-                'Suggestions applied without selection');
+              const applied = tag => doc.querySelector(`[aria-label="Remove ${tag} from paper tags"]`);
+              const offered = tag => doc.querySelector(`[aria-label="Add ${tag} to paper tags"]`);
+              ensure(!doc.querySelector('.paper-tag-proposal input[type="checkbox"]'), 'Filing still uses tag checkboxes');
+              ensure(command.proposal.keywords.every(({tag}) => applied(tag)), 'Stated keywords did not start as selected bubbles');
+              ensure(command.proposal.suggestions.every(({tag}) => offered(tag) && !offered(tag).hidden && !applied(tag)),
+                'Suggestions did not start as available bubbles');
               const rejected = command.proposal.keywords[0].tag;
-              doc.querySelector(`[aria-label="Remove ${rejected} from paper tags"]`).click();
+              applied(rejected).click();
               await Promise.resolve();
-              ensure(!checks[0].checked, 'Removing a keyword chip did not uncheck it');
-              checks[keywordCount].checked = true;
-              checks[keywordCount].dispatchEvent(new ui.view.Event('change', {bubbles: true}));
+              ensure(!applied(rejected) && !offered(rejected).hidden, 'Removing a keyword did not make it available again');
               const chosen = command.proposal.suggestions[0].tag;
-              ensure(doc.querySelector(`[aria-label="Remove ${chosen} from paper tags"]`), 'Checking a suggestion did not add its chip');
+              offered(chosen).click();
+              await Promise.resolve();
+              ensure(applied(chosen) && offered(chosen).hidden, 'Clicking a suggestion did not move it into the selected tags');
               const approve = doc.querySelector('[data-approve="true"]');
               ensure(approve && !approve.disabled, 'The synthetic filing must be ready for approval');
               approve.click(); await settle();
               const filing = requests.find(row => row.method === 'approve')?.params;
-              ensure(filing?.tags.includes(chosen) && !filing.keyword_tags.includes(rejected)
+              ensure(filing?.tags.includes(chosen) && !filing.tags.includes('unread') && !filing.keyword_tags.includes(rejected)
                 && filing.keyword_tags.length === keywordCount - 1, 'Filing did not receive the displayed tags');
               response.tags = sizes(); ensure(Math.abs(response.tags.list - response.tags.detail) < 2, 'Tag controls broke matching heights');
               ui.view.resizeTo(640, 900); await settle();
@@ -1335,7 +1344,8 @@ async function startup({rootURI}) {
               const icon = await (await fetch('chrome://notable/content/icons/tablet.svg')).text();
               ensure(icon.includes('M9 16V8') && !icon.includes('<line'), 'Toolbar icon still contains a dot');
               response.passed = ['review list matches details height', 'long list scrolls independently', 'keyboard selection stays visible',
-                'list position persists', 'expanded details and tag controls resize list', 'checked keywords and tag chips control filing',
+                'list position persists', 'expanded details and tag controls resize list', 'selected keyword and suggestion bubbles control filing',
+                'Inbox unread starts selected and its removal persists through filing',
                 'narrow list remains bounded', 'toolbar uses rectangle and R without dot'];
             } finally { ui.rpc = saved.rpc; ui.queueFiling = saved.queueFiling; ui.latest = saved.latest; ui.tab = saved.tab; ui.selected = null; ui.showAllReviews = false; ui.view.resizeTo(1040, 760); ui.render(); }
           }
@@ -2364,7 +2374,7 @@ def maintenance_checks(client, root, checked):
                            'creators': [{'creatorType': 'author', 'lastName': 'Gurevich'}],
                            'tags': [{'tag': 'Vascular fixture tag'}, {'tag': 'Read'}, {'tag': 'Automatic fixture tag', 'type': 1}]})
     client.create('item', {'key': unread, 'itemType': 'journalArticle', 'title': unread_title,
-                           'tags': [{'tag': 'Vascular fixture tag'}, {'tag': 'Reading list'}]})
+                           'tags': [{'tag': 'Vascular fixture tag'}, {'tag': 'Reading list'}, {'tag': 'unread'}]})
     client.create('item', {'key': 'NMTG2345', 'itemType': 'note', 'parentItem': parent,
                            'note': '<p>Tag bank fixture: café</p>', 'tags': [{'tag': 'Note-only fixture tag'}]})
     client.create('item', {'key': 'NMTR2345', 'itemType': 'document', 'title': 'Trashed tag fixture',
